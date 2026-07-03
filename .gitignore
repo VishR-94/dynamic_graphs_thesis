@@ -1,3 +1,38 @@
+# ============================================================
+# Thesis project: proprietary data, outputs, and secrets
+# ============================================================
+
+# Proprietary / local datasets
+data/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+
+# Experiment outputs
+outputs/
+runs/
+wandb/
+checkpoints/
+artifacts/
+lightning_logs/
+
+# Local/private config files
+local_config.yaml
+local_config.yml
+.env
+.env.*
+secrets/
+
+# Mac system files
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
