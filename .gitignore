@@ -3,7 +3,7 @@
 # ============================================================
 
 # Proprietary / local datasets
-data/
+/data/
 *.pt
 *.pth
 *.ckpt
@@ -16,12 +16,12 @@ data/
 *.parquet
 
 # Experiment outputs
-outputs/
-runs/
-wandb/
-checkpoints/
-artifacts/
-lightning_logs/
+/outputs/
+/runs/
+/wandb/
+/checkpoints/
+/artifacts/
+/lightning_logs/
 
 # Local/private config files
 local_config.yaml
