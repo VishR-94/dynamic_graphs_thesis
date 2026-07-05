@@ -74,13 +74,13 @@ def drop_first_point(split: SplitDict) -> SplitDict:
 
     #this creates a copy of split. If we just did cleaned = split,
     #they will point to the same object. This creates a new copy
-    cleaned = Dict(split)
+    cleaned = dict(split)
 
     cleaned_sample = []
 
     for x, aux, day in split['samples']:
         x_clean = x[1:]
-        cleaned_sample.append(x_clean,aux,day)
+        cleaned_sample.append((x_clean,aux,day))
 
     cleaned['samples'] = cleaned_sample
     cleaned['T'] = cleaned_sample[0][0].shape[0]
