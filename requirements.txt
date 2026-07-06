@@ -10,3 +10,4 @@ statsmodels
 arch
 jupyter
 scipy
+pyyaml
