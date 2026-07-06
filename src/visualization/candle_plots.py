@@ -760,59 +760,163 @@ def plot_average_intraday_abs_return(
     split: SplitDict,
     sample_indices: int | Sequence[int] | slice | None = None,
     assets: str | int | Sequence[str | int] | None = None,
+    mode: str = "profile",
+    max_date_ticks: int = 12,
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes, np.ndarray, np.ndarray]:
     """
-    Plot average absolute close log return by intraday return minute.
+    Plot average absolute close log return.
 
-    The shaded band shows plus/minus one standard deviation.
+    mode="profile":
+        Average over selected days and selected assets at each intraday minute.
+        This gives one average intraday volatility profile.
+
+    mode="concat":
+        For each selected day, average over selected assets at each minute.
+        Then concatenate those daily curves into one long trading-time series.
+
+    The shaded band shows mean plus/minus one standard deviation.
+    The lower side of the band is clipped at zero because absolute returns
+    cannot be negative.
     """
-    avg_abs_return, std_abs_return = compute_average_intraday_abs_return(
-        split=split,
-        sample_indices=sample_indices,
-        assets=assets,
-    )
+    if mode not in {"profile", "concat"}:
+        raise ValueError(f"mode must be 'profile' or 'concat', got {mode!r}")
+
+    sample_ids = resolve_sample_indices(split, sample_indices)
+    asset_ids, asset_labels = resolve_asset_indices(split, assets)
+
+    if len(sample_ids) == 0:
+        raise ValueError("No sample indices selected.")
 
     market_open = parse_market_time(split["market_open"])
     market_close = parse_market_time(split["market_close"])
-
-    dummy_date = datetime(2000, 1, 1)
-    start = datetime.combine(dummy_date.date(), market_open)
-    start = start + timedelta(minutes=1)
-
-    x_axis = np.array(
-        [start + timedelta(minutes=i) for i in range(len(avg_abs_return))]
-    )
-
-    lower = avg_abs_return - std_abs_return
-    upper = avg_abs_return + std_abs_return
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(12, 5))
     else:
         fig = ax.figure
 
-    ax.plot(
-        x_axis,
-        avg_abs_return,
-        label="Mean absolute log return",
-    )
+    if mode == "profile":
+        avg_abs_return, std_abs_return = compute_average_intraday_abs_return(
+            split=split,
+            sample_indices=sample_indices,
+            assets=assets,
+        )
 
-    ax.fill_between(
-        x_axis,
-        lower,
-        upper,
-        alpha=0.2,
-        label="±1 standard deviation",
-    )
+        dummy_date = datetime(2000, 1, 1)
+        start = datetime.combine(dummy_date.date(), market_open)
+        start = start + timedelta(minutes=1)
 
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        x_axis = np.array(
+            [start + timedelta(minutes=i) for i in range(len(avg_abs_return))]
+        )
 
-    ax.set_title("Average intraday absolute log return")
-    ax.set_xlabel(
-        f"Time of day ({market_open.strftime('%H:%M')}–{market_close.strftime('%H:%M')})"
-    )
+        lower = np.maximum(avg_abs_return - std_abs_return, 0.0)
+        upper = avg_abs_return + std_abs_return
+
+        ax.plot(
+            x_axis,
+            avg_abs_return,
+            label="Mean absolute log return",
+        )
+
+        ax.fill_between(
+            x_axis,
+            lower,
+            upper,
+            alpha=0.2,
+            label="Mean ± 1 standard deviation",
+        )
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+        xlabel = (
+            f"Time of day "
+            f"({market_open.strftime('%H:%M')}–{market_close.strftime('%H:%M')})"
+        )
+
+    else:
+        gap_points = 5
+
+        first_x, _, _ = split["samples"][sample_ids[0]]
+        points_per_day = first_x.shape[0] - 1
+
+        x_parts = []
+        mean_parts = []
+        std_parts = []
+
+        for day_position, sample_idx in enumerate(sample_ids):
+            x, aux, day = split["samples"][sample_idx]
+
+            returns = compute_close_log_returns(x, split)
+            returns = returns[:, asset_ids]
+
+            abs_returns = returns.abs()
+
+            day_mean = abs_returns.mean(dim=1)
+            day_std = abs_returns.std(dim=1, unbiased=False)
+
+            start = day_position * (points_per_day + gap_points)
+            x_axis = np.arange(start, start + len(day_mean))
+
+            x_parts.append(x_axis)
+            mean_parts.append(day_mean)
+            std_parts.append(day_std)
+
+            x_parts.append(np.array([start + len(day_mean)]))
+            mean_parts.append(day_mean.new_tensor([float("nan")]))
+            std_parts.append(day_std.new_tensor([float("nan")]))
+
+        x_axis = np.concatenate(x_parts)
+        avg_abs_return = to_numpy(torch.cat(mean_parts))
+        std_abs_return = to_numpy(torch.cat(std_parts))
+
+        lower = np.maximum(avg_abs_return - std_abs_return, 0.0)
+        upper = avg_abs_return + std_abs_return
+
+        ax.plot(
+            x_axis,
+            avg_abs_return,
+            label="Mean absolute log return across assets",
+        )
+
+        ax.fill_between(
+            x_axis,
+            lower,
+            upper,
+            alpha=0.2,
+            label="Mean ± 1 standard deviation across assets",
+        )
+
+        tick_every = max(1, len(sample_ids) // max_date_ticks)
+
+        tick_positions = []
+        tick_labels = []
+
+        for day_position, sample_idx in enumerate(sample_ids):
+            if day_position % tick_every != 0:
+                continue
+
+            _, _, day = split["samples"][sample_idx]
+            start = day_position * (points_per_day + gap_points)
+
+            tick_positions.append(start)
+            tick_labels.append(
+                f"{format_day_label(day)}\n{market_open.strftime('%H:%M')}"
+            )
+
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+
+        xlabel = (
+            f"Trading return-time only "
+            f"({market_open.strftime('%H:%M')}–{market_close.strftime('%H:%M')})"
+        )
+
+    ax.set_title("Average absolute close log return")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Absolute log return")
+    ax.set_ylim(bottom=0.0)
     ax.legend(fontsize=8)
 
     fig.tight_layout()
