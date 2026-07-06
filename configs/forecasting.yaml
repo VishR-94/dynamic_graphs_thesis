@@ -1,0 +1,50 @@
+data:
+  split_names:
+    - train
+    - val
+    - test
+
+forecasting:
+  context_length: 60
+
+  horizons:
+    - 1
+    - 5
+    - 15
+    - 30
+    - 60
+
+  input_channels:
+    - open
+    - high
+    - low
+    - close
+    - volume
+    - amount
+
+  target_channels:
+    - open
+    - high
+    - low
+    - close
+    - volume
+
+preprocessing:
+  standardize: true
+  standardization_scope: global_train
+
+  clip: true
+  clip_min: -5.0
+  clip_max: 5.0
+
+  eps: 1.0e-8
+
+training:
+  batch_size: 32
+  num_workers: 0
+
+evaluation:
+  metrics:
+    - mae
+    - mse
+    - rmse
