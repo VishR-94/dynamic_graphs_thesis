@@ -8,7 +8,7 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.spatial.distance import squareform
-from src.data.candle import compute_close_log_returns, get_channel
+from src.data.load_candle_data import compute_log_returns, get_channel
 
 SplitDict = dict[str,Any]
 
@@ -107,11 +107,12 @@ def resolve_asset_indices(
 
     return indices, labels
 
-#this outputs a np array of log returns on close bar prices. it concatenates
+#this outputs a np array of log returns on chosen channel. it concatenates
 #returns for the same asset over selected days. for example,
 #selecting 2 days for all 93 assets returns array of dim [389*2,93]
-def collect_close_log_returns(
+def collect_channel_log_returns(
         split: SplitDict,
+        channel: str='close',
         sample_indices: int|Sequence[int]|slice|None=None,
         assets: str|int|Sequence[int|str]|None=None,
 )->tuple[np.ndarray,list[str]]:
@@ -132,7 +133,11 @@ def collect_close_log_returns(
 
     for sample_idx in sample_ids:
         x,aux,day = split['samples'][sample_idx]
-        returns = compute_close_log_returns(x,split)
+        returns = compute_log_returns(
+        x=x,
+        split=split,
+        channels=[channel],
+        )
         returns = returns[:,asset_ids]
         #eg after looping over 2 days this contains
         #returns_day0 (shape[389,N]),returns_day1 (shape[389,N])
@@ -150,6 +155,7 @@ def collect_close_log_returns(
 #we may use a sparse verion of this later for our static graph
 def compute_return_correlation_matrix(
         split: SplitDict,
+        channel: str='close',
         sample_indices: int|Sequence[int]|slice|None=None,
         assets: str|int|Sequence[int|str]|None=None
 )->tuple[np.ndarray,list[str]]:
@@ -158,10 +164,11 @@ def compute_return_correlation_matrix(
 
     If sample_indices=None, this uses all days in the split.
     """
-    returns_array,asset_labels=collect_close_log_returns(
-        split,
-        sample_indices,
-        assets,
+    returns_array,asset_labels=collect_channel_log_returns(
+        split=split,
+        channel=channel,
+        sample_indices=sample_indices,
+        assets=assets,
     )
     if returns_array.shape[1]==1:
         corr = np.array([[1.0]])
@@ -225,6 +232,7 @@ def reorder_correlation_matrix(
 #we can use the reordering function to reorder if we want
 def plot_return_correlation_heatmap(
         split:SplitDict,
+        channel: str='close',
         sample_indices:int|Sequence[int]|slice|None=None,
         assets:str|int|Sequence[str|int]|None=None,
         reorder:bool=False,
@@ -242,6 +250,7 @@ def plot_return_correlation_heatmap(
 
     corr,labels = compute_return_correlation_matrix(
         split=split,
+        channel=channel,
         sample_indices=sample_indices,
         assets=assets
     )
@@ -358,7 +367,7 @@ def format_day_label(day: Any) -> str:
 #normalize=True will normalize each line plot by its first close price
 def plot_intraday_channel(
     split: SplitDict,
-    channel: int,
+    channel: str = "close",
     sample_indices: int | Sequence[int] | slice | None = None,
     assets: str | int | Sequence[str | int] | None = None,
     normalize: bool = False,
@@ -369,20 +378,21 @@ def plot_intraday_channel(
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes]:
     """
-    Plot intraday time series for selected assets and selected days for selected channel.
+    Plot intraday time series for selected assets and selected days
+    for a selected channel.
 
     Assumes split has already been cleaned.
 
     mode="concat":
         Plot one long line per asset across selected days.
         The x-axis is compressed to show trading minutes only.
-        Small gaps are inserted between days.
-        If normalize=True, each asset is normalized by its first close in the
-        selected range.
+        Small gaps filled with NaN values are inserted between days.
+        If normalize=True, each asset is normalized by its first selected value
+        in the selected range.
 
     mode="overlay":
         Plot each asset-day as a separate line on the intraday clock-time axis.
-        If normalize=True, each asset-day is normalized by that day's first close.
+        If normalize=True, each asset-day is normalized by that day's first value.
 
     By default, this plots the first max_samples days and first max_assets assets.
     Set max_samples=None to plot all selected days.
@@ -390,9 +400,9 @@ def plot_intraday_channel(
     """
     if mode not in {"concat", "overlay"}:
         raise ValueError(f"mode must be 'concat' or 'overlay', got {mode!r}")
-    
-    if channel not in split['channels']:
-        raise ValueError(f'Channel must be one of {split['channels']}')
+
+    if channel not in split["channels"]:
+        raise ValueError(f"Channel must be one of {split['channels']}")
 
     sample_ids = resolve_sample_indices(
         split,
@@ -408,6 +418,9 @@ def plot_intraday_channel(
 
     if len(sample_ids) == 0:
         raise ValueError("No sample indices selected.")
+
+    if len(asset_ids) == 0:
+        raise ValueError("No assets selected.")
 
     market_open = parse_market_time(split["market_open"])
     market_close = parse_market_time(split["market_close"])
@@ -426,35 +439,42 @@ def plot_intraday_channel(
         for asset_idx, asset_label in zip(asset_ids, asset_labels):
             x_parts = []
             y_parts = []
-            first_selected_close = None
+            first_selected_value = None
 
             for day_position, sample_idx in enumerate(sample_ids):
-                x, aux, day = split["samples"][sample_idx]
+                x, _, _ = split["samples"][sample_idx]
 
                 channel_value = get_channel(x, split, channel).float()
                 y = channel_value[:, asset_idx]
 
-                if first_selected_close is None:
-                    first_selected_close = y[0].clamp_min(1e-8)
+                if first_selected_value is None:
+                    first_selected_value = y[0].clamp_min(1e-8)
 
                 if normalize:
-                    y = y / first_selected_close
+                    y = y / first_selected_value
 
                 start = day_position * (points_per_day + gap_points)
-                x_axis = np.arange(start, start + len(y))
 
-                x_parts.append(x_axis)
-                y_parts.append(y)
+                day_x = np.arange(start, start + len(y))
+                day_y = to_numpy(y)
 
-                x_parts.append(np.array([start + len(y)]))
-                y_parts.append(y.new_tensor([float("nan")]))
+                x_parts.append(day_x)
+                y_parts.append(day_y)
+
+                if day_position < len(sample_ids) - 1:
+                    gap_start = start + len(y)
+                    gap_x = np.arange(gap_start, gap_start + gap_points)
+                    gap_y = np.full(gap_points, np.nan)
+
+                    x_parts.append(gap_x)
+                    y_parts.append(gap_y)
 
             x_all = np.concatenate(x_parts)
-            y_all = torch.cat(y_parts)
+            y_all = np.concatenate(y_parts)
 
             ax.plot(
                 x_all,
-                to_numpy(y_all),
+                y_all,
                 alpha=0.8,
                 label=asset_label,
             )
@@ -489,7 +509,7 @@ def plot_intraday_channel(
         dummy_date = datetime(2000, 1, 1)
 
         for sample_idx in sample_ids:
-            x, aux, day = split["samples"][sample_idx]
+            x, _, day = split["samples"][sample_idx]
 
             channel_value = get_channel(x, split, channel).float()
 
@@ -529,9 +549,7 @@ def plot_intraday_channel(
             f"({market_open.strftime('%H:%M')}–{market_close.strftime('%H:%M')})"
         )
 
-    ylabel = (
-        f'Normalised {channel} values' if normalize else f'{channel} values'
-    )
+    ylabel = f"Normalised {channel} values" if normalize else f"{channel} values"
 
     ax.set_title(f"Intraday {channel} values")
     ax.set_xlabel(xlabel)
@@ -544,9 +562,10 @@ def plot_intraday_channel(
 
     return fig, ax
 
-#function to plot log returns - similar to plot_intraday_close but for log returns
+#function to plot log returns - similar to plot_intraday_channel but for log returns
 def plot_intraday_log_returns(
     split: SplitDict,
+    channel: str = "close",
     sample_indices: int | Sequence[int] | slice | None = None,
     assets: str | int | Sequence[str | int] | None = None,
     mode: str = "concat",
@@ -556,17 +575,21 @@ def plot_intraday_log_returns(
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes]:
     """
-    Plot intraday close-to-close log returns for selected assets and days.
+    Plot intraday log returns/log changes for selected assets and days.
+
+    For price channels such as open, high, low, and close, these are log returns.
+    For non-price channels such as volume or amount, these are log changes.
 
     Assumes split has already been cleaned.
 
     mode="concat":
-        Plot one long return line per asset across selected days.
+        Plot one long return/change line per asset across selected days.
         The x-axis is compressed to show trading return-minutes only.
-        Small gaps are inserted between days.
+        Small gaps filled with NaN values are inserted between days.
 
     mode="overlay":
-        Plot each asset-day as a separate return line on the intraday clock-time axis.
+        Plot each asset-day as a separate return/change line on the intraday
+        clock-time axis.
 
     By default, this plots the first max_samples days and first max_assets assets.
     Set max_samples=None to plot all selected days.
@@ -574,6 +597,9 @@ def plot_intraday_log_returns(
     """
     if mode not in {"concat", "overlay"}:
         raise ValueError(f"mode must be 'concat' or 'overlay', got {mode!r}")
+
+    if channel not in split["channels"]:
+        raise ValueError(f"Channel must be one of {split['channels']}")
 
     sample_ids = resolve_sample_indices(
         split,
@@ -589,6 +615,9 @@ def plot_intraday_log_returns(
 
     if len(sample_ids) == 0:
         raise ValueError("No sample indices selected.")
+
+    if len(asset_ids) == 0:
+        raise ValueError("No assets selected.")
 
     market_open = parse_market_time(split["market_open"])
     market_close = parse_market_time(split["market_close"])
@@ -609,26 +638,38 @@ def plot_intraday_log_returns(
             y_parts = []
 
             for day_position, sample_idx in enumerate(sample_ids):
-                x, aux, day = split["samples"][sample_idx]
+                x, _, _ = split["samples"][sample_idx]
 
-                returns = compute_close_log_returns(x, split)
+                returns = compute_log_returns(
+                    x=x,
+                    split=split,
+                    channels=[channel],
+                )
+
                 y = returns[:, asset_idx]
 
                 start = day_position * (points_per_day + gap_points)
-                x_axis = np.arange(start, start + len(y))
 
-                x_parts.append(x_axis)
-                y_parts.append(y)
+                day_x = np.arange(start, start + len(y))
+                day_y = to_numpy(y)
 
-                x_parts.append(np.array([start + len(y)]))
-                y_parts.append(y.new_tensor([float("nan")]))
+                x_parts.append(day_x)
+                y_parts.append(day_y)
+
+                if day_position < len(sample_ids) - 1:
+                    gap_start = start + len(y)
+                    gap_x = np.arange(gap_start, gap_start + gap_points)
+                    gap_y = np.full(gap_points, np.nan)
+
+                    x_parts.append(gap_x)
+                    y_parts.append(gap_y)
 
             x_all = np.concatenate(x_parts)
-            y_all = torch.cat(y_parts)
+            y_all = np.concatenate(y_parts)
 
             ax.plot(
                 x_all,
-                to_numpy(y_all),
+                y_all,
                 alpha=0.8,
                 label=asset_label,
             )
@@ -663,9 +704,13 @@ def plot_intraday_log_returns(
         dummy_date = datetime(2000, 1, 1)
 
         for sample_idx in sample_ids:
-            x, aux, day = split["samples"][sample_idx]
+            x, _, day = split["samples"][sample_idx]
 
-            returns = compute_close_log_returns(x, split)
+            returns = compute_log_returns(
+                x=x,
+                split=split,
+                channels=[channel],
+            )
 
             for asset_idx, asset_label in zip(asset_ids, asset_labels):
                 y = returns[:, asset_idx]
@@ -702,9 +747,9 @@ def plot_intraday_log_returns(
 
     ax.axhline(0.0, linewidth=1)
 
-    ax.set_title("Intraday close log returns")
+    ax.set_title(f"Intraday {channel} log returns/log changes")
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Log return")
+    ax.set_ylabel("Log return / log change")
 
     if mode == "concat" or len(sample_ids) * len(asset_ids) <= 20:
         ax.legend(fontsize=8)
@@ -719,45 +764,63 @@ def plot_intraday_log_returns(
 #and all assets.
 def compute_average_intraday_abs_return(
     split: SplitDict,
+    channel: str = "close",
     sample_indices: int | Sequence[int] | slice | None = None,
     assets: str | int | Sequence[str | int] | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute average absolute close log return for each intraday return minute.
+    Compute mean and standard deviation of absolute intraday log returns/log
+    changes for one selected channel.
+
+    For price channels such as open, high, low, and close, these are log returns.
+    For non-price channels such as volume or amount, these are log changes.
 
     Averages over selected days and selected assets.
 
     Returns:
-        NumPy array with shape [T - 1].
+        avg_abs_return:
+            NumPy array with shape [T - 1].
+
+        std_abs_return:
+            NumPy array with shape [T - 1].
     """
+    if channel not in split["channels"]:
+        raise ValueError(f"Channel must be one of {split['channels']}")
+
     sample_ids = resolve_sample_indices(split, sample_indices)
-    asset_ids, asset_labels = resolve_asset_indices(split, assets)
+    asset_ids, _ = resolve_asset_indices(split, assets)
 
     if len(sample_ids) == 0:
         raise ValueError("No sample indices selected.")
 
+    if len(asset_ids) == 0:
+        raise ValueError("No assets selected.")
+
     abs_returns_per_day = []
 
     for sample_idx in sample_ids:
-        x, aux, day = split["samples"][sample_idx]
+        x, _, _ = split["samples"][sample_idx]
 
-        returns = compute_close_log_returns(x, split)
+        returns = compute_log_returns(
+            x=x,
+            split=split,
+            channels=[channel],
+        )
+
         returns = returns[:, asset_ids]
-
-        #this is a list over days of objects that are [minute,asset]
         abs_returns_per_day.append(returns.abs())
 
-    #this stacks into [day,minute,asset]
     stacked = torch.stack(abs_returns_per_day, dim=0)
-    #this averages/takes s.d over dimension 0 (day) and dimension 2 (asset)
+
     avg_abs_return = stacked.mean(dim=(0, 2))
     std_abs_return = stacked.std(dim=(0, 2), unbiased=False)
 
-    return to_numpy(avg_abs_return),to_numpy(std_abs_return)
+    return to_numpy(avg_abs_return), to_numpy(std_abs_return)
 
 #function to plot the average absolute log returns computed above
 def plot_average_intraday_abs_return(
     split: SplitDict,
+    channel: str = "close",
     sample_indices: int | Sequence[int] | slice | None = None,
     assets: str | int | Sequence[str | int] | None = None,
     mode: str = "profile",
@@ -765,7 +828,10 @@ def plot_average_intraday_abs_return(
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes, np.ndarray, np.ndarray]:
     """
-    Plot average absolute close log return.
+    Plot average absolute log returns/log changes for one selected channel.
+
+    For price channels such as open, high, low, and close, these are log returns.
+    For non-price channels such as volume or amount, these are log changes.
 
     mode="profile":
         Average over selected days and selected assets at each intraday minute.
@@ -782,11 +848,17 @@ def plot_average_intraday_abs_return(
     if mode not in {"profile", "concat"}:
         raise ValueError(f"mode must be 'profile' or 'concat', got {mode!r}")
 
+    if channel not in split["channels"]:
+        raise ValueError(f"Channel must be one of {split['channels']}")
+
     sample_ids = resolve_sample_indices(split, sample_indices)
-    asset_ids, asset_labels = resolve_asset_indices(split, assets)
+    asset_ids, _ = resolve_asset_indices(split, assets)
 
     if len(sample_ids) == 0:
         raise ValueError("No sample indices selected.")
+
+    if len(asset_ids) == 0:
+        raise ValueError("No assets selected.")
 
     market_open = parse_market_time(split["market_open"])
     market_close = parse_market_time(split["market_close"])
@@ -799,6 +871,7 @@ def plot_average_intraday_abs_return(
     if mode == "profile":
         avg_abs_return, std_abs_return = compute_average_intraday_abs_return(
             split=split,
+            channel=channel,
             sample_indices=sample_indices,
             assets=assets,
         )
@@ -817,7 +890,7 @@ def plot_average_intraday_abs_return(
         ax.plot(
             x_axis,
             avg_abs_return,
-            label="Mean absolute log return",
+            label=f"Mean absolute {channel} log return/change",
         )
 
         ax.fill_between(
@@ -846,30 +919,42 @@ def plot_average_intraday_abs_return(
         std_parts = []
 
         for day_position, sample_idx in enumerate(sample_ids):
-            x, aux, day = split["samples"][sample_idx]
+            x, _, _ = split["samples"][sample_idx]
 
-            returns = compute_close_log_returns(x, split)
+            returns = compute_log_returns(
+                x=x,
+                split=split,
+                channels=[channel],
+            )
+
             returns = returns[:, asset_ids]
-
             abs_returns = returns.abs()
 
             day_mean = abs_returns.mean(dim=1)
             day_std = abs_returns.std(dim=1, unbiased=False)
 
             start = day_position * (points_per_day + gap_points)
-            x_axis = np.arange(start, start + len(day_mean))
 
-            x_parts.append(x_axis)
-            mean_parts.append(day_mean)
-            std_parts.append(day_std)
+            day_x = np.arange(start, start + len(day_mean))
+            day_mean_np = to_numpy(day_mean)
+            day_std_np = to_numpy(day_std)
 
-            x_parts.append(np.array([start + len(day_mean)]))
-            mean_parts.append(day_mean.new_tensor([float("nan")]))
-            std_parts.append(day_std.new_tensor([float("nan")]))
+            x_parts.append(day_x)
+            mean_parts.append(day_mean_np)
+            std_parts.append(day_std_np)
+
+            if day_position < len(sample_ids) - 1:
+                gap_start = start + len(day_mean)
+                gap_x = np.arange(gap_start, gap_start + gap_points)
+                gap_values = np.full(gap_points, np.nan)
+
+                x_parts.append(gap_x)
+                mean_parts.append(gap_values)
+                std_parts.append(gap_values)
 
         x_axis = np.concatenate(x_parts)
-        avg_abs_return = to_numpy(torch.cat(mean_parts))
-        std_abs_return = to_numpy(torch.cat(std_parts))
+        avg_abs_return = np.concatenate(mean_parts)
+        std_abs_return = np.concatenate(std_parts)
 
         lower = np.maximum(avg_abs_return - std_abs_return, 0.0)
         upper = avg_abs_return + std_abs_return
@@ -877,7 +962,7 @@ def plot_average_intraday_abs_return(
         ax.plot(
             x_axis,
             avg_abs_return,
-            label="Mean absolute log return across assets",
+            label=f"Mean absolute {channel} log return/change across assets",
         )
 
         ax.fill_between(
@@ -913,9 +998,9 @@ def plot_average_intraday_abs_return(
             f"({market_open.strftime('%H:%M')}–{market_close.strftime('%H:%M')})"
         )
 
-    ax.set_title("Average absolute close log return")
+    ax.set_title(f"Average absolute {channel} log return/change")
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Absolute log return")
+    ax.set_ylabel("Absolute log return / log change")
     ax.set_ylim(bottom=0.0)
     ax.legend(fontsize=8)
 
