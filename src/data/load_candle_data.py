@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Sequence
 import torch
 
 #create a dictionary called SplitDict -> keys are strings and values are any
@@ -144,29 +144,55 @@ def get_channel(x: torch.Tensor,split: SplitDict, channel: str) -> torch.Tensor:
     return x[:,:,idx]
 
 #function to compute log returns from close to close for a single day
-def compute_close_log_returns(
-        x: torch.Tensor,
-        split: SplitDict,
-        eps: float = 1e-8
+def compute_log_returns(
+    x: torch.Tensor,
+    split: SplitDict,
+    channels: Sequence[str],
+    eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Compute within-day close-to-close log returns.
+    Compute within-day log changes for one or more channels.
+
+    For price channels such as open, high, low, and close, these are log returns.
+    For non-price channels such as volume or amount, these are log changes.
 
     Args:
-        x: cleaned daily tensor with shape [T, N, D]
-        split: split dictionary containing channel metadata
-        eps: lower clamp to avoid log(0)
+        x:
+            Daily tensor with shape [T, N, D].
+
+        split:
+            Split dictionary containing channel names.
+
+        channels:
+            Channels to transform, e.g. ["close"] or
+            ["open", "high", "low", "close"].
+
+        eps:
+            Small positive value used to avoid log(0).
 
     Returns:
-        returns with shape [T - 1, N]
+        If one channel is requested:
+            Tensor with shape [T - 1, N].
+
+        If multiple channels are requested:
+            Tensor with shape [T - 1, N, C],
+            where C is len(channels).
 
     Definition:
-        r[t] = log(close[t + 1]) - log(close[t])
+        r[t] = log(value[t + 1]) - log(value[t])
     """
+    if len(channels) == 0:
+        raise ValueError("At least one channel must be requested.")
 
-    close = get_channel(x, split, channel='close')
-    log_close = torch.log(close.clamp_min(eps))
-    returns = log_close[1:]-log_close[:-1]
+    channel_indices = [get_channel_index(split, channel) for channel in channels]
+
+    values = x[:, :, channel_indices].float()
+    log_values = torch.log(values.clamp_min(eps))
+
+    returns = log_values[1:] - log_values[:-1]
+
+    if len(channels) == 1:
+        returns = returns[:, :, 0]
 
     return returns
 
