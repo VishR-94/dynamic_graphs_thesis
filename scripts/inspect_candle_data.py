@@ -5,11 +5,11 @@
 import argparse
 import torch
 
-from src.data.candle import(
+from src.data.load_candle_data import(
     load_candle_splits,
     clean_candle_splits,
     describe_split,
-    compute_close_log_returns,
+    compute_log_returns,
     validate_clean_split
 )
 
@@ -49,7 +49,11 @@ def main() -> None:
 
     print("\nComputing first-day close log returns...")
     x, aux, day = train["samples"][0]
-    returns = compute_close_log_returns(x, train)
+    returns = compute_log_returns(
+    x=x,
+    split=train,
+    channels=["close"],
+    )
     print("day:", day)
     print("x shape:", tuple(x.shape))
     print("returns shape:", tuple(returns.shape))
