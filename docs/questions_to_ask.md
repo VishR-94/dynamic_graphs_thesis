@@ -3,4 +3,8 @@
 3) How do we do the probabilistic output head for our architecture - we output discrete tokens. Should we (a) output a softmax prob vector over the discrete token space and then sample from that (before feeding into the decoder), giving us essentially an emperical distribution over the predictions in the continuous space or (b) in our forecasting model take the forecasted discrete tokens, decode back to the continuous space and then feed that into a probabilistic output head that gives us the mean and variance of a Gaussian as our output?
 4) Should we standardise our data beforehand? If so, how? Using the mean and std of the training dataset or should we standardise each window individually?
 
+5) It looks like theres some errors in the data - examples found:
+    1. NVDA prices look incorrect
+    2. BKNG prices look incorrect
 
+    
