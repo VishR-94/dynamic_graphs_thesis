@@ -32,7 +32,7 @@ class WindowedCandleDataset(Dataset):
         y[1] = value at origin + horizons[1]
         ...
 
-    No normalization is applied here unless a normaliser is passed.
+    No normalisation is applied here unless a normaliser is passed.
     """
     
     def __init__(
@@ -121,6 +121,14 @@ class WindowedCandleDataset(Dataset):
             self.target_channel_ids,
         ].float()
 
+        #get the last point of the context window - this gives [93,6]
+        last_context_full = x_day[origin_idx]
+        #we only want the target channels (since this is all we will need to reconstruct)
+        last_context_target = last_context_full[
+            :,
+            self.target_channel_ids,
+        ].float()
+
         example: ExampleDict = {
             "x": x,
             "y": y,
@@ -129,6 +137,7 @@ class WindowedCandleDataset(Dataset):
             "origin_idx": origin_idx,
             "context_start": context_start,
             "context_end": context_end,
+            "last_context_target": last_context_target,
             "target_indices": target_indices_tensor,
             "input_channels": self.input_channels,
             "target_channels": self.target_channels,
@@ -214,3 +223,153 @@ class WindowedCandleDataset(Dataset):
                 f"Available channels: {available_channels}."
             )
 
+
+#class to normalise windowed data using window mean and std
+class WindowContextNormaliser():
+    """
+    Normalise each forecasting example using statistics computed from its own
+    context window.
+
+    This is the raw-candle/Kronos-style normalisation route.
+
+    For each example:
+
+        x: [context_length, N, input_channels]
+        y: [num_horizons, N, target_channels]
+
+    We compute mean/std from x over the time dimension:
+
+        mean: [N, input_channels]
+        std:  [N, input_channels]
+
+    Then we normalise:
+
+        x_norm = (x - mean) / std
+
+    For y, we use the matching target-channel statistics from the same context
+    window.
+    """
+
+    def __init__(
+            self,
+            eps: float=1e-8,
+            clip:bool=True,
+            clip_min:float=-5,
+            clip_max:float=5,
+            apply_to_target:bool=True,
+            include_stats:bool=True
+    ):
+        self.eps = eps
+        self.clip = clip
+        self.clip_min = clip_min
+        self.clip_max = clip_max
+        self.apply_to_target = apply_to_target
+        self.include_stats = include_stats
+
+    @classmethod
+    def from_config(
+        cls,
+        config:dict[str,Any]
+    ):
+        """
+        Build a WindowContextNormaliser from the YAML config.
+        """
+        normalisation_config = config['normalisation']
+        if normalisation_config["method"] != "window_context":
+            raise ValueError(
+                "WindowContextNormaliser requires "
+                "normalisation.method: window_context"
+            )
+        
+        window_config = normalisation_config['window_context']
+        if window_config["stats_from"] != "context":
+            raise ValueError("Only stats_from: context is currently supported.")
+
+        if window_config["scope"] != "per_asset_channel":
+            raise ValueError("Only scope: per_asset_channel is currently supported.")
+        
+        return cls(
+            eps=float(normalisation_config["eps"]),
+            clip=bool(normalisation_config["clip"]),
+            clip_min=float(normalisation_config["clip_min"]),
+            clip_max=float(normalisation_config["clip_max"]),
+            apply_to_target=bool(window_config["apply_to_target"]),
+            include_stats=bool(window_config["include_stats"]),
+        )
+    
+    #this will be run automatically when self.normaliser since it is __call__
+    def __call__(
+            self,
+            example:ExampleDict,
+    )->ExampleDict:
+        """
+        Normalise one example dictionary.
+        """
+        x = example['x'].float()
+        y = example['y'].float()
+
+        if x.ndim != 3:
+            raise ValueError(f"Expected x to have shape [T, N, C], got {x.shape}")
+
+        if y.ndim != 3:
+            raise ValueError(f"Expected y to have shape [H, N, C], got {y.shape}")
+        
+        #compute mean and std along the time dimension - returns [N,C]
+        mean = x.mean(dim=0)
+        std = x.std(dim=0,unbiased=False).clamp_min(self.eps)
+        log_std = torch.log(std)
+        
+        #this works because of pytorch broadcasting
+        x_norm = (x-mean)/std
+
+        #clip x_norm if we want to
+        if self.clip:
+            x_norm = x_norm.clamp(self.clip_min,self.clip_max)
+
+        #now we need to modify the original example dictionary
+        example = dict(example)
+        example['x'] = x_norm
+
+        #now we need to normalise the targets - recall the target channels may not equal input channels
+        #we also need to use the input data mean/std to normalise the target
+
+        input_channels = example['input_channels']
+        target_channels = example['target_channels']
+
+        target_channel_positions = [
+            input_channels.index(channel)
+            for channel in target_channels
+        ]
+
+        #now we have the index of the target channels, convert it into a torch tensor
+        target_channel_positions = torch.tensor(
+            target_channel_positions,
+            dtype=torch.long,
+            device=mean.device,
+        )
+        
+        #now get the mean, std and log_std of the target channels
+        target_mean = mean.index_select(1, target_channel_positions)
+        target_std = std.index_select(1, target_channel_positions)
+        target_log_std = log_std.index_select(1, target_channel_positions)
+
+        if self.apply_to_target:
+            y_norm = (y-target_mean)/target_std
+
+            if self.clip:
+                y_norm = y_norm.clamp(self.clip_min,self.clip_max)
+            
+            example['y'] = y_norm
+
+        if self.include_stats:
+            example["norm_mean"] = mean
+            example["norm_std"] = std
+            example["norm_log_std"] = log_std
+
+            example["target_norm_mean"] = target_mean
+            example["target_norm_std"] = target_std
+            example["target_norm_log_std"] = target_log_std
+        
+        return example
+
+        
