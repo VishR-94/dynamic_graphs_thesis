@@ -42,7 +42,7 @@ features:
     - volume
     - amount
 
-normalization:
+normalisation:
   enabled: true
   method: window_context
 
