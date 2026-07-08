@@ -4,7 +4,10 @@
 4) Should we standardise our data beforehand? If so, how? Using the mean and std of the training dataset or should we standardise each window individually?
 
 5) It looks like theres some errors in the data - examples found:
-    1. NVDA prices look incorrect
-    2. BKNG prices look incorrect
+    1. NVDA prices look incorrect - first half of the year the level is completely wrong
+    2. BKNG prices look incorrect - shape looks fine but the level is wrong. Data shows it trading around 3500 but it traded 150 in 2024
+    3. AVGO prices look incorrect - first half of the year the level is completely wrong
+    4. WMT prices look incorrect - first few months of year the level is wrong
+
 
     
