@@ -372,4 +372,56 @@ class WindowContextNormaliser():
         
         return example
 
-        
+#function to generate log change data. Its better to evaluate our models on log changes 
+#since this does not suffer from large level difference between the assets and channels
+#MSE/RMSE on raw data is very difficult to compare across models/assets/channels
+
+#important that we only compute log changes WITHIN each day (i.e. we dont want to compute 
+# log changes where log(p_t) - log(p_(t-1)) and t/(t-1) are 2 close on one day and open the next)
+#this is because there is stock splits and other price jumps that we can't clean out
+
+def build_log_change_split(
+        split:SplitDict,
+        eps:float=1e-8
+)->SplitDict:
+    """
+    Convert a cleaned raw candle split into within-day one-step log changes.
+
+    For each daily tensor x with shape [T, N, D], this returns a new daily
+    tensor with shape [T - 1, N, D]:
+
+        x_log[t] = log(x[t + 1]) - log(x[t])
+
+    This is computed separately within each day, so no overnight returns or
+    stock-split boundary jumps are created.
+
+    For price channels, these are log returns.
+    For volume/amount channels, these are log changes.
+    """
+
+    if 'samples' not in split:
+        raise KeyError("split must contain the key 'samples'")
+    
+    if len(split['samples'])==0:
+        raise ValueError("split contains no samples")
+    
+    new_samples=[]
+
+    for x_day,aux,day in split['samples']:
+        if x_day.ndim != 3:
+            raise ValueError(
+                f'Expected each day to have shape [T,N,C], got {x_day.shape}'
+            )
+        x_day = x_day.float()
+        log_values = torch.log(x_day.clamp_min(eps))
+        x_log_change = log_values[1:] - log_values[:-1]
+
+        new_samples.append((x_log_change,aux,day))
+
+    log_split = dict(split)
+    log_split['samples'] = new_samples
+    log_split["T"] = new_samples[0][0].shape[0]
+    log_split['representation'] = 'log_change'
+    log_split['eps'] = eps
+
+    return log_split
