@@ -29,15 +29,42 @@ forecasting:
     - close
     - volume
 
-preprocessing:
-  standardize: true
-  standardization_scope: global_train
+features:
+  representation: raw
+
+  price_channels:
+    - open
+    - high
+    - low
+    - close
+
+  non_price_channels:
+    - volume
+    - amount
+
+normalization:
+  enabled: true
+  method: window_context
 
   clip: true
   clip_min: -5.0
   clip_max: 5.0
 
   eps: 1.0e-8
+
+  window_context:
+    stats_from: context
+    scope: per_asset_channel
+    apply_to_target: true
+    include_stats: true
+    stats:
+      - mean
+      - log_std
+
+  global_train:
+    fit_on: train
+    scope: all_assets
+    apply_to_target: true
 
 training:
   batch_size: 32
