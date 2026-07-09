@@ -9,5 +9,6 @@
     3. AVGO prices look incorrect - first half of the year the level is completely wrong
     4. WMT prices look incorrect - first few months of year the level is wrong
 
-
+------
+1) Ask Lampos - when we evaluate the statistical benchmark models (ARIMA,GARCH), is it ok if we skip steps since its not feasible to evaluate on exactly the same steps as the neural models since the statistical models will be univariate, 1 per channel per asset. This means on the test dataset we will need to do 5,691 × 93 × 5 = 2.65 million forecasts which wont be feasible. Instead can we just stride forward our context window (so we jump maybe 60minutes ahead) which reduces the number of forecasts to 48,825. Is that defensible just for those benchmarks (not an issue for the neural models since they are multivariate and can be batched).
     
