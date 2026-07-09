@@ -414,7 +414,7 @@ def build_log_change_split(
             )
         x_day = x_day.float()
         log_values = torch.log(x_day.clamp_min(eps))
-        x_log_change = log_values[1:] - log_values[:-1]
+        x_log_change = log_values[1:,:,:] - log_values[:-1,:,:]
 
         new_samples.append((x_log_change,aux,day))
 
