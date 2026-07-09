@@ -132,6 +132,7 @@ class WindowedCandleDataset(Dataset):
         example: ExampleDict = {
             "x": x,
             "y": y,
+            "y_unnormalised": y,
             "day": day,
             "sample_idx": sample_idx,
             "origin_idx": origin_idx,
@@ -425,3 +426,108 @@ def build_log_change_split(
     log_split['eps'] = eps
 
     return log_split
+
+#function to transform our raw input data to a feature representation that guarantees valid
+#candle predictions - namely we need to ensure close_pred, open_pred, high_pred, low_pred, volume_pred 
+#are all positive and theat high_pred >= low_pred. These transformations ensure that - later we will 
+#invert them to get predictions back into raw price space. 
+
+def build_valid_transformed_split(
+    split: SplitDict,
+    eps: float = 1e-8,
+) -> SplitDict:
+    """
+    Convert raw OHLCV candles xinto a valid-candle feature representation.
+
+    Input channels must include:
+        open, high, low, close, volume
+
+    Output channels are:
+        log_close
+        log_open_to_close
+        log_upper_wick_ratio
+        log_lower_wick_ratio
+        log_volume
+
+    These features can later be inverted back to valid OHLCV candles.
+    """
+    required_channels = ["open", "high", "low", "close", "volume"]
+
+    missing_channels = [
+        channel
+        for channel in required_channels
+        if channel not in split["channels"]
+    ]
+
+    if len(missing_channels) > 0:
+        raise ValueError(
+            f"Missing required channels: {missing_channels}. "
+            f"Available channels: {split['channels']}."
+        )
+
+    open_idx = get_channel_index(split, "open")
+    high_idx = get_channel_index(split, "high")
+    low_idx = get_channel_index(split, "low")
+    close_idx = get_channel_index(split, "close")
+    volume_idx = get_channel_index(split, "volume")
+
+    new_channels = [
+        "log_close",
+        "log_open_to_close",
+        "log_upper_wick_ratio",
+        "log_lower_wick_ratio",
+        "log_volume",
+    ]
+
+    new_samples = []
+
+    for x_day, aux, day in split["samples"]:
+        if x_day.ndim != 3:
+            raise ValueError(
+                f"Expected each x_day to have shape [T, N, D], got {x_day.shape}"
+            )
+
+        x_day = x_day.float()
+
+        open_price = x_day[:, :, open_idx].clamp_min(eps)
+        high_price = x_day[:, :, high_idx].clamp_min(eps)
+        low_price = x_day[:, :, low_idx].clamp_min(eps)
+        close_price = x_day[:, :, close_idx].clamp_min(eps)
+        volume = x_day[:, :, volume_idx].clamp_min(eps)
+
+        body_high = torch.maximum(open_price, close_price)
+        body_low = torch.minimum(open_price, close_price)
+
+        high_price = torch.maximum(high_price, body_high)
+        low_price = torch.minimum(low_price, body_low).clamp_min(eps)
+
+        upper_wick_ratio = high_price / body_high.clamp_min(eps) - 1.0
+        lower_wick_ratio = body_low / low_price.clamp_min(eps) - 1.0
+
+        log_close = torch.log(close_price)
+        log_open_to_close = torch.log(open_price / close_price)
+        log_upper_wick_ratio = torch.log(upper_wick_ratio.clamp_min(0.0) + eps)
+        log_lower_wick_ratio = torch.log(lower_wick_ratio.clamp_min(0.0) + eps)
+        log_volume = torch.log(volume)
+
+        x_transformed = torch.stack(
+            [
+                log_close,
+                log_open_to_close,
+                log_upper_wick_ratio,
+                log_lower_wick_ratio,
+                log_volume,
+            ],
+            dim=2,
+        )
+
+        new_samples.append((x_transformed, aux, day))
+
+    transformed_split = dict(split)
+    transformed_split["samples"] = new_samples
+    transformed_split["channels"] = new_channels
+    transformed_split["T"] = new_samples[0][0].shape[0]
+    transformed_split["representation"] = "valid_transformed"
+    transformed_split["eps"] = eps
+
+    return transformed_split
