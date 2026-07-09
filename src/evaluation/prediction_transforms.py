@@ -1,4 +1,8 @@
+import torch
+from collections.abc import Sequence
+
 ####
+# Usage:
 # We want to be able to evaluate our models using metrics (such as MSE and RMSE) either on 
 # raw price scale or log change scale. Log change scale is better since it is not impacted by
 # the different levels of all series across assets. The issue is that some of our models will
@@ -20,8 +24,6 @@
 #    get cumulative log change predictions to each horizon point, which can then be converted back to raw
 #    price prediction at the horizon and compared to raw price models.  
 ###
-import torch
-from collections.abc import Sequence
 
 #function to undo the window normalisation on predictions from neural models
 def inverse_window_normalisation(
