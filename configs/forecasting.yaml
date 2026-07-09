@@ -32,16 +32,6 @@ forecasting:
 features:
   representation: raw
 
-  price_channels:
-    - open
-    - high
-    - low
-    - close
-
-  non_price_channels:
-    - volume
-    - amount
-
 normalisation:
   enabled: true
   method: window_context
