@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from src.data.load_candle_data import (
     clean_candle_splits,
     load_candle_splits,
+    get_channel_index,
 )
 from src.data.data_generator import (
     WindowContextNormaliser,
@@ -158,6 +159,7 @@ def run_real_data_tests() -> None:
     transformed_config = deepcopy(config)
     transformed_config["forecasting"]["input_channels"] = VALID_TRANSFORMED_CHANNELS
     transformed_config["forecasting"]["target_channels"] = VALID_TRANSFORMED_CHANNELS
+    transformed_config["normalisation"]["clip"] = False
 
     train_raw, val_raw, test_raw = load_candle_splits(DATA_DIR)
 
@@ -215,7 +217,11 @@ def run_real_data_tests() -> None:
             "Add 'y_unnormalised': y to WindowedCandleDataset before normalisation."
         )
 
-    assert tuple(example["y_unnormalised"].shape) == (expected_num_horizons, 93, 5)
+    assert tuple(example["y_unnormalised"].shape) == (
+        expected_num_horizons,
+        93,
+        5,
+    )
 
     print_check("WindowedCandleDataset returns expected single-example shapes.")
 
@@ -229,7 +235,12 @@ def run_real_data_tests() -> None:
 
     assert tuple(batch["x"].shape) == (4, 60, 93, 5)
     assert tuple(batch["y"].shape) == (4, expected_num_horizons, 93, 5)
-    assert tuple(batch["y_unnormalised"].shape) == (4, expected_num_horizons, 93, 5)
+    assert tuple(batch["y_unnormalised"].shape) == (
+        4,
+        expected_num_horizons,
+        93,
+        5,
+    )
     assert tuple(batch["last_context_target"].shape) == (4, 93, 5)
     assert tuple(batch["target_norm_mean"].shape) == (4, 93, 5)
     assert tuple(batch["target_norm_std"].shape) == (4, 93, 5)
@@ -246,7 +257,23 @@ def run_real_data_tests() -> None:
 
     assert tuple(y_transformed_recovered.shape) == tuple(batch["y"].shape)
 
-    print_check("Inverse window normalisation works on a real batch.")
+    if not torch.allclose(
+        y_transformed_recovered,
+        batch["y_unnormalised"],
+        atol=1e-5,
+        rtol=1e-5,
+    ):
+        max_diff = (
+            y_transformed_recovered
+            - batch["y_unnormalised"]
+        ).abs().max().item()
+
+        raise ValueError(
+            "Inverse window normalisation did not recover y_unnormalised. "
+            f"Max diff: {max_diff}"
+        )
+
+    print_check("Inverse window normalisation recovers y_unnormalised.")
 
     y_pred_raw = valid_transformed_to_raw_ohlcv(
         y_transformed=y_transformed_recovered,
@@ -273,6 +300,51 @@ def run_real_data_tests() -> None:
     check_finite("y_pred_raw", y_pred_raw)
     check_finite("y_true_raw", y_true_raw)
     check_finite("last_context_raw", last_context_raw)
+
+    raw_channel_indices = torch.tensor(
+        [
+            get_channel_index(test_clean, channel)
+            for channel in RAW_OUTPUT_CHANNELS
+        ],
+        dtype=torch.long,
+    )
+
+    raw_targets = []
+
+    for batch_idx in range(batch["y"].shape[0]):
+        sample_idx = int(batch["sample_idx"][batch_idx].item())
+        target_indices = batch["target_indices"][batch_idx]
+
+        x_raw_day, _, _ = test_clean["samples"][sample_idx]
+
+        y_raw_direct = x_raw_day.index_select(
+            0,
+            target_indices,
+        )
+
+        y_raw_direct = y_raw_direct.index_select(
+            2,
+            raw_channel_indices,
+        ).float()
+
+        raw_targets.append(y_raw_direct)
+
+    y_raw_direct = torch.stack(raw_targets, dim=0)
+
+    if not torch.allclose(
+        y_true_raw,
+        y_raw_direct,
+        atol=1e-4,
+        rtol=1e-4,
+    ):
+        max_diff = (y_true_raw - y_raw_direct).abs().max().item()
+
+        raise ValueError(
+            "Inverse valid-candle transform did not recover raw targets. "
+            f"Max diff: {max_diff}"
+        )
+
+    print_check("Inverse valid-candle transform recovers raw OHLCV targets.")
 
     open_price = y_pred_raw[..., 0]
     high_price = y_pred_raw[..., 1]
@@ -332,7 +404,10 @@ def run_real_data_tests() -> None:
     assert overall_rmse.ndim == 0
     assert tuple(per_horizon_rmse.shape) == (expected_num_horizons,)
     assert tuple(per_channel_rmse.shape) == (5,)
-    assert tuple(per_horizon_channel_rmse.shape) == (expected_num_horizons, 5)
+    assert tuple(per_horizon_channel_rmse.shape) == (
+        expected_num_horizons,
+        5,
+    )
 
     check_finite("overall_rmse", overall_rmse)
     check_finite("per_horizon_rmse", per_horizon_rmse)
