@@ -1,9 +1,10 @@
-#this script is a test for the data layer :
-#can we load and clean data, are the shapes correct, can we compute log returns
-#are the Inf/NaN values
-
 import argparse
 import torch
+
+'''
+This script is a test for the data layer : can we load and clean data, are the shapes correct, 
+can we compute log returns and are there Inf/NaN values
+'''
 
 from src.data.load_candle_data import(
     load_candle_splits,

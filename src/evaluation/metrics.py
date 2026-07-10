@@ -1,16 +1,16 @@
 from collections.abc import Sequence
 import torch
 
-###
-# Usage as follows:
-# Each metric takes y_pred and y_true. These are shape [H,N,C] or [B,H,N,C]
-# First it computes pointwise metric called values which returns tensor of same shape as y_pred/y_true
-# So values contains the errors for a given batch (B) for a given horizon (H) for a given asset (N) for a given channel (C)
-# Then we use reduce_metric to average over chosen channels
-# For example, if y_pred/y_true are [B,H,N,C] and reduce_dims=c(0,2)
-# we average over batch and asset and return a tensor of shape [H,C] - error per horizon per channel
-# if reduce_dims = None, we return a single number which is the error metric averaged over B,H,N,C
-###
+'''
+ Usage as follows:
+ Each metric takes y_pred and y_true. These are shape [H,N,C] or [B,H,N,C]
+ First it computes pointwise metric called values which returns tensor of same shape as y_pred/y_true
+ So values contains the errors for a given batch (B) for a given horizon (H) for a given asset (N) for a given channel (C)
+ Then we use reduce_metric to average over chosen channels
+ For example, if y_pred/y_true are [B,H,N,C] and reduce_dims=c(0,2)
+ we average over batch and asset and return a tensor of shape [H,C] - error per horizon per channel
+ if reduce_dims = None, we return a single number which is the error metric averaged over B,H,N,C
+'''
 
 def validate_prediction_shapes(
     y_pred: torch.Tensor,

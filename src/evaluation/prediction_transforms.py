@@ -1,29 +1,29 @@
 import torch
 from collections.abc import Sequence
 
-####
-# Usage:
-# We want to be able to evaluate our models using metrics (such as MSE and RMSE) either on 
-# raw price scale or log change scale. Log change scale is better since it is not impacted by
-# the different levels of all series across assets. The issue is that some of our models will
-# take as their input window normalised price data and therefore output (normalised) price data
-# and some (e.g. ARIMA) will take as their input log change data and output log change data.
-# Here we will have functions to 
-# 1. Undo the window normalisation we do before passing data to neural models.
-#    This will allow us to transform neural model predictions back to raw price scale
-# 2. Undo the transformations we make to the inputs that were used to ensure the predictions are valid
-#    candle data (all values>0, high>=low etc).     
-# 3. Convert Raw price predictions to a cumulative log change equivalent. For example, if
-#    we have a raw price prediction at t=[1,5,15,30,60], we can convert those to cumulative log
-#    change from the origin to those horizon points.
-# 4. Convert cumulative log change predictions back to raw prices. ARIMA will output all log changes
-#    between t=[1,2,3,....,60]. We can use those along with the last price in the window to compute 
-#    the predicted raw price at the points in our horizon.
-# 5. Helper functions to compute cumulative log changes from one step log changes. This will allow us to 
-#    take the one step log change predictions from ARIMA or seq-to-seq models and cumulate them to 
-#    get cumulative log change predictions to each horizon point, which can then be converted back to raw
-#    price prediction at the horizon and compared to raw price models.  
-###
+'''
+ Usage:
+ We want to be able to evaluate our models using metrics (such as MSE and RMSE) either on 
+ raw price scale or log change scale. Log change scale is better since it is not impacted by
+ the different levels of all series across assets. The issue is that some of our models will
+ take as their input window normalised price data and therefore output (normalised) price data
+ and some (e.g. ARIMA) will take as their input log change data and output log change data.
+ Here we will have functions to 
+ 1. Undo the window normalisation we do before passing data to neural models.
+    This will allow us to transform neural model predictions back to raw price scale
+ 2. Undo the transformations we make to the inputs that were used to ensure the predictions are valid
+    candle data (all values>0, high>=low etc).     
+ 3. Convert Raw price predictions to a cumulative log change equivalent. For example, if
+    we have a raw price prediction at t=[1,5,15,30,60], we can convert those to cumulative log
+    change from the origin to those horizon points.
+ 4. Convert cumulative log change predictions back to raw prices. ARIMA will output all log changes
+    between t=[1,2,3,....,60]. We can use those along with the last price in the window to compute 
+    the predicted raw price at the points in our horizon.
+ 5. Helper functions to compute cumulative log changes from one step log changes. This will allow us to 
+    take the one step log change predictions from ARIMA or seq-to-seq models and cumulate them to 
+    get cumulative log change predictions to each horizon point, which can then be converted back to raw
+    price prediction at the horizon and compared to raw price models.  
+'''
 
 #function to undo the window normalisation on predictions from neural models
 def inverse_window_normalisation(
