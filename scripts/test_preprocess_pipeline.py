@@ -159,6 +159,7 @@ def run_real_data_tests() -> None:
     transformed_config = deepcopy(config)
     transformed_config["forecasting"]["input_channels"] = VALID_TRANSFORMED_CHANNELS
     transformed_config["forecasting"]["target_channels"] = VALID_TRANSFORMED_CHANNELS
+    #need clip=Flase here else we wont be able to recover the true unnormalised values
     transformed_config["normalisation"]["clip"] = False
 
     train_raw, val_raw, test_raw = load_candle_splits(DATA_DIR)
