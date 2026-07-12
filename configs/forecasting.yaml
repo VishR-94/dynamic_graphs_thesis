@@ -6,6 +6,7 @@ data:
 
 forecasting:
   context_length: 60
+  stride: 15
 
   horizons:
     - 1

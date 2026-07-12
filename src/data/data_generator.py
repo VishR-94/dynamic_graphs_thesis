@@ -42,6 +42,7 @@ class WindowedCandleDataset(Dataset):
             horizons: list[int],
             input_channels: list[str],
             target_channels: list[str],
+            stride: int = 1,
             normaliser: Callable[[ExampleDict],ExampleDict]|None=None
     )-> None:
         self.split = split
@@ -49,6 +50,7 @@ class WindowedCandleDataset(Dataset):
         self.horizons = horizons
         self.input_channels = input_channels
         self.target_channels = target_channels
+        self.stride = stride
         self.normaliser = normaliser
         
         self._validate_inputs()
@@ -83,6 +85,7 @@ class WindowedCandleDataset(Dataset):
             horizons = list(forecasting_config['horizons']),
             input_channels = list(forecasting_config['input_channels']),
             target_channels = list(forecasting_config['target_channels']),
+            stride = int(forecasting_config.get('stride',1)),
             normaliser = normaliser,
         )
     
@@ -174,7 +177,7 @@ class WindowedCandleDataset(Dataset):
             if last_origin < first_origin:
                 continue
 
-            for origin_idx in range(first_origin,last_origin+1):
+            for origin_idx in range(first_origin,last_origin+1,self.stride):
                 index.append((sample_idx,origin_idx))
             
         return index
