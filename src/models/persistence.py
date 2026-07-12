@@ -53,7 +53,7 @@ class PersistenceBaseline:
             context_length=int(forecasting_config["context_length"]),
             horizons=list(forecasting_config["horizons"]),
             target_channels=list(forecasting_config["target_channels"]),
-            stride = int(forecasting_config.get("stride",1)),
+            stride = int(forecasting_config['stride']),
         )
 
     def fit(

@@ -85,7 +85,7 @@ class WindowedCandleDataset(Dataset):
             horizons = list(forecasting_config['horizons']),
             input_channels = list(forecasting_config['input_channels']),
             target_channels = list(forecasting_config['target_channels']),
-            stride = int(forecasting_config.get('stride',1)),
+            stride = int(forecasting_config['stride']),
             normaliser = normaliser,
         )
     
