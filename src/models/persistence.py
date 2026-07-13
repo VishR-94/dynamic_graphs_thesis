@@ -11,7 +11,7 @@ PredictionDict = dict[str, Any]
 
 '''
 Implement a simple persistence benchmark. This works as follows:
-For each window, we predict all values of the horizon to simple be the values at the last point in the window.
+For each window, we predict all values of the horizon to simply be the values at the last point in the window.
 For example, if our window is length 60 and horizons are [1,5,15,30,60], our predictions (in either prices or 
 log change) for every horizon is just the values in the final available minute in our window for all assets and
 all channels. 
