@@ -28,7 +28,6 @@ forecasting:
     - high
     - low
     - close
-    - volume
 
 features:
   representation: raw
