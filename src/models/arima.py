@@ -34,7 +34,7 @@ and first_origin = context_length - 1
 That means with max_horizon = context_length = 60, T = 390, stride = 15), we have
     num_forecasting_calls = 93 * 20 * 4 * 19 = 141,360 forecasting calls 
 
-This can take hours.
+This can take hours. On just close data, using auto.arima with a stride of 15mins will take ~120 mins on CPU. 
 '''
 
 SplitDict = dict[str, Any]
