@@ -10,7 +10,6 @@ from src.data.load_candle_data import get_channel_index
 from src.evaluation.prediction_transforms import (
     cumulative_log_change_to_raw,
     one_step_returns_to_cumulative_horizons,
-    raw_to_cumulative_log_change,
 )
 
 SplitDict = dict[str, Any]
@@ -34,15 +33,17 @@ class VarBaseline:
 
     This model fits one VAR model per target channel.
 
-    For close-only targets, this means:
-        one VAR model over all assets' close log changes.
+    For close-only targets, this means one VAR model over all assets'
+    close log changes.
 
     Prediction flow:
         raw context
         -> one-step log-change context
         -> VAR forecasts future one-step log changes
         -> cumulative horizon log changes
-        -> optionally raw values
+        -> raw predicted values
+
+    Predictions and ground truth are returned in raw value space.
     """
 
     def __init__(
@@ -180,19 +181,17 @@ class VarBaseline:
 
     def fitted_values(
         self,
-        output_space: str = "cumulative_log_change",
         batch_size: int = 256,
         num_workers: int = 0,
     ) -> PredictionDict:
         """
-        Return VAR predictions and true values on the training split.
+        Return raw VAR predictions and ground truth on the training split.
         """
         if self.train_split is None:
             raise ValueError("Call fit(...) before fitted_values().")
 
         return self.predict(
             split=self.train_split,
-            output_space=output_space,
             batch_size=batch_size,
             num_workers=num_workers,
         )
@@ -200,21 +199,28 @@ class VarBaseline:
     def predict(
         self,
         split: SplitDict,
-        output_space: str = "cumulative_log_change",
         batch_size: int = 256,
         num_workers: int = 0,
     ) -> PredictionDict:
         """
-        Generate VAR predictions.
+        Generate raw VAR predictions.
+
+        Args:
+            split:
+                Cleaned raw candle split.
+
+            batch_size:
+                DataLoader batch size.
+
+            num_workers:
+                Number of DataLoader workers.
+
+        Returns:
+            Dictionary containing raw y_pred and y_true tensors with shape:
+                [num_examples, num_horizons, num_assets, num_channels]
         """
         if len(self.fitted_models) == 0:
             raise ValueError("Call fit(...) before predict(...).")
-
-        if output_space not in {"cumulative_log_change", "raw"}:
-            raise ValueError(
-                "output_space must be either 'cumulative_log_change' or "
-                f"'raw', got {output_space}."
-            )
 
         dataset = WindowedCandleDataset.from_config(
             split=split,
@@ -236,6 +242,7 @@ class VarBaseline:
         all_sample_idx = []
         all_origin_idx = []
         all_target_indices = []
+        all_last_context_target = []
 
         for batch in loader:
             x_context = batch["x"].float()
@@ -254,31 +261,21 @@ class VarBaseline:
                 horizons=self.horizons,
             )
 
-            y_true_cumulative = raw_to_cumulative_log_change(
-                y_raw=y_true_raw,
+            y_pred_raw = cumulative_log_change_to_raw(
+                cumulative_log_change=y_pred_cumulative,
                 last_context_target=last_context_target,
-            )
+            )   
 
-            if output_space == "cumulative_log_change":
-                y_pred = y_pred_cumulative
-                y_true = y_true_cumulative
-
-            else:
-                y_pred = cumulative_log_change_to_raw(
-                    cumulative_log_change=y_pred_cumulative,
-                    last_context_target=last_context_target,
-                )
-
-                y_true = y_true_raw
-
-            all_y_pred.append(y_pred)
-            all_y_true.append(y_true)
+            all_y_pred.append(y_pred_raw)
+            all_y_true.append(y_true_raw)
             all_sample_idx.append(batch["sample_idx"])
             all_origin_idx.append(batch["origin_idx"])
             all_target_indices.append(batch["target_indices"])
+            all_last_context_target.append(last_context_target)
 
         y_pred = torch.cat(all_y_pred, dim=0)
         y_true = torch.cat(all_y_true, dim=0)
+        last_context_target = torch.cat(all_last_context_target,dim=0)
 
         sample_idx = torch.cat(all_sample_idx, dim=0)
         origin_idx = torch.cat(all_origin_idx, dim=0)
@@ -287,7 +284,6 @@ class VarBaseline:
         return {
             "y_pred": y_pred,
             "y_true": y_true,
-            "output_space": output_space,
             "channels": self.target_channels,
             "horizons": self.horizons,
             "asset_cols": split["asset_cols"],
@@ -299,6 +295,7 @@ class VarBaseline:
             "trend": self.trend,
             "selected_lags": self.selected_lags,
             "failed_models": self.failed_models,
+            "last_context_target": last_context_target,
         }
 
     def _fit_one_channel(

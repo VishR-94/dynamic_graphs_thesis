@@ -4,7 +4,6 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.data.data_generator import WindowedCandleDataset
-from src.evaluation.prediction_transforms import raw_to_cumulative_log_change
 
 SplitDict = dict[str, Any]
 PredictionDict = dict[str, Any]
@@ -20,14 +19,12 @@ class MeanBaseline:
     """
     Raw-window mean baseline.
 
-    This predicts that every future horizon is equal to the average value in
-    the current context window.
+    This predicts that every future horizon is equal to the average target
+    value in the current context window:
 
-    In raw space:
         prediction[h] = mean(context window)
 
-    In cumulative log-change space:
-        prediction[h] = log(mean(context window)) - log(last context value)
+    Predictions and ground truth are returned in raw value space.
     """
 
     def __init__(
@@ -61,9 +58,9 @@ class MeanBaseline:
         val_split: SplitDict | None = None,
     ) -> "MeanBaseline":
         """
-        Store train/validation splits for interface consistency.
+        Store train and validation splits for interface consistency.
 
-        Persistence has no parameters to fit.
+        The mean baseline has no parameters to fit.
         """
         self.train_split = train_split
         self.val_split = val_split
@@ -72,7 +69,6 @@ class MeanBaseline:
 
     def fitted_values(
         self,
-        output_space: str = "cumulative_log_change",
         batch_size: int = 256,
         num_workers: int = 0,
     ) -> PredictionDict:
@@ -84,7 +80,6 @@ class MeanBaseline:
 
         return self.predict(
             split=self.train_split,
-            output_space=output_space,
             batch_size=batch_size,
             num_workers=num_workers,
         )
@@ -92,37 +87,26 @@ class MeanBaseline:
     def predict(
         self,
         split: SplitDict,
-        output_space: str = "cumulative_log_change",
         batch_size: int = 256,
         num_workers: int = 0,
     ) -> PredictionDict:
         """
-        Generate mean predictions.
+        Generate raw mean predictions.
 
         Args:
             split:
                 Cleaned raw candle split.
 
-            output_space:
-                Either:
-                    "raw"
-                    "cumulative_log_change"
-
             batch_size:
                 DataLoader batch size.
 
             num_workers:
-                DataLoader workers.
+                Number of DataLoader workers.
 
         Returns:
-            Dictionary containing y_pred and y_true with shape:
+            Dictionary containing raw y_pred and y_true tensors with shape:
                 [num_examples, num_horizons, num_assets, num_channels]
         """
-        if output_space not in {"raw", "cumulative_log_change"}:
-            raise ValueError(
-                "output_space must be either 'raw' or "
-                f"'cumulative_log_change', got {output_space}."
-            )
 
         dataset = WindowedCandleDataset.from_config(
             split=split,
@@ -142,12 +126,14 @@ class MeanBaseline:
         all_sample_idx = []
         all_origin_idx = []
         all_target_indices = []
+        all_last_context_target = []
 
         for batch in loader:
             #has shape [B,context_length,N,C]
             x_context = batch["x"].float()
             y_true_raw = batch["y"].float()
             last_context_target = batch["last_context_target"].float()
+            
 
             #has shape [B,N,C] -> averaged over time dimension
             context_mean = x_context.mean(dim=1)
@@ -159,29 +145,16 @@ class MeanBaseline:
                 1,
             )
 
-            if output_space == "raw":
-                y_pred = y_pred_raw
-                y_true = y_true_raw
-
-            else:
-                y_pred = raw_to_cumulative_log_change(
-                    y_raw=y_pred_raw,
-                    last_context_target=last_context_target,
-                )
-
-                y_true = raw_to_cumulative_log_change(
-                    y_raw=y_true_raw,
-                    last_context_target=last_context_target,
-                )
-
-            all_y_pred.append(y_pred)
-            all_y_true.append(y_true)
+            all_last_context_target.append(last_context_target)
+            all_y_pred.append(y_pred_raw)
+            all_y_true.append(y_true_raw)
             all_sample_idx.append(batch["sample_idx"])
             all_origin_idx.append(batch["origin_idx"])
             all_target_indices.append(batch["target_indices"])
 
         y_pred = torch.cat(all_y_pred, dim=0)
         y_true = torch.cat(all_y_true, dim=0)
+        last_context_target = torch.cat(all_last_context_target,dim=0)
 
         sample_idx = torch.cat(all_sample_idx, dim=0)
         origin_idx = torch.cat(all_origin_idx, dim=0)
@@ -190,20 +163,20 @@ class MeanBaseline:
         return {
             "y_pred": y_pred,
             "y_true": y_true,
-            "output_space": output_space,
             "channels": self.target_channels,
             "horizons": self.horizons,
             "sample_idx": sample_idx,
             "origin_idx": origin_idx,
             "target_indices": target_indices,
+            "last_context_target": last_context_target,
         }
 
     def _dataset_config(self) -> dict[str, Any]:
         """
         Build a minimal config for WindowedCandleDataset.
 
-        Mean only needs the target channels as inputs, because it only
-        uses the last context target.
+        The mean baseline requires the target channels across the complete
+        context window.
         """
         return {
             "forecasting": {

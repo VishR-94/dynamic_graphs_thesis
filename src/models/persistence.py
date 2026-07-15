@@ -4,7 +4,6 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.data.data_generator import WindowedCandleDataset
-from src.evaluation.prediction_transforms import raw_to_cumulative_log_change
 
 SplitDict = dict[str, Any]
 PredictionDict = dict[str, Any]
@@ -21,14 +20,12 @@ class PersistenceBaseline:
     """
     Raw-price persistence baseline.
 
-    This predicts that every future horizon is equal to the last observed value
-    in the context window.
+    This predicts that every future horizon is equal to the last observed
+    target value in the context window:
 
-    In raw space:
         prediction[h] = last_context_target
 
-    In cumulative log-change space:
-        prediction[h] = 0
+    Predictions and ground truth are returned in raw value space.
     """
 
     def __init__(
@@ -73,19 +70,17 @@ class PersistenceBaseline:
 
     def fitted_values(
         self,
-        output_space: str = "cumulative_log_change",
         batch_size: int = 256,
         num_workers: int = 0,
     ) -> PredictionDict:
         """
-        Return persistence predictions on the training split.
+        Return raw persistence predictions on the training split.
         """
         if self.train_split is None:
             raise ValueError("Call fit(...) before fitted_values().")
 
         return self.predict(
             split=self.train_split,
-            output_space=output_space,
             batch_size=batch_size,
             num_workers=num_workers,
         )
@@ -93,37 +88,26 @@ class PersistenceBaseline:
     def predict(
         self,
         split: SplitDict,
-        output_space: str = "cumulative_log_change",
         batch_size: int = 256,
         num_workers: int = 0,
     ) -> PredictionDict:
         """
-        Generate persistence predictions.
+        Generate raw persistence predictions.
 
         Args:
             split:
                 Cleaned raw candle split.
 
-            output_space:
-                Either:
-                    "raw"
-                    "cumulative_log_change"
-
             batch_size:
                 DataLoader batch size.
 
             num_workers:
-                DataLoader workers.
+                Number of DataLoader workers.
 
         Returns:
-            Dictionary containing y_pred and y_true with shape:
+            Dictionary containing raw y_pred and y_true tensors with shape:
                 [num_examples, num_horizons, num_assets, num_channels]
         """
-        if output_space not in {"raw", "cumulative_log_change"}:
-            raise ValueError(
-                "output_space must be either 'raw' or "
-                f"'cumulative_log_change', got {output_space}."
-            )
 
         dataset = WindowedCandleDataset.from_config(
             split=split,
@@ -140,6 +124,7 @@ class PersistenceBaseline:
 
         all_y_pred = []
         all_y_true = []
+        all_last_context_target = []
         all_sample_idx = []
         all_origin_idx = []
         all_target_indices = []
@@ -155,29 +140,16 @@ class PersistenceBaseline:
                 1,
             )
 
-            if output_space == "raw":
-                y_pred = y_pred_raw
-                y_true = y_true_raw
-
-            else:
-                y_pred = raw_to_cumulative_log_change(
-                    y_raw=y_pred_raw,
-                    last_context_target=last_context_target,
-                )
-
-                y_true = raw_to_cumulative_log_change(
-                    y_raw=y_true_raw,
-                    last_context_target=last_context_target,
-                )
-
-            all_y_pred.append(y_pred)
-            all_y_true.append(y_true)
+            all_y_pred.append(y_pred_raw)
+            all_y_true.append(y_true_raw)
             all_sample_idx.append(batch["sample_idx"])
             all_origin_idx.append(batch["origin_idx"])
             all_target_indices.append(batch["target_indices"])
+            all_last_context_target.append(last_context_target)
 
         y_pred = torch.cat(all_y_pred, dim=0)
         y_true = torch.cat(all_y_true, dim=0)
+        last_context_target = torch.cat(all_last_context_target,dim=0)
 
         sample_idx = torch.cat(all_sample_idx, dim=0)
         origin_idx = torch.cat(all_origin_idx, dim=0)
@@ -186,12 +158,12 @@ class PersistenceBaseline:
         return {
             "y_pred": y_pred,
             "y_true": y_true,
-            "output_space": output_space,
             "channels": self.target_channels,
             "horizons": self.horizons,
             "sample_idx": sample_idx,
             "origin_idx": origin_idx,
             "target_indices": target_indices,
+            "last_context_target": last_context_target,
         }
 
     def _dataset_config(self) -> dict[str, Any]:

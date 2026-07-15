@@ -9,7 +9,6 @@ from src.data.load_candle_data import get_channel_index
 from src.evaluation.prediction_transforms import (
     cumulative_log_change_to_raw,
     one_step_returns_to_cumulative_horizons,
-    raw_to_cumulative_log_change,
 )
 
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -45,14 +44,17 @@ class ArimaBaseline:
     """
     Univariate ARIMA baseline.
 
-    This model fits one ARIMA model per asset/channel on one-step log changes.
+    This model fits one ARIMA model per asset and channel on one-step
+    log changes.
 
     Prediction flow:
         raw context
         -> one-step log-change context
         -> ARIMA forecasts future one-step log changes
         -> cumulative horizon log changes
-        -> optionally raw values
+        -> raw predicted values
+
+    Predictions and ground truth are returned in raw value space.
     """
 
     def __init__(
@@ -239,12 +241,11 @@ class ArimaBaseline:
 
     def fitted_values(
         self,
-        output_space: str = "cumulative_log_change",
         batch_size: int = 256,
         num_workers: int = 0,
     ) -> PredictionDict:
         """
-        Return ARIMA predictions and true values on the training split.
+        Return raw ARIMA predictions and true values on the training split.
 
         This uses the same rolling-window prediction logic as predict(...),
         but applies it to the stored training split.
@@ -254,7 +255,6 @@ class ArimaBaseline:
 
         return self.predict(
             split=self.train_split,
-            output_space=output_space,
             batch_size=batch_size,
             num_workers=num_workers,
         )
@@ -262,40 +262,29 @@ class ArimaBaseline:
     def predict(
         self,
         split: SplitDict,
-        output_space: str = "cumulative_log_change",
         batch_size: int = 256,
         num_workers: int = 0,
     ) -> PredictionDict:
         """
-        Generate ARIMA predictions.
+        Generate raw ARIMA predictions.
 
         Args:
             split:
                 Cleaned raw candle split.
 
-            output_space:
-                Either:
-                    "cumulative_log_change"
-                    "raw"
-
             batch_size:
                 DataLoader batch size.
 
             num_workers:
-                DataLoader workers.
+                Number of DataLoader workers.
 
         Returns:
-            Dictionary containing y_pred and y_true with shape:
+            Dictionary containing raw y_pred and y_true tensors with shape:
                 [num_examples, num_horizons, num_assets, num_channels]
         """
         if len(self.fitted_models) == 0:
             raise ValueError("Call fit(...) before predict(...).")
 
-        if output_space not in {"cumulative_log_change", "raw"}:
-            raise ValueError(
-                "output_space must be either 'cumulative_log_change' or "
-                f"'raw', got {output_space}."
-            )
 
         dataset = WindowedCandleDataset.from_config(
             split=split,
@@ -317,6 +306,7 @@ class ArimaBaseline:
         all_sample_idx = []
         all_origin_idx = []
         all_target_indices = []
+        all_last_context_target = []
 
         for batch in loader:
             x_context = batch["x"].float()
@@ -335,32 +325,22 @@ class ArimaBaseline:
                 horizons=self.horizons,
             )
 
-            y_true_cumulative = raw_to_cumulative_log_change(
-                y_raw=y_true_raw,
-                last_context_target=last_context_target,
-                eps=self.eps,
+            y_pred_raw = cumulative_log_change_to_raw(
+            cumulative_log_change=y_pred_cumulative,
+            last_context_target=last_context_target,
             )
 
-            if output_space == "cumulative_log_change":
-                y_pred = y_pred_cumulative
-                y_true = y_true_cumulative
-
-            else:
-                y_pred = cumulative_log_change_to_raw(
-                    cumulative_log_change=y_pred_cumulative,
-                    last_context_target=last_context_target,
-                )
-
-                y_true = y_true_raw
-
-            all_y_pred.append(y_pred)
-            all_y_true.append(y_true)
+            all_last_context_target.append(last_context_target)
+            all_y_pred.append(y_pred_raw)
+            all_y_true.append(y_true_raw)
             all_sample_idx.append(batch["sample_idx"])
             all_origin_idx.append(batch["origin_idx"])
             all_target_indices.append(batch["target_indices"])
 
         y_pred = torch.cat(all_y_pred, dim=0)
         y_true = torch.cat(all_y_true, dim=0)
+        last_context_target = torch.cat(all_last_context_target,dim=0)
+
 
         sample_idx = torch.cat(all_sample_idx, dim=0)
         origin_idx = torch.cat(all_origin_idx, dim=0)
@@ -369,7 +349,6 @@ class ArimaBaseline:
         return {
             "y_pred": y_pred,
             "y_true": y_true,
-            "output_space": output_space,
             "channels": self.target_channels,
             "horizons": self.horizons,
             "asset_cols": split["asset_cols"],
@@ -379,6 +358,7 @@ class ArimaBaseline:
             "fit_mode": self.fit_mode,
             "selected_orders": self.selected_orders,
             "failed_models": self.failed_models,
+            "last_context_target": last_context_target,
         }
 
     def _fit_one_series(
