@@ -41,7 +41,7 @@ DATA_DIR = Path(
     "/Users/vishalruparelia/Library/CloudStorage/"
     "GoogleDrive-vishal@autonomous-fox.ai/"
     "Shared drives/Vishal/data/cached_datasets/"
-    "exp-24-a95-Candle/session"
+    "exp-1m-95s-24y/session"
 )
 
 CONFIG_PATH = Path("configs/forecasting.yaml")

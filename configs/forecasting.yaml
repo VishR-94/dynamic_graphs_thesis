@@ -1,8 +1,7 @@
 data:
-  split_names:
-    - train
-    - val
-    - test
+  split:
+    val_start: "2024-09-01"
+    test_start: "2024-10-01"
 
 forecasting:
   context_length: 60
@@ -59,9 +58,3 @@ normalisation:
 training:
   batch_size: 32
   num_workers: 0
-
-evaluation:
-  metrics:
-    - mae
-    - mse
-    - rmse
