@@ -1,0 +1,3 @@
+[submodule "external/ModernTCN"]
+	path = external/ModernTCN
+	url = https://github.com/luodhhh/ModernTCN.git
