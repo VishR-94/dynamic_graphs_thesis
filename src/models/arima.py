@@ -230,7 +230,7 @@ class ArimaBaseline:
 
                 model_count += 1
 
-                if verbose and model_count % 10 == 0:
+                if verbose and model_count % 25 == 0:
                     print(f"  fitted {model_count}/{total_models}")
 
         if verbose:
@@ -411,6 +411,9 @@ class ArimaBaseline:
                     method=self.optim_method,
                     disp=False,
                     maxiter=self.maxiter,
+                    cov_type="none",
+                    low_memory=True,
+                    full_output=False
                 )
 
             return model_result, selected_order, fallback_mean, None
