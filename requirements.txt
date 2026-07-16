@@ -11,3 +11,4 @@ jupyter
 scipy
 pyyaml
 pmdarima
+torchmetrics

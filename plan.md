@@ -1,6 +1,6 @@
 # Definitive project handover: Dynamic graph learning for intraday financial forecasting
 
-This document is a self-contained handover for a new ChatGPT conversation continuing Vish R’s MSc dissertation project. It reconciles the earlier comprehensive handover and correction/addendum. The new conversation should still verify the GitHub repository directly before assuming the code exactly matches this document.
+This document is a self-contained handover for the next ChatGPT conversation continuing Vish R’s MSc dissertation project. The next conversation will run inside the ChatGPT Project and can inspect the current repository directly. This document therefore records the agreed research plan, design decisions, verified data facts, implementation status and sequencing; exact code details should be read from the repository rather than inferred from this handover.
 
 ---
 
@@ -8,13 +8,51 @@ This document is a self-contained handover for a new ChatGPT conversation contin
 
 Use these labels throughout:
 
-* **Confirmed and implemented**: agreed and code has likely been written.
+* **Confirmed and implemented**: agreed and verified in the current repository or successful test run.
 * **Agreed but not yet implemented**: project decision made, but code not yet done.
 * **Provisional / under consideration**: promising idea, not final.
 * **Rejected / deprioritised**: considered and set aside, with reason.
 * **Unresolved**: needs supervisor decision, repository verification, or further research.
 
 ---
+
+# Current status at handover
+
+**Status: confirmed**
+
+The data, preprocessing, classical-baseline and evaluation infrastructure is complete and has passed the repository sanity checks. The active sequence from this point is:
+
+```text
+Remaining standalone benchmark phase:
+    1. ModernTCN
+    2. Kronos
+    3. MTGNN only if a suitable implementation is available and straightforward to adapt
+
+Then build the proposed architecture in two separate stages:
+    Stage 1: train and validate the tokenizer / autoencoder
+    Stage 2: train the downstream forecasting model using the learned tokenizer representation
+
+Then:
+    synthetic validation
+    real-data comparisons and ablations
+    learned-graph analysis
+    dissertation results and write-up
+```
+
+The remaining benchmarks are independent models. **ModernTCN, Kronos and optional MTGNN do not use the project tokenizer.** The tokenizer belongs only to the proposed architecture and is developed after the standalone benchmark phase.
+
+Verified infrastructure status:
+
+```text
+Data loading and first-row cleaning: complete
+Chronological train/validation/test repartitioning: complete
+Window generation and normalisation: complete
+Classical baselines: complete
+Raw-only prediction contract: complete
+ForecastEvaluator and common metric registry: complete
+Long-form evaluation tables: complete
+Preprocessing regression script: passing
+```
 
 # 1. Dissertation research question and intended contribution
 
@@ -55,31 +93,38 @@ independent asset models, and simple multivariate linear models miss.
 
 ## Current benchmark framing
 
-**Status: confirmed conceptually; classical part implemented**
+**Status: confirmed**
 
-Benchmark hierarchy:
+The comparison hierarchy is:
 
 ```text
-Classical/statistical baselines:
+Classical/statistical baselines — implemented:
     persistence
     window mean
     ARIMA / auto-ARIMA
     VAR
     GARCH
 
-Neural temporal baselines:
-    TCN / ModernTCN-style model
-    Mamba
+Remaining standalone benchmarks:
+    ModernTCN — required temporal benchmark
+    Kronos — required financial time-series foundation-model benchmark
+    MTGNN — optional graph benchmark, only if the available code is easy to run and adapt
 
-Foundation-model baselines:
-    Chronos-2
-    Kronos
+Proposed architecture:
+    Stage 1: separately trained tokenizer / autoencoder
+    Stage 2: downstream dynamic-graph forecasting model using the tokenizer representation
+```
 
-Graph baseline:
-    static adaptive graph temporal model
+Models discussed earlier but no longer in the implementation plan include Mamba, S4, Chronos-2, a separate generic TCN, Graph WaveNet, AGCRN, DCRNN and STGCN. They can remain literature references where useful.
 
-Final contribution:
-    dynamic graph temporal forecasting model
+The central empirical progression is:
+
+```text
+classical models
+→ strong temporal benchmark
+→ financial foundation-model benchmark
+→ optional static/adaptive graph benchmark
+→ proposed tokenizer + dynamic-graph forecasting architecture
 ```
 
 ---
@@ -121,9 +166,9 @@ Stride should be added because one-minute sliding windows are highly redundant.
 
 ## Raw dataset
 
-**Status: confirmed, but current path should be re-verified**
+**Status: confirmed**
 
-The dataset consists of intraday equity candle data stored in PyTorch `.pt` files:
+The active data are intraday equity candles stored locally in three PyTorch files:
 
 ```text
 train.pt
@@ -131,20 +176,15 @@ val.pt
 test.pt
 ```
 
-Original path used earlier:
+The files are not themselves treated as the final chronological partitions. `load_candle_splits()` loads all three as containers for the full 2024 dataset and repartitions their contents according to the configured date boundaries.
 
-```text
-/Users/vishalruparelia/Library/CloudStorage/GoogleDrive-vishal@autonomous-fox.ai/
-Shared drives/Vishal/data/cached_datasets/exp-24-a95-Candle/session
-```
+The exact local data path is machine-specific and should be read from the current notebook or script. The data are not committed to the repository.
 
-A later corrected dataset may now be in a different folder. The new conversation must verify the active data path from the repository/notebooks.
+## Raw file structure
 
-## Raw split structure
+**Status: confirmed by direct inspection**
 
-**Status: confirmed for the expected raw candle dataset**
-
-Expected split keys:
+Each file contains:
 
 ```text
 samples
@@ -160,19 +200,17 @@ D
 dropped_days
 ```
 
-Expected metadata observed:
+Metadata are identical across all three files:
 
 ```text
-train samples: 188
-val samples:   43
-test samples:  21
-
 assets: 93
-raw time steps per day: 391
+raw time steps per session: 391
 channels: 6
 frequency: 1 minute
 market open: 09:30
 market close: 16:00
+fill method: ffill
+tensor dtype: torch.float32
 ```
 
 Raw channels:
@@ -186,53 +224,58 @@ volume
 amount
 ```
 
-Each raw sample is a tuple:
+Every valid sample is:
 
 ```text
 sample[0]: tensor [391, 93, 6]
-sample[1]: auxiliary object, usually None
-sample[2]: session/day identifier
+sample[1]: None
+sample[2]: ISO-like session string, e.g. "2024-01-02 00:00:00"
 ```
 
-## Date range
+The three physical files contained before repartitioning:
 
-**Status: unresolved**
+```text
+train.pt: 187 valid sessions, 2024-01-02 to 2024-09-30
+val.pt:    42 valid sessions, 2024-10-01 to 2024-11-27
+test.pt:   20 valid sessions, 2024-12-02 to 2024-12-31
+```
 
-The exact calendar date range was not explicitly recorded. It should be inferred from the day/session strings in the loaded data. We know the data include periods around the NVDA split on 2024-06-10 because that event appeared in data validation.
+Across the files there are:
+
+```text
+249 valid sessions
+249 unique dates
+no cross-file date overlap
+chronological ordering within each source file
+```
+
+## Date range and dropped sessions
+
+**Status: confirmed**
+
+Valid-session coverage is:
+
+```text
+2024-01-02 to 2024-12-31
+```
+
+`dropped_days` contains `(day, reason)` tuples rather than samples. The known dropped sessions are:
+
+```text
+2024-07-03 — incomplete 211/391
+2024-11-29 — incomplete 211/391
+2024-12-24 — incomplete 211/391
+```
+
+Dropped sessions are not also present among the valid samples. The loader combines and repartitions these records by date along with the valid samples.
 
 ## Dataset version warning
 
-**Status: important known issue**
+**Status: historical context**
 
-A newer folder was previously tested:
+An earlier generated folder had a different target/return-style structure rather than the raw multi-asset candle structure expected by this pipeline. It lacked the current `channels` and `D` metadata and should not be used to infer the active format.
 
-```text
-exp-1m-95s-24y/session
-```
-
-Its first version had the wrong structure for the current pipeline:
-
-```text
-no channels key
-no D key
-sample[0] looked like [390, 94]
-sample[1] looked like [391]
-included target_asset / target_mode style metadata
-```
-
-Interpretation:
-
-```text
-That looked like a target/return dataset, not raw multi-asset OHLCV candles.
-```
-
-Decision:
-
-```text
-Do not patch the current raw-candle pipeline around that wrong format unless the project intentionally changes data target.
-```
-
-Dimitri later fixed/regenerated the data. The current repository/data path should be verified.
+The active code should always be checked against the current raw candle files rather than patched around that older incompatible format.
 
 ---
 
@@ -445,17 +488,55 @@ This should be clarified with Dr Lampos.
 
 ## Split methodology
 
-**Status: confirmed from dataset**
+**Status: confirmed and implemented**
 
-The dataset is already split into train, validation and test files:
+The three physical `.pt` files are loaded, combined and repartitioned chronologically in memory. Their original split membership is ignored.
+
+Configured boundaries:
 
 ```text
-train: 188 days
-val:    43 days
-test:   21 days
+train:      day < 2024-09-01
+validation: 2024-09-01 <= day < 2024-10-01
+test:       day >= 2024-10-01
 ```
 
-The next conversation should verify these counts from the actual data.
+Effective calendar split:
+
+```text
+train:      January–August 2024
+validation: September 2024
+test:       October–December 2024
+```
+
+Observed valid-session counts:
+
+```text
+train:      167
+validation: 20
+test:       62
+total:      249
+```
+
+`load_candle_splits()`:
+
+```text
+1. loads train.pt, val.pt and test.pt;
+2. verifies matching assets, channels and metadata;
+3. combines all valid samples;
+4. parses and sorts session dates;
+5. rejects duplicate dates;
+6. reads val_start and test_start from configs/forecasting.yaml;
+7. assigns every valid sample to exactly one chronological split;
+8. combines and repartitions dropped-day records by their date;
+9. rejects any empty resulting split;
+10. returns dictionaries with the same structure as before.
+```
+
+All 249 valid sessions are preserved. The downstream call remains unchanged:
+
+```python
+train_raw, val_raw, test_raw = load_candle_splits(DATA_DIR)
+```
 
 ## Windowed supervised examples
 
@@ -635,17 +716,21 @@ No future data are used.
 
 **Status: unresolved**
 
-Chronos-2 and Kronos integration has not been implemented. Their input requirements must be checked carefully to avoid future covariate leakage or target leakage.
+Kronos has not yet been integrated as a standalone benchmark. Its official input construction must be checked carefully for future-covariate or target leakage. The proposed tokenizer and downstream model require the same discipline: all representations and normalisation statistics available to a forecast must come only from its input context.
 
 ---
 
 # 7. Repository structure and code design
 
+## Repository access
+
+**Status: confirmed**
+
+The next ChatGPT conversation will run inside the Project and can inspect the repository directly. This handover should guide sequencing and preserve decisions, but exact signatures and implementation details should be taken from the current code.
+
 ## Repository structure
 
-**Status: mostly confirmed; verify against GitHub**
-
-Known structure:
+**Status: verified**
 
 ```text
 src/
@@ -664,13 +749,10 @@ docs/
 requirements.txt
 README.md
 .gitignore
+plan.md
 ```
 
-## Important files
-
-**Status: mostly implemented; verify exact names**
-
-Expected important files:
+Important current files include:
 
 ```text
 src/data/load_candle_data.py
@@ -698,13 +780,48 @@ notebooks/baselines.ipynb
 scripts/test_preprocess_pipeline.py
 ```
 
-Exact script names should be verified.
-
-## Naming preferences
+## Completed repository cleanup
 
 **Status: confirmed**
 
-The project uses British spelling:
+Substantive cleanup completed before this handover:
+
+```text
+removed the obsolete make_metric_table pathway and its private helpers
+updated the baseline notebook to use make_evaluation_table
+removed stale notebook imports and corrected its evaluation description
+removed duplicate pyyaml from requirements.txt
+removed redundant .gitkeep files from non-empty directories
+repaired README/data-documentation code fences and stale split description
+added config-driven chronological repartitioning in load_candle_splits
+```
+
+Minor formatting-only cleanup was deliberately deprioritised.
+
+## Validation commands
+
+The current state passed:
+
+```bash
+python -m compileall -q src scripts
+python -m scripts.test_preprocess_pipeline
+```
+
+The preprocessing script completed with:
+
+```text
+All sanity checks passed.
+```
+
+It exercises the real-data loading, repartitioning, cleaning, transformed representations, window dataset, DataLoader batching, normalisation and inversion, candle reconstruction, validity constraints and evaluation transforms/metrics.
+
+Run it as a module from the repository root. Direct execution with `python scripts/test_preprocess_pipeline.py` does not automatically put the repository root on the import path.
+
+## Naming and interaction preferences
+
+**Status: confirmed**
+
+Use British spelling:
 
 ```text
 normaliser
@@ -712,100 +829,46 @@ normalisation
 unnormalised
 ```
 
-Avoid American spelling in new code unless an external library requires it.
-
-## Model location
-
-**Status: confirmed**
-
-Model scripts should go in:
+Model files belong in:
 
 ```text
 src/models/
 ```
 
-not:
+not `src/baselines/`.
 
-```text
-src/baselines/
-```
-
-## Code-interaction preference for future assistant
-
-**Status: confirmed user preference**
-
-When reviewing code:
-
-```text
-One function/change at a time.
-If OK, say “OK”.
-If not OK, explain what is wrong and give the corrected version.
-```
-
-Do not output code fences with metadata.
-
-Good:
-
-```python
-def f():
-    pass
-```
-
-Bad:
-
-````text
-```python id="..."
-def f():
-    pass
-````
-
-````
+When reviewing code, work one controlled change at a time. If a function is correct, say “OK”. If it is not, explain the issue and provide the corrected version. Do not add metadata such as `id="..."` to code fences.
 
 ---
 
 # 8. Configuration and preprocessing design
 
-## Forecasting config
+## Forecasting and data config
 
-**Status: implemented; verify exact file**
+**Status: confirmed and implemented**
 
-Current config includes:
+`configs/forecasting.yaml` includes the chronological split boundaries:
 
-```text
-context_length
-stride
-horizons
-input_channels
-target_channels
-````
+```yaml
+data:
+  split:
+    val_start: "2024-09-01"
+    test_start: "2024-10-01"
+```
 
-Typical values:
+It also includes the forecasting setup:
 
 ```text
 context_length = 60
-stride = 1, 15, or 60
+stride = 15
 horizons = [1, 5, 15, 30, 60]
+input_channels = [open, high, low, close, volume, amount]
+target_channels = [open, high, low, close]
 ```
 
-Target channel configurations used:
+The loader reads the split boundaries internally from the repository config, while datasets and models receive the returned train/validation/test dictionaries exactly as before.
 
-```text
-close-only:
-    close
-
-OHLC:
-    open, high, low, close
-
-OHLCV:
-    open, high, low, close, volume
-```
-
-Latest recommendation:
-
-```text
-Use close or OHLC as primary targets.
-Use volume/amount as inputs, not necessarily as targets.
-```
+Volume and amount are model inputs, not current forecast targets. The valid-candle transformed representation presently covers OHLCV and therefore needs an explicit decision about how `amount` enters the proposed tokenizer architecture.
 
 ## Normalisation config
 
@@ -872,23 +935,23 @@ Do not initially feed raw norm_mean because price levels can shift mechanically 
 
 ## Shared baseline interface
 
-**Status: mostly implemented; verify exact signatures**
+**Status: confirmed and implemented**
 
-Baseline classes generally follow:
+All five classical baselines use a common raw-only prediction contract:
 
 ```text
 Model.from_config(config)
 model.fit(train_split, val_split)
-model.predict(split, output_space="cumulative_log_change")
+model.predict(split, batch_size=..., num_workers=...)
 model.fitted_values(...)
 ```
 
-Common output dictionary includes:
+The normal prediction output includes raw-space values and indexing metadata such as:
 
 ```text
 y_pred
 y_true
-output_space
+last_context_target
 channels
 horizons
 sample_idx
@@ -896,15 +959,27 @@ origin_idx
 target_indices
 ```
 
-Some models also include:
+Model classes do not select an evaluation space. The former `output_space` argument and normal output field were removed. `ForecastEvaluator` validates the raw output, performs the required transformation and constructs the persistence comparator.
+
+Some models also expose model-specific metadata:
 
 ```text
-asset_cols
-selected_orders
-selected_lags
-failed_models
-y_variance
-variance_output_space
+ARIMA: selected orders and failed models
+VAR: selected lags and failed models
+GARCH: fitted-parameter diagnostics, y_variance and variance_output_space
+```
+
+GARCH mean predictions follow the same raw-only point-forecast contract. Its variance output remains explicitly labelled as cumulative-log-change variance.
+
+The baseline notebook follows:
+
+```text
+fit model
+→ predict raw values
+→ ForecastEvaluator
+→ evaluate registered metrics
+→ make_evaluation_table
+→ display horizon/channel tables
 ```
 
 ## Persistence
@@ -1044,11 +1119,13 @@ This is acceptable for a simple baseline, but if using GARCH for NLL/calibration
 
 # 10. Baseline results and interpretation
 
-## Qualitative ranking
+## Status of existing results
 
-**Status: confirmed from notebook outputs; exact numbers should be re-run**
+**Status: historical, pre-repartition evidence**
 
-Point-forecast MAE ranking:
+The notebook contains earlier classical-baseline outputs produced before the final January–August / September / October–December chronological split was introduced. They are useful for understanding model behaviour, but they are not the definitive dissertation result table and should not be quoted as final post-split numbers.
+
+Earlier qualitative ranking:
 
 ```text
 Persistence ≈ auto-ARIMA ≈ GARCH
@@ -1056,73 +1133,86 @@ VAR slightly worse
 Window mean worse than persistence
 ```
 
-This applies to point MAE/RMSE, not necessarily probabilistic evaluation.
-
-## Approximate close-only MAE values
-
-**Status: approximate; verify against notebook**
-
-Persistence, cumulative log-change MAE, close-only, stride 60:
+Earlier close-only cumulative-log-change MAE values at stride 60 were approximately:
 
 ```text
-h=1:  0.000387
-h=5:  0.000824
-h=15: 0.001365
-h=30: 0.001870
-h=60: 0.002700
+Persistence:
+    h=1:  0.000387
+    h=5:  0.000824
+    h=15: 0.001365
+    h=30: 0.001870
+    h=60: 0.002700
+
+VAR:
+    h=1:  0.000397
+    h=5:  0.000837
+    h=15: 0.001377
+    h=30: 0.001877
+    h=60: 0.002703
 ```
 
-Auto-ARIMA close-only was almost identical.
+Auto-ARIMA and GARCH were also close to persistence for point forecasts.
 
-VAR close-only roughly:
+## Interpretation retained from the classical work
 
-```text
-h=1:  0.000397
-h=5:  0.000837
-h=15: 0.001377
-h=30: 0.001877
-h=60: 0.002703
-```
-
-GARCH was also nearly persistence-like.
-
-## Interpretation
-
-**Status: agreed**
-
-Key write-up point:
+**Status: agreed, but final magnitudes require the final experiment run**
 
 ```text
-Persistence is an extremely strong point forecast baseline for intraday prices.
+Persistence is an extremely strong point-forecast baseline for intraday prices.
 Classical return models mostly forecast near-zero returns.
-VAR’s active cross-asset linear corrections do not improve out-of-sample MAE.
-GARCH is useful mainly as a conditional volatility model, not as a mean forecaster.
+VAR's active linear cross-asset corrections did not improve out-of-sample point accuracy.
+GARCH is most distinctive as a conditional-volatility model rather than as a mean forecaster.
 ```
 
-This motivates nonlinear temporal and graph models without overclaiming.
+This motivates nonlinear temporal and relational modelling without claiming that the final graph model must outperform every baseline at every horizon.
 
 ---
 
-# 11. Overall model architecture
+# 11. Overall project and architecture sequence
 
-## Planned final pipeline
+## Standalone benchmark phase
 
-**Status: agreed but not fully implemented**
+**Status: current next phase**
 
-High-level architecture:
+Before developing the project tokenizer or downstream model, complete the independent benchmark set:
 
 ```text
-raw OHLCV context
-→ valid-candle transform
+1. ModernTCN
+2. Kronos
+3. MTGNN only if a suitable codebase is available and straightforward to adapt
+```
+
+These benchmarks consume the candle data according to their own appropriate interfaces. They are not trained on outputs from the project tokenizer.
+
+## Proposed architecture
+
+**Status: agreed conceptually; not yet implemented**
+
+Only after the remaining standalone benchmarks are evaluated does work begin on the proposed model. Its training is deliberately separated into two stages:
+
+```text
+Stage 1:
+    train tokenizer / autoencoder
+
+Stage 2:
+    train downstream forecasting model using the learned token representation
+```
+
+High-level proposed pipeline:
+
+```text
+raw six-channel candle context
+→ valid-candle-style feature representation, extended or supplemented for amount
 → window-context normalisation
-→ temporal encoder / tokenizer
-→ node-wise temporal embeddings
-→ graph construction
-→ spatial message passing
-→ multi-horizon prediction head
+→ separately trained tokenizer / autoencoder
+→ discrete tokens or token embeddings
+→ node-wise temporal representation
+→ input-conditioned graph construction
+→ cross-asset message passing
+→ direct multi-horizon OHLC prediction head
 → inverse normalisation
 → inverse feature transform
-→ raw-space or cumulative log-change evaluation
+→ raw-output ForecastEvaluator
 ```
 
 Important principle:
@@ -1132,43 +1222,50 @@ Temporal modelling should initially be node-wise.
 Cross-asset mixing should happen through the graph/spatial module.
 ```
 
-This avoids letting a generic dense model mix assets before the graph module.
+This prevents a generic dense layer from mixing assets before the relational component that the dissertation is intended to study.
 
 ---
 
 # 12. Tokenizer, encoder, BSQ and decoder design
 
-## Kronos-style tokenizer
+## Role and sequencing
 
-**Status: provisional / under consideration**
+**Status: agreed; implementation begins only after the standalone benchmark phase**
 
-Kronos was discussed as using a two-stage tokenizer + forecasting setup:
+The tokenizer belongs to the proposed architecture. It is not a shared preprocessing stage for ModernTCN, Kronos or optional MTGNN.
+
+The proposed architecture is trained in two stages:
 
 ```text
 Stage 1:
-    train tokenizer / autoencoder
+    train and validate the tokenizer / autoencoder
 
 Stage 2:
-    use learned tokens for forecasting
+    train the downstream forecasting model using tokenizer outputs
 ```
 
-The tokenizer is understood to involve:
+The initial implementation should keep these stages separate. Joint end-to-end fine-tuning can be considered later only if there is a clear experimental reason and sufficient time.
+
+## Tokenizer design
+
+**Status: agreed at high level; exact implementation unresolved**
+
+The current design is inspired by the Kronos tokenizer structure:
 
 ```text
 Transformer encoder
-BSQ quantisation
-decoder
+→ BSQ quantisation
+→ discrete tokens / quantised embeddings
+→ decoder
 ```
 
-This should be verified directly against the current Kronos paper/repository before dissertation writing.
+Kronos itself is also a standalone benchmark. Its benchmark role and the use of a Kronos-inspired tokenizer in the proposed architecture are separate issues.
 
 ## Tokenizer input representation
 
-**Status: agreed if tokenizer is implemented**
+**Status: partially agreed**
 
-The tokenizer should operate on the valid-candle transformed space, not raw OHLCV.
-
-Input transformed channels:
+The tokenizer should operate on a valid candle representation rather than unadjusted raw price levels. The current implemented transform contains:
 
 ```text
 log_close
@@ -1178,183 +1275,141 @@ log_lower_wick_ratio
 log_volume
 ```
 
-If `amount` is needed, the representation must be extended.
-
-## Two-stage vs end-to-end
-
-**Status: unresolved**
-
-There was discussion about whether to train tokenizer and forecaster separately or end-to-end.
-
-Current practical position:
+The raw model inputs also include `amount`, so the tokenizer design must decide whether to:
 
 ```text
-Start Kronos-style two-stage if implementing a tokenizer.
-Consider end-to-end fine-tuning later only if time permits.
+add log_amount to the transformed representation;
+provide amount through a separate feature path; or
+exclude it from the tokenizer while retaining it elsewhere in the forecasting model.
 ```
 
-This should be clarified with Dr Lampos because there may be different expectations.
+## Stage 1 validation
 
-## Probabilistic decoder
-
-**Status: provisional / under consideration**
-
-Dimitri suggested probabilistic outputs.
-
-Possible design:
+Before training the downstream forecaster, assess at least:
 
 ```text
-decoder embeddings
-→ MLP output head
-→ Gaussian mean and variance
-→ Gaussian NLL loss
+reconstruction loss and reconstruction quality
+validity of reconstructed candles after inversion
+token/code utilisation
+codebook or bit collapse
+token dimensions and temporal granularity
+stability across train and validation data
+whether the representation retains information useful for forecasting
 ```
 
-The Gaussian would be over transformed features, not raw OHLCV.
+## Decoder and probabilistic outputs
 
-This is not yet implemented.
+**Status: optional extension, not required for the next implementation step**
+
+A probabilistic decoder or downstream Gaussian head was discussed earlier. When the tokenizer stage begins, its immediate purpose is representation learning and reconstruction. Probabilistic forecasting should not delay the standalone benchmarks or the core dynamic-graph experiments; it can remain an extension if later justified.
 
 ---
 
-# 13. Temporal modelling design
+# 13. Standalone temporal and foundation-model benchmarks
 
-## Candidate temporal baselines
+## ModernTCN
 
-**Status: agreed list; not yet implemented**
+**Status: required next benchmark; not yet implemented**
 
-Recommended order:
+ModernTCN is the remaining strong temporal-only neural benchmark. It should be trained and evaluated before the project tokenizer is developed.
+
+Its role is to answer:
 
 ```text
-1. Simple repo-native TCN / ModernTCN-style model
-2. Mamba
-3. Chronos-2
-4. Kronos
+How strong is a modern temporal model without the proposed dynamic cross-asset graph architecture?
 ```
 
-The first neural model should be deliberately simple to validate:
+Implementation should adapt the available ModernTCN design faithfully enough to be a credible benchmark while fitting the repository's direct multi-horizon OHLC output and common evaluation contract.
+
+## Kronos
+
+**Status: required benchmark; not yet evaluated**
+
+Kronos is the financial candlestick/time-series foundation-model benchmark. Its official paper, repository, licence, input format and feasible adaptation/fine-tuning protocol must be checked when implementation begins.
+
+Kronos is independent of the tokenizer later trained for the proposed architecture.
+
+## Previously discussed temporal alternatives
+
+**Status: not in the current implementation plan**
+
+Mamba, S4, Chronos-2 and a separate generic TCN were discussed earlier. They remain relevant literature context but are not planned benchmark implementations. The current required benchmark scope is ModernTCN and Kronos, with MTGNN optional as the graph benchmark.
+
+## Node-wise temporal modelling for the proposed architecture
+
+**Status: agreed conceptually; not yet implemented**
+
+A likely pattern after tokenizer training is:
 
 ```text
-training loop
-batching
-normalisation
-inverse transforms
-metrics
-comparison against persistence
-```
-
-Do not start with a full ModernTCN reproduction if it delays progress.
-
-## Mamba vs S4
-
-**Status: agreed for now**
-
-Decision:
-
-```text
-Use Mamba rather than S4 as the main state-space sequence baseline.
-```
-
-Reason:
-
-```text
-Mamba is a more current selective SSM and better aligned with modern sequence modelling.
-S4 is historically important but optional unless an explicit SSM ablation is needed.
-```
-
-S4 is not rejected on technical grounds; it is just deprioritised.
-
-## Node-wise temporal modelling
-
-**Status: agreed but not yet implemented**
-
-For temporal baselines and final architecture, a likely pattern is:
-
-```text
-input: [B, T, N, C]
-reshape: [B*N, T, C]
+input token representation: [B, T_token, N, C_token]
+reshape: [B*N, T_token, C_token]
 temporal model per asset
-output: [B, N, hidden_dim]
+output node states: [B, N, hidden_dim]
 ```
 
-Then graph construction/message passing handles cross-asset interaction.
+Graph construction and message passing then provide the explicit cross-asset interaction.
 
 ---
 
 # 14. Dynamic and static graph construction
 
-## Static adaptive graph baseline
+## Optional MTGNN benchmark
 
-**Status: agreed but not yet implemented**
+**Status: optional; feasibility check comes after Kronos**
 
-The main GNN baseline should not be a basic fixed-graph GCN.
+MTGNN is the only remaining graph benchmark under active consideration. It learns a global/adaptive graph for multivariate time-series forecasting and would provide a useful comparison with the proposed input-conditioned dynamic graph.
 
-Recommended baseline:
+Implement MTGNN only if a reliable codebase is available and the adaptation is reasonably straightforward. Do not spend disproportionate dissertation time reproducing it from scratch.
 
-```text
-Adaptive Graph TCN / static adaptive graph temporal network
-```
-
-Inspired by Graph WaveNet / MTGNN:
+Conceptual comparison:
 
 ```text
-learn node embeddings E1, E2
-A = softmax(ReLU(E1 E2^T))
-```
+ModernTCN:
+    temporal benchmark without an explicit learned asset graph
 
-This learns one static graph shared across all windows.
+MTGNN, if implemented:
+    learned global/adaptive graph shared across observations
 
-Proposed file/class:
-
-```text
-src/models/adaptive_graph_tcn.py
-AdaptiveGraphTCN
+Proposed model:
+    graph conditioned on the current tokenizer-derived input representation
 ```
 
 ## Final dynamic graph model
 
-**Status: agreed conceptually; design unresolved**
+**Status: agreed conceptually; exact design unresolved**
 
-The final model should learn a graph conditioned on each input window:
+The downstream forecasting model should learn an adjacency conditioned on each input example or market state:
 
 ```text
 A_b = f(H_b)
 ```
 
-or possibly each time step:
+A graph for every minute inside the input window remains a possible extension:
 
 ```text
 A_{b,t} = f(H_{b,t})
 ```
 
-Unresolved graph design choices:
+but should not be assumed before the simpler per-window design is evaluated.
+
+Open design choices include:
 
 ```text
-per-window or per-time-step
-dense or sparse/top-k
-directed or symmetric
-softmax adjacency or normalised weights
-positive-only or signed edges
-with or without self-loops
+per-window or per-time-step adjacency
+dense or sparse/top-k graph
+directed or symmetric relationships
+positive-only or signed weights
+normalisation of adjacency weights
+self-loops
+number and placement of message-passing layers
 ```
 
-## Rejected graph baselines
+## Other graph architectures
 
-**Status: rejected / deprioritised**
+**Status: literature references, not planned benchmarks**
 
-Basic GCN:
-
-```text
-Too weak and not a complete temporal forecasting baseline.
-```
-
-STGCN / DCRNN as the main GNN baseline:
-
-```text
-Designed mainly for known physical graphs, especially traffic networks.
-Less appropriate because the asset graph is unknown.
-```
-
-They remain useful literature references.
+Basic GCN, DCRNN, STGCN, Graph WaveNet and AGCRN remain useful background. They are not additional implementation targets unless the project scope changes explicitly.
 
 ---
 
@@ -1387,7 +1442,7 @@ H:   [B, N, hidden_dim]
 H_neighbour[b] = A_b[b] @ H[b]
 ```
 
-The next conversation should design this carefully after the first neural temporal baseline is working.
+Design this carefully during Stage 2 of the proposed architecture, after the standalone benchmarks are complete and the tokenizer has been trained and validated.
 
 ---
 
@@ -1428,54 +1483,56 @@ Classical models forecast one-step returns and then convert to cumulative horizo
 
 # 17. Loss functions and training stages
 
-## Deterministic neural loss
+## Standalone benchmark training
 
-**Status: provisional**
+**Status: next work**
 
-Likely first neural loss:
+Train and evaluate the independent benchmark models first:
 
 ```text
-MSE, MAE, or Huber in normalised transformed space
+ModernTCN
+Kronos
+MTGNN only if straightforward
 ```
 
-Evaluation should remain in cumulative log-change space.
+Their training does not use the project tokenizer.
+
+## Proposed architecture — Stage 1 tokenizer training
+
+**Status: agreed; follows the benchmark phase**
+
+```text
+transformed candle windows
+→ encoder
+→ BSQ quantisation
+→ decoder reconstruction
+```
+
+The exact reconstruction, BSQ and auxiliary losses must be designed from the chosen tokenizer implementation and verified against the current Kronos paper/code where used as inspiration.
+
+## Proposed architecture — Stage 2 forecasting
+
+**Status: agreed; follows successful tokenizer training**
+
+```text
+trained tokenizer representation
+→ downstream temporal and dynamic-graph model
+→ direct multi-horizon OHLC forecasts
+```
+
+The initial approach should normally freeze the tokenizer while the forecasting model is established. Later end-to-end fine-tuning is an optional ablation, not the default starting point.
+
+## Deterministic forecasting loss
+
+**Status: to be selected during benchmark/model implementation**
+
+Candidate training losses include MAE, MSE or Huber loss in the model's training representation. Final comparison remains through the common evaluation suite in `ForecastEvaluator`.
 
 ## Probabilistic loss
 
-**Status: unresolved / under consideration**
+**Status: optional extension**
 
-If probabilistic forecasting is included:
-
-```text
-Gaussian NLL over transformed features
-```
-
-For mean `mu` and variance `sigma^2`:
-
-```text
-NLL = 0.5 * [log(sigma^2) + (y - mu)^2 / sigma^2]
-```
-
-Need to decide with Dr Lampos whether this is core or extension.
-
-## Tokenizer training stages
-
-**Status: provisional**
-
-Possible stages:
-
-```text
-Stage 1:
-    train tokenizer/autoencoder on transformed windows
-
-Stage 2:
-    train forecaster using tokens/embeddings
-
-Optional:
-    fine-tune end-to-end later
-```
-
-Exact BSQ loss and architecture details need verification.
+Gaussian NLL and probabilistic heads were discussed, but are not required to begin the remaining benchmarks, tokenizer or deterministic downstream model. Revisit only if the core experiments are complete and there is a clear dissertation benefit.
 
 ---
 
@@ -1564,74 +1621,75 @@ This is used by ARIMA, VAR and GARCH.
 
 # 19. Metrics and aggregation across assets and horizons
 
-## Implemented metrics
+## Evaluation architecture
 
 **Status: confirmed and implemented**
 
-Metrics:
+Every model should ultimately provide raw predictions, raw ground truth and the last observed target. Evaluation is centralised:
 
 ```text
-MAE
-MSE
-RMSE
+raw model output
+→ ForecastEvaluator validation
+→ evaluation-space transformation
+→ same-horizon persistence comparator
+→ metric registry
+→ make_evaluation_table
 ```
 
-For tensors:
+This keeps evaluation-space logic out of individual model classes.
+
+## Registered evaluation metrics
+
+**Status: confirmed and implemented**
 
 ```text
-[B, H, N, C]
+cumulative_log_change_mae
+mase
+relative_mae_vs_persistence
+persistence_win_rate
 ```
 
-dimension meanings:
+Interpretation:
 
 ```text
-0: batch/window
-1: horizon
-2: asset
-3: channel
+cumulative_log_change_mae:
+    MAE after converting raw predictions and targets to cumulative log changes
+
+mase:
+    absolute error scaled by a one-step persistence error calculated from the
+    training split within sessions
+
+relative_mae_vs_persistence:
+    model MAE divided by the same-horizon persistence MAE on the evaluated split
+
+persistence_win_rate:
+    proportion of pointwise forecasts with lower absolute error than persistence
 ```
 
-Important reductions:
+Metrics are reduced over forecast examples and assets while retaining:
 
 ```text
-overall:
-    average all dimensions
-
-per horizon:
-    average B, N, C
-
-per asset:
-    average B, H, C
-
-per channel:
-    average B, H, N
-
-per horizon-channel:
-    average B, N
+[horizon, target_channel]
 ```
 
-## Primary metric
-
-**Status: agreed, but should be confirmed with Dr Lampos**
-
-Recommended headline metric:
+`make_evaluation_table()` converts a metric dictionary into long form:
 
 ```text
-cumulative log-change MAE/RMSE
+metric
+horizon
+channel
+value
 ```
 
-Reason:
+The former `make_metric_table()` implementation and its private helpers were removed.
 
-```text
-Raw price errors are not comparable across assets with different price levels.
-Cumulative log-change errors are scale-comparable.
-```
+## Generic metric utilities
 
-## Batch aggregation
+MAE, MSE and RMSE remain useful lower-level functions and synthetic-test utilities, but they are not the current registered benchmark table by themselves.
 
-**Status: confirmed**
+## Aggregation rule
 
-For final evaluation, concatenate predictions/truths across batches first, then compute metrics. This avoids final-batch weighting issues.
+Concatenate predictions and truths across batches before final metric computation. This avoids weighting the last, potentially smaller, batch incorrectly.
 
 ---
 
@@ -1639,7 +1697,7 @@ For final evaluation, concatenate predictions/truths across batches first, then 
 
 ## Classical baselines
 
-**Status: implemented or nearly implemented**
+**Status: implemented**
 
 ```text
 Persistence
@@ -1649,75 +1707,99 @@ VAR
 GARCH
 ```
 
-## Neural baselines
+## Remaining standalone benchmarks
 
-**Status: agreed but not yet implemented**
+**Status: agreed**
 
-Recommended:
+Required:
 
 ```text
-TCN / ModernTCN-style model
-Mamba
-Chronos-2
+ModernTCN
 Kronos
-Adaptive Graph TCN
 ```
 
-## Possible ablations
-
-**Status: provisional**
-
-Potential ablations:
+Optional:
 
 ```text
-close-only vs OHLC targets
-with vs without volume/amount inputs
-raw/log-return vs valid-candle transformed representation
-with vs without norm_log_std inputs
-temporal-only vs temporal + graph
-static adaptive graph vs dynamic graph
-identity graph vs learned graph
-dense graph vs top-k sparse graph
-Mamba vs TCN
-deterministic vs probabilistic output
+MTGNN — only if an available implementation is straightforward to run and adapt
 ```
 
-## Rejected / deprioritised approaches
+These models are evaluated before tokenizer training and are independent of the tokenizer used by the proposed architecture.
 
-### DCC-GARCH / full multivariate GARCH
+## Proposed architecture
 
-**Status: rejected / deprioritised**
-
-Reason:
+**Status: agreed sequence; not yet implemented**
 
 ```text
-93 assets imply a very large correlation structure.
-It is CPU-expensive.
-VAR already suggests simple linear cross-asset structure is not improving point forecasts.
+Stage 1: tokenizer / autoencoder
+Stage 2: downstream dynamic-graph forecasting model
 ```
 
-### Global raw-price normalisation
-
-**Status: rejected**
-
-Reason:
+## Essential final comparisons
 
 ```text
-Raw prices are nonstationary.
-Stock splits create discontinuities.
-Window-context normalisation is safer.
+classical baselines
+ModernTCN
+Kronos
+MTGNN, if implemented
+proposed tokenizer + dynamic-graph forecasting architecture
 ```
 
-### Full ModernTCN reproduction as first neural step
-
-**Status: deprioritised**
-
-Reason:
+The core architecture ablation should isolate the graph contribution while keeping the surrounding representation and forecaster as comparable as possible:
 
 ```text
-First neural model should validate the pipeline.
-A simpler TCN-style model is faster and safer.
+no graph
+versus global/static adaptive graph
+versus input-conditioned dynamic graph
 ```
+
+Other possible ablations remain secondary:
+
+```text
+with versus without amount input
+with versus without normalisation statistics
+dense versus top-k graph
+with versus without self-loops
+frozen tokenizer versus later end-to-end fine-tuning
+deterministic versus probabilistic output, only if probabilistic scope is retained
+```
+
+## Synthetic validation
+
+**Status: required after the proposed forecasting model is working**
+
+Real equity data do not provide an observable true graph. Controlled synthetic data should therefore be generated with known cross-node dependencies and known changes in graph structure or regime.
+
+The synthetic study should compare:
+
+```text
+temporal/no-graph model
+global or static adaptive graph model
+input-conditioned dynamic graph model
+```
+
+It should evaluate both:
+
+```text
+forecasting performance when relationships change
+graph recovery or tracking of the known changing structure
+```
+
+## Rejected or deprioritised expansion
+
+```text
+DCC-GARCH / full multivariate GARCH
+Mamba
+S4
+Chronos-2
+an additional generic TCN
+DCRNN
+STGCN
+Graph WaveNet as a separate benchmark
+AGCRN as a separate benchmark
+```
+
+These may be cited where relevant but are not part of the current implementation sequence.
 
 ---
 
@@ -1806,15 +1888,15 @@ A = softmax(ReLU(E1 E2^T))
 
 ### MTGNN
 
-**Status: highly relevant baseline inspiration**
+**Status: optional benchmark and relevant reference**
 
-Learns graph structure for multivariate time-series forecasting when graph is not known.
+Learns graph structure for multivariate time-series forecasting when the graph is not known. It is the only additional graph benchmark currently under consideration, and should be implemented only if the available code is easy to run and adapt.
 
 ### AGCRN
 
-**Status: relevant reference, verify inclusion**
+**Status: relevant literature reference, not planned benchmark**
 
-Adaptive graph convolutional recurrent network. Learns node embeddings and adaptive graph convolution. Useful reference for learned static/adaptive graphs.
+Adaptive graph convolutional recurrent network. Learns node embeddings and adaptive graph convolution. Useful for discussing learned global/adaptive graphs, but not part of the current implementation plan.
 
 ## Dynamic graph papers
 
@@ -1859,43 +1941,50 @@ Do not treat this as a final citation list until verified.
 
 ### Kronos
 
-**Status: highly relevant, details need verification**
+**Status: required standalone benchmark and tokenizer inspiration; implementation details need verification**
 
-Financial K-line/candlestick foundation model. Discussed as using a tokenizer, Transformer autoencoder, BSQ quantisation, and two-stage training.
+Financial K-line/candlestick foundation model. It is a required independent benchmark. Its tokenizer architecture also motivates parts of the proposed project's Stage 1 tokenizer, but these are separate uses.
 
-Need to verify:
+Verify from the official paper/repository:
 
 ```text
 normalisation method
-tokenizer architecture
-BSQ implementation
+tokenizer architecture and BSQ implementation
 input/output format
-license and feasibility
+pretrained checkpoints and adaptation protocol
+licence
+compute requirements
 ```
-
-### Chronos-2
-
-**Status: proposed baseline, details need verification**
-
-General time-series foundation model. Need to verify official interface, whether it supports the required multivariate/financial setup, and whether comparison should be zero-shot or fine-tuned.
-
-### Mamba
-
-**Status: selected over S4 for now**
-
-Modern selective state-space model. Preferred as sequence model baseline.
-
-### S4
-
-**Status: optional / deprioritised**
-
-Historically important structured state-space model. Use only if an explicit SSM ablation is needed.
 
 ### ModernTCN
 
-**Status: proposed neural baseline**
+**Status: required next benchmark**
 
-Modern convolutional time-series architecture. First implementation should probably be a simpler TCN-style model before attempting full reproduction.
+Modern convolutional time-series architecture and the next model to implement after committing the current infrastructure work.
+
+### MTGNN
+
+**Status: optional graph benchmark**
+
+See the spatio-temporal graph section. Evaluate only if an accessible implementation is straightforward to adapt.
+
+### Chronos-2
+
+**Status: literature context, not planned implementation**
+
+General time-series foundation model that was previously considered. It is not in the current benchmark plan.
+
+### Mamba
+
+**Status: literature context, not planned implementation**
+
+Modern selective state-space model. Previously considered as a sequence baseline, but removed from the current implementation scope.
+
+### S4
+
+**Status: literature context, not planned implementation**
+
+Historically important structured state-space model. Retain for background only where useful.
 
 ---
 
@@ -1903,9 +1992,9 @@ Modern convolutional time-series architecture. First implementation should proba
 
 **Status: confirmed practical constraint**
 
-User is working locally on a Mac using VS Code, Terminal and Jupyter.
+The user is working locally on a Mac using VS Code, Terminal and Jupyter.
 
-Observed runtimes:
+Observed approximate classical-model runtimes included:
 
 ```text
 ARIMA close-only simple: a few minutes
@@ -1917,10 +2006,12 @@ VAR close-only: feasible
 Implications:
 
 ```text
-Use stride for expensive baselines.
-Avoid DCC-GARCH for now.
-Start neural work with simple models.
-Do not overbuild foundation-model integrations before validating the training pipeline.
+use stride where appropriate for expensive models
+avoid DCC-GARCH and unnecessary benchmark expansion
+implement ModernTCN before spending time on foundation/graph integrations
+verify Kronos and MTGNN compute and code availability early
+prefer adapting reliable official code to rebuilding large published systems
+keep the tokenizer and downstream forecaster as two controlled stages initially
 ```
 
 ---
@@ -1971,7 +2062,11 @@ Important emerging narrative:
 Persistence is extremely strong for intraday price levels.
 Classical statistical models mostly reduce to near-zero return forecasts.
 Simple linear cross-asset dynamics do not improve performance.
-This motivates nonlinear temporal models and graph-based relational modelling.
+ModernTCN tests the value of a strong temporal model.
+Kronos provides a finance-specific foundation-model comparison.
+Optional MTGNN tests a learned global/adaptive graph if feasible.
+The proposed architecture then learns its own discrete representation before
+forecasting with an input-conditioned dynamic graph.
 The final contribution is dynamic graph learning, not merely sequence modelling.
 ```
 
@@ -1979,75 +2074,87 @@ The final contribution is dynamic graph learning, not merely sequence modelling.
 
 # 25. Current unresolved questions ranked by importance
 
-1. **Primary prediction target**
+1. **ModernTCN adaptation**
 
 ```text
-Close-only or OHLC?
-Should volume be excluded as a target?
+How should the official architecture be adapted to [B, T, N, C] inputs and direct
+multi-horizon OHLC outputs while remaining a credible ModernTCN benchmark?
 ```
 
-Latest recommendation: close or OHLC primary; volume/amount as inputs.
-
-2. **Headline metric**
+2. **Kronos evaluation protocol**
 
 ```text
-Should cumulative log-change MAE/RMSE be the main metric?
+Which official checkpoint/interface should be used?
+Zero-shot, fine-tuned or otherwise adapted?
+How should its native representation and horizons be compared fairly with this project?
 ```
 
-Latest recommendation: yes.
-
-3. **Probabilistic forecasting**
+3. **MTGNN feasibility**
 
 ```text
-Should Gaussian mean/variance and NLL be core scope or optional?
+Is a reliable codebase available?
+Can it be adapted to the data and common output/evaluation contract without a large rebuild?
 ```
 
-Dimitri recommends it; Dr Lampos should clarify.
-
-4. **Neural benchmark scope**
+4. **Tokenizer input representation**
 
 ```text
-Which are essential: TCN, Mamba, Chronos-2, Kronos, adaptive graph TCN?
+How should amount be incorporated?
+What temporal patch/token granularity should be used?
+Should normalisation statistics be included as features?
 ```
 
-5. **Classical baseline sufficiency**
+5. **Tokenizer architecture and loss**
 
 ```text
-Are persistence, mean, ARIMA, VAR and GARCH enough?
+Exact Transformer encoder/decoder design
+BSQ bit dimension and quantisation details
+reconstruction and auxiliary loss terms
+code-utilisation and collapse diagnostics
 ```
 
-Likely yes, but ask Dr Lampos.
-
-6. **Dynamic graph design**
+6. **Tokenizer use in Stage 2**
 
 ```text
-Per-window or per-time-step?
+Use discrete token IDs, quantised embeddings or encoder states?
+Freeze the tokenizer initially?
+Is later end-to-end fine-tuning a worthwhile ablation?
+```
+
+7. **Downstream dynamic graph design**
+
+```text
+Per-window or per-time-step graph?
 Dense or sparse?
 Directed or symmetric?
+Positive-only or signed?
+Where should message passing enter the forecaster?
 ```
 
-7. **Use of normalisation constants**
+8. **Synthetic validation design**
 
 ```text
-Should norm_log_std or other volatility stats be fed to the model?
+What dynamic graph data-generating process should be used?
+How should graph recovery and regime tracking be measured?
 ```
 
-8. **Amount channel**
+9. **Headline presentation of the metric suite**
 
 ```text
-Ignore, log-transform, or handle separately?
+The implemented suite is fixed, but which metric should lead the dissertation tables
+and abstract: cumulative-log-change MAE, MASE or relative improvement over persistence?
 ```
 
-9. **Foundation model feasibility**
+10. **Probabilistic extension**
 
 ```text
-Can Chronos-2/Kronos be integrated fairly and within time?
+Keep outside the core deterministic scope, or include only after the main experiments?
 ```
 
-10. **Finance-GNN literature list**
+11. **Finance-GNN literature list**
 
 ```text
-Need exact papers and citations.
+The exact finance-specific papers and citations still need to be finalised.
 ```
 
 ---
@@ -2056,54 +2163,59 @@ Need exact papers and citations.
 
 ## Immediate
 
-1. Send Dr Lampos a progress/questions email.
-2. Verify repository state against this document.
-3. Commit current baseline code and notebooks.
-4. Produce a clean baseline result table.
+1. Commit and push the completed data, baseline and evaluation infrastructure together with this updated handover.
+2. Inspect the ModernTCN paper and official/reliable codebase.
+3. Design the repository integration and train/evaluate ModernTCN under the common raw-output and `ForecastEvaluator` contract.
 
-## Next modelling step
-
-**Recommended next implementation:**
+## Complete the standalone benchmark phase
 
 ```text
-A simple repo-native TCN-style neural baseline
+1. ModernTCN
+2. Kronos
+3. MTGNN only if code availability and adaptation are straightforward
 ```
 
-Purpose:
+Do not begin tokenizer training until this benchmark phase is complete. These models do not use the project tokenizer.
+
+## Build the proposed architecture
+
+After the standalone benchmarks:
 
 ```text
-validate neural training loop
-validate normalisation/inverse-transform pipeline
-compare against persistence
-establish first supervised neural benchmark
+Stage 1:
+    design, train and validate the tokenizer / autoencoder
+
+Stage 2:
+    design and train the downstream forecasting model using tokenizer outputs
+    add the input-conditioned dynamic graph and message passing
 ```
 
-## After TCN
-
-Recommended order:
+## Final experimental stage
 
 ```text
-1. Mamba
-2. Static adaptive graph temporal network
-3. Chronos-2 and/or Kronos, if feasible
-4. Final dynamic graph model
+1. controlled synthetic experiments with known changing graphs
+2. real-data comparison with all completed benchmarks
+3. no-graph versus static/global-graph versus dynamic-graph ablations
+4. tokenizer and representation ablations where informative
+5. learned-graph analysis
+6. dissertation results, limitations and write-up
 ```
 
 ---
 
 # 27. Questions to send Dr Lampos
 
-Suggested concise questions:
+The earlier broad list has been narrowed by decisions already made. Useful remaining questions include:
 
 ```text
-1. Is cumulative log-change MAE/RMSE the right headline metric?
-2. Should the main prediction target be close-only, OHLC, or OHLCV?
-3. Is it reasonable to use volume/amount as inputs but not primary targets?
-4. Are persistence, mean, ARIMA, VAR and GARCH sufficient classical baselines?
-5. Which neural baselines are essential: TCN, Mamba, Chronos-2, Kronos, adaptive graph TCN?
-6. Should probabilistic forecasting be a core contribution or optional extension?
-7. Does static adaptive graph vs dynamic graph sound like a clear contribution?
-8. Should normalisation constants, especially volatility-like stats, be included as model inputs?
+1. Does the benchmark scope — ModernTCN, Kronos and optional MTGNN — look sufficient?
+2. For Kronos, what comparison protocol would be most defensible?
+3. For the proposed tokenizer, should amount be included directly, handled separately or omitted?
+4. Should the tokenizer be frozen for the first downstream experiments, with end-to-end fine-tuning only as an ablation?
+5. Is a per-window dynamic graph sufficient for the core contribution, or is per-time-step variation expected?
+6. Which implemented metric should be the headline result alongside persistence-relative measures?
+7. Should probabilistic forecasting remain outside the core scope unless time permits?
+8. Does the planned synthetic graph-recovery study adequately support the dynamic-graph contribution?
 ```
 
 ---
@@ -2195,65 +2307,79 @@ variance_raw = variance_scaled / return_scale^2
 
 # Appendix C: Important repository checks
 
-The next conversation should verify:
+The next conversation has direct repository access and should inspect code before editing. The following current facts were already verified during this handover:
 
 ```text
-data path
-split shapes
-channel names
-drop-first-row cleaning
-WindowedCandleDataset indexing
-stride implementation
-normalisation implementation
+active raw sample shape: [391, 93, 6]
+clean daily shape: [390, 93, 6]
+249 unique valid sessions
+chronological config-driven split
+first-row cleaning
+WindowedCandleDataset indexing and stride
+window-context normalisation and inverse
 valid-candle transform and inverse
-prediction transforms
-metrics
-baseline model output contracts
-GARCH scaling
-baseline result notebook
-requirements.txt
-.gitignore
+raw-only classical baseline outputs
+ForecastEvaluator registry
+make_evaluation_table workflow
+GARCH return scaling
+preprocessing regression script passes
 ```
+
+Before implementing each new external model, verify its official code, licence, dependencies, expected data layout and output contract rather than relying on this handover for package/API details.
 
 ---
 
 # Instructions for the next ChatGPT conversation
 
-The new conversation should treat this document as a detailed project memory, **not as guaranteed ground truth**. It will have access to the GitHub repository and should verify code before making changes.
+The next conversation runs inside the ChatGPT Project and can inspect the current repository directly. Treat this document as the record of agreed decisions and sequencing, while treating the repository as the source of truth for exact code.
 
 Specific instructions:
 
 1. **Inspect the repository before editing.**
-   Do not assume file names, class names, function signatures or config keys perfectly match this document.
+   Do not infer exact signatures, config keys or class internals from this handover when the code is available.
 
-2. **Verify current data paths and shapes.**
-   Confirm the active dataset path, split counts, sample shapes, channel names and cleaned dimensions.
+2. **Preserve the project sequence.**
 
-3. **Check implementation status.**
-   Confirm which files actually exist and whether the described functions/classes are already implemented.
+   ```text
+   remaining standalone benchmarks:
+       ModernTCN
+       Kronos
+       optional MTGNN
+
+   then proposed architecture:
+       Stage 1 tokenizer
+       Stage 2 downstream forecasting model
+   ```
+
+   The standalone benchmarks do not use the project tokenizer.
+
+3. **Do not expand the benchmark list without an explicit decision.**
+   Mamba, S4, Chronos-2 and additional graph architectures are not current implementation targets.
 
 4. **Preserve existing design choices unless explicitly changed.**
-   In particular:
 
    * use `src/models/`, not `src/baselines/`;
    * use British spelling: `normaliser`, `normalisation`, `unnormalised`;
    * keep window-context normalisation as the current default;
-   * do not introduce global raw-price normalisation unless explicitly requested.
+   * do not introduce global raw-price normalisation without an explicit decision;
+   * retain the raw-only model output contract and central `ForecastEvaluator`;
+   * retain the chronological config-driven split;
+   * current inputs are OHLC, volume and amount; current targets are OHLC.
 
-5. **Avoid code-fence metadata.**
-   Use plain code fences only.
+5. **Work one controlled step at a time.**
+   The user prefers reviewing one function or change at a time and validating it before proceeding.
 
-6. **Work one step at a time.**
-   If asked to review a function, review only that function. If it is correct, say “OK”. If not, explain the issue and provide the corrected version.
+6. **Do not overbuild.**
+   Begin with ModernTCN. Verify external code feasibility before designing a large integration. Implement MTGNN only if straightforward.
 
-7. **Do not overbuild.**
-   The next modelling step should probably be a simple TCN-style neural baseline to validate the training and evaluation pipeline before Mamba, Kronos, Chronos-2 or the final dynamic graph model.
+7. **Use current primary sources for external model details.**
+   ModernTCN, Kronos, MTGNN and package APIs may change. Check official papers, repositories and documentation when implementing or citing them.
 
-8. **Use current web/primary sources for external model details.**
-   Kronos, Chronos-2, Mamba, ModernTCN and package APIs may have changed. Verify against official repositories/papers/docs before implementing or citing.
+8. **Keep benchmark and proposed-architecture code conceptually separate.**
+   The tokenizer is for the proposed architecture, not for ModernTCN, Kronos or MTGNN.
 
 9. **Clearly mark uncertainty.**
-   If a detail is inferred from this handover rather than verified from code/data, say so.
+   Do not invent architecture details, codebases or recommendations that are not in the repository, this document or a verified source.
 
-10. **Keep the dissertation framing in mind.**
-    The final contribution is dynamic graph learning for intraday multi-asset forecasting, not just another temporal model.
+10. **Keep the dissertation contribution in view.**
+    The final contribution is an input-conditioned dynamic graph forecasting model trained after a separate tokenizer stage, not merely another temporal benchmark.

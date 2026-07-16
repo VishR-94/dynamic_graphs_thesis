@@ -2,7 +2,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 from functools import partial
 import torch
-
+from torchmetrics.functional.regression import pearson_corrcoef
 from src.evaluation.prediction_transforms import (
     raw_to_cumulative_log_change,
 )
@@ -524,6 +524,40 @@ def mase(
         reduce_dims=reduce_dims,
     )
 
+
+def pearson_correlation(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    reduce_dims: Sequence[int] = (0, 2),
+) -> torch.Tensor:
+    validate_prediction_shapes(y_pred, y_true)
+
+    if tuple(reduce_dims) != (0, 2):
+        raise ValueError(
+            "pearson_correlation currently supports "
+            "reduce_dims=(0, 2) only."
+        )
+
+    batch_size, num_horizons, num_assets, num_channels = y_pred.shape
+
+    # [B, H, N, C] -> [B*N, H*C]
+    pred_flat = (
+        y_pred.permute(0, 2, 1, 3)
+        .reshape(batch_size * num_assets, -1)
+    )
+
+    true_flat = (
+        y_true.permute(0, 2, 1, 3)
+        .reshape(batch_size * num_assets, -1)
+    )
+
+    correlations = pearson_corrcoef(
+        pred_flat,
+        true_flat,
+    )
+
+    return correlations.reshape(num_horizons, num_channels)
+
 MetricFunction = Callable[..., torch.Tensor]
 class ForecastEvaluator:
     """
@@ -724,6 +758,11 @@ class ForecastEvaluator:
             "cumulative_log_change_mae": partial(
                 self.compute_pairwise_metric,
                 metric_fn=mae,
+                output_space="cumulative_log_change",
+            ),
+            "cumulative_log_change_pearson_correlation": partial(
+                self.compute_pairwise_metric,
+                metric_fn=pearson_correlation,
                 output_space="cumulative_log_change",
             ),
             "mase": self.compute_mase,
