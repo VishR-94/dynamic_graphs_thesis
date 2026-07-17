@@ -208,6 +208,11 @@ class ModernTCNBaseline:
         self.model: Any | None = None
         self.train_split: dict[str, Any] | None = None
         self.val_split: dict[str, Any] | None = None
+        self.device: torch.device | None = None
+        self.checkpoint_path: Path | None = None
+        self.training_history: list[dict[str, float | int]] = []
+        self.best_epoch: int | None = None
+        self.best_validation_loss: float | None = None
 
     @classmethod
     def from_config(
