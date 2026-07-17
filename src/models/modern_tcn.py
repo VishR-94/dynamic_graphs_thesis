@@ -861,6 +861,7 @@ class ModernTCNBaseline:
         train_split: dict[str, Any],
         val_split: dict[str, Any],
         checkpoint_path: str | Path | None = None,
+        epoch_callback: (Callable[[dict[str,float | int]], None] | None) = None,
     ) -> "ModernTCNBaseline":
         """
         Train ModernTCN using the training split and select the best epoch
@@ -929,14 +930,14 @@ class ModernTCNBaseline:
                 device=device,
             )
 
-            history.append(
-                {
-                    "epoch": epoch,
-                    "learning_rate": learning_rate,
-                    "training_loss": training_loss,
-                    "validation_loss": validation_loss,
-                }
-            )
+            epoch_record: dict[str, float | int] = {
+                "epoch": epoch,
+                "learning_rate": learning_rate,
+                "training_loss": training_loss,
+                "validation_loss": validation_loss,
+            }
+
+            history.append(epoch_record)
 
             print(
                 f"Epoch {epoch:03d} | "
@@ -960,6 +961,9 @@ class ModernTCNBaseline:
             else:
                 patience_counter += 1
 
+            if epoch_callback is not None:
+                epoch_callback(dict(epoch_record))
+
             if patience_counter >= self.patience:
                 print(
                     "Early stopping after "
@@ -971,6 +975,7 @@ class ModernTCNBaseline:
                 optimizer=optimizer,
                 completed_epoch=epoch,
             )
+
 
         self._load_checkpoint(
             checkpoint_path=resolved_checkpoint_path,
