@@ -58,3 +58,14 @@ normalisation:
 training:
   batch_size: 32
   num_workers: 0
+
+models:
+  modern_tcn:
+    training:
+      learning_rate: 1.0e-4
+      weight_decay: 0.0
+      batch_size: 16
+      max_epochs: 100
+      patience: 10
+      seed: 42
+      scheduler_type: type3
