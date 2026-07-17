@@ -60,30 +60,30 @@ training:
   num_workers: 0
 
 models:
-  models:
-    modern_tcn:
-      patch_size: 8
-      patch_stride: 4
-      hidden_dim: 64
-      ffn_ratio: 1
-      num_blocks: 1
-      large_kernel: 51
-      small_kernel: 5
-      dropout: 0.05
-      head_dropout: 0.0
+  modern_tcn:
+    patch_size: 8
+    patch_stride: 4
+    hidden_dim: 64
+    ffn_ratio: 1
+    num_blocks: 1
+    large_kernel: 51
+    small_kernel: 5
+    dropout: 0.05
+    head_dropout: 0.0
 
-      revin: true
-      revin_affine: false
-      subtract_last: false
-      individual_head: false
-      use_multi_scale: false
-      small_kernel_merged: false
+    revin: true
+    revin_affine: false
+    subtract_last: false
+    individual_head: false
+    use_multi_scale: false
+    small_kernel_merged: false
 
-      training:
-        learning_rate: 1.0e-4
-        weight_decay: 0.0
-        batch_size: 16
-        max_epochs: 100
-        patience: 10
-        seed: 42
-        scheduler_type: type3
+    training:
+      learning_rate: 1.0e-4
+      weight_decay: 0.0
+      batch_size: 16
+      max_epochs: 100
+      patience: 10
+      seed: 42
+      scheduler_type: type3
+  
