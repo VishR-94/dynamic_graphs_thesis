@@ -799,6 +799,146 @@ class ModernTCNBaseline:
 
         return checkpoint
     
+    def load_checkpoint(
+        self,
+        checkpoint_path: str | Path,
+        device: str | torch.device = "cpu",
+    ) -> "ModernTCNBaseline":
+        """
+        Load a trained ModernTCN checkpoint for inference.
+
+        This constructs the model using the current configuration and the
+        dimensions stored in the checkpoint. It does not create an optimiser
+        or perform any training.
+
+        Args:
+            checkpoint_path:
+                Path to a checkpoint produced by ModernTCNBaseline.fit().
+
+            device:
+                Device on which prediction will run.
+
+        Returns:
+            The current ModernTCNBaseline instance.
+        """
+        checkpoint_path = (
+            Path(checkpoint_path)
+            .expanduser()
+            .resolve()
+        )
+
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(checkpoint_path)
+
+        resolved_device = torch.device(device)
+
+        if (
+            resolved_device.type == "cuda"
+            and not torch.cuda.is_available()
+        ):
+            raise RuntimeError(
+                "CUDA was requested, but CUDA is not available."
+            )
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+        )
+
+        required_keys = {
+            "epoch",
+            "model_state_dict",
+            "best_validation_loss",
+            "asset_cols",
+            "target_channels",
+            "horizons",
+            "num_assets",
+            "num_variables",
+        }
+
+        missing_keys = required_keys.difference(checkpoint)
+
+        if missing_keys:
+            raise KeyError(
+                "ModernTCN checkpoint is missing required keys: "
+                f"{sorted(missing_keys)}"
+            )
+
+        checkpoint_channels = list(
+            checkpoint["target_channels"]
+        )
+
+        checkpoint_horizons = [
+            int(horizon)
+            for horizon in checkpoint["horizons"]
+        ]
+
+        if checkpoint_channels != list(self.target_channels):
+            raise ValueError(
+                "Checkpoint target channels do not match the "
+                "current configuration."
+            )
+
+        if checkpoint_horizons != list(self.horizons):
+            raise ValueError(
+                "Checkpoint horizons do not match the "
+                "current configuration."
+            )
+
+        self.asset_cols = list(
+            checkpoint["asset_cols"]
+        )
+
+        self.num_assets = int(
+            checkpoint["num_assets"]
+        )
+
+        self.num_variables = int(
+            checkpoint["num_variables"]
+        )
+
+        if len(self.asset_cols) != self.num_assets:
+            raise ValueError(
+                "Checkpoint asset metadata is inconsistent."
+            )
+
+        expected_num_variables = (
+            self.num_assets
+            * len(self.target_channels)
+        )
+
+        if self.num_variables != expected_num_variables:
+            raise ValueError(
+                "Checkpoint num_variables is inconsistent with "
+                "the number of assets and target channels."
+            )
+
+        self.model = self._build_official_model()
+
+        try:
+            self.model.load_state_dict(
+                checkpoint["model_state_dict"]
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                "Checkpoint weights are incompatible with the "
+                "current ModernTCN architecture. Ensure that the "
+                "config contains the selected run's architecture."
+            ) from exc
+
+        self.model.to(resolved_device)
+        self.model.eval()
+
+        self.device = resolved_device
+        self.checkpoint_path = checkpoint_path
+        self.best_epoch = int(checkpoint["epoch"])
+        self.best_validation_loss = float(
+            checkpoint["best_validation_loss"]
+        )
+        self.training_history = []
+
+        return self
+    
 
     def _adjust_learning_rate(
         self,
