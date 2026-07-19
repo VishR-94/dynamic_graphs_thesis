@@ -35,7 +35,7 @@ normalisation:
   enabled: true
   method: window_context
 
-  clip: true
+  clip: false
   clip_min: -5.0
   clip_max: 5.0
 
@@ -71,7 +71,8 @@ models:
     dropout: 0.05
     head_dropout: 0.0
 
-    revin: true
+    variable_layout: joint
+    revin: false
     revin_affine: false
     subtract_last: false
     individual_head: false

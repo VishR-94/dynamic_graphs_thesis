@@ -132,6 +132,36 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--target-channels",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional ordered target-channel override. "
+            "The same channels are used as ModernTCN inputs and targets. "
+            "Example: --target-channels close volume"
+        ),
+    )
+
+    parser.add_argument(
+        "--variable-layout",
+        choices=("joint", "per_asset"),
+        default=None,
+        help=(
+            "Optional ModernTCN variable-layout override."
+        ),
+    )
+
+    parser.add_argument(
+        "--smoke-days",
+        type=int,
+        default=None,
+        help=(
+            "Retain only the first N chronological sessions from each split "
+            "for a fast pipeline smoke test."
+        ),
+    )
+
     return parser
 
 
@@ -201,21 +231,41 @@ def prepare_experiment_paths(
 
 def build_run_checkpoint_path(
     checkpoint_root: Path,
+    experiment_name: str,
     run_id: str,
 ) -> Path:
     """
     Create a unique best-checkpoint path for one W&B run.
-    """
-    if not run_id:
-        raise ValueError("W&B run ID must not be empty.")
 
-    run_checkpoint_dir = checkpoint_root / run_id
+    Structure:
+        <checkpoint_root>/<experiment_name>/runs/<run_id>/
+    """
+    if not experiment_name:
+        raise ValueError(
+            "experiment_name must not be empty."
+        )
+
+    if not run_id:
+        raise ValueError(
+            "W&B run ID must not be empty."
+        )
+
+    run_checkpoint_dir = (
+        checkpoint_root
+        / experiment_name
+        / "runs"
+        / run_id
+    )
+
     run_checkpoint_dir.mkdir(
         parents=True,
         exist_ok=False,
     )
 
-    return run_checkpoint_dir / "best_checkpoint.pt"
+    return (
+        run_checkpoint_dir
+        / "best_checkpoint.pt"
+    )
 
 
 def apply_cli_overrides(
@@ -231,9 +281,52 @@ def apply_cli_overrides(
     """
     resolved_config = deepcopy(config)
 
-    training_config = resolved_config[
+    forecasting_config = resolved_config[
+    "forecasting"
+    ]
+
+    modern_tcn_config = resolved_config[
         "models"
-    ]["modern_tcn"]["training"]
+    ]["modern_tcn"]
+
+    training_config = modern_tcn_config[
+        "training"
+    ]
+
+    if args.target_channels is not None:
+        target_channels = [
+            str(channel).strip()
+            for channel in args.target_channels
+        ]
+
+        if not target_channels:
+            raise ValueError(
+                "--target-channels must contain at least one channel."
+            )
+
+        if any(
+            not channel
+            for channel in target_channels
+        ):
+            raise ValueError(
+                "--target-channels cannot contain empty names."
+            )
+
+        if len(target_channels) != len(
+            set(target_channels)
+        ):
+            raise ValueError(
+                "--target-channels cannot contain duplicates."
+            )
+
+        forecasting_config[
+            "target_channels"
+        ] = target_channels
+
+    if args.variable_layout is not None:
+        modern_tcn_config[
+            "variable_layout"
+        ] = args.variable_layout
 
     if args.max_epochs is not None:
         if args.max_epochs <= 0:
@@ -269,8 +362,13 @@ def build_wandb_config(
     forecasting_config = config["forecasting"]
     modern_tcn_config = config["models"]["modern_tcn"]
     training_config = modern_tcn_config["training"]
-
     global_training_config = config.get("training", {})
+
+    revin_enabled = bool(
+        modern_tcn_config["revin"]
+    )
+
+
 
     return {
         # Experiment identity.
@@ -278,6 +376,12 @@ def build_wandb_config(
         "dataset_id": data_dir.parent.name,
         "cached_split_directory": str(data_dir),
         "evaluation_split": evaluation_split,
+        "variable_layout": str(
+            modern_tcn_config.get(
+                "variable_layout",
+                "joint",
+            )
+        ),
 
         # Forecasting task.
         "context_length": int(
@@ -322,8 +426,11 @@ def build_wandb_config(
         "head_dropout": float(
             modern_tcn_config["head_dropout"]
         ),
-        "revin": bool(
-            modern_tcn_config["revin"]
+        "revin": revin_enabled,
+        "loss_space": (
+            "raw"
+            if bool(modern_tcn_config["revin"])
+            else "window_context_normalised"
         ),
         "revin_affine": bool(
             modern_tcn_config["revin_affine"]
@@ -339,6 +446,18 @@ def build_wandb_config(
         ),
         "small_kernel_merged": bool(
             modern_tcn_config["small_kernel_merged"]
+        ),
+        "normalisation_enabled": (
+            not revin_enabled
+        ),
+        "normalisation_method": str(
+            config["normalisation"]["method"]
+        ),
+        "normalisation_clip": bool(
+            config["normalisation"]["clip"]
+        ),
+        "normalisation_config_enabled": bool(
+            config["normalisation"]["enabled"]
         ),
 
         # Training.
@@ -463,6 +582,41 @@ def load_experiment_inputs(
     )
 
 
+def limit_split_days(
+    split: SplitDict,
+    max_days: int | None,
+) -> SplitDict:
+    """
+    Retain only the first max_days sessions for a fast smoke test.
+
+    This preserves the original split boundary, asset ordering,
+    channel ordering and within-session window construction.
+    """
+    if max_days is None:
+        return split
+
+    if max_days <= 0:
+        raise ValueError(
+            "--smoke-days must be greater than zero."
+        )
+
+    if "samples" not in split:
+        raise KeyError(
+            "Split does not contain a 'samples' field."
+        )
+
+    limited_split = dict(split)
+    limited_split["samples"] = list(
+        split["samples"][:max_days]
+    )
+
+    if not limited_split["samples"]:
+        raise ValueError(
+            "The limited split contains no sessions."
+        )
+
+    return limited_split
+
 def fit_modern_tcn_run(
     base_config: ConfigDict,
     train_split: SplitDict,
@@ -486,13 +640,34 @@ def fit_modern_tcn_run(
         run_config=run.config,
     )
 
-    checkpoint_path = build_run_checkpoint_path(
-        checkpoint_root=checkpoint_root,
-        run_id=run.id,
-    )
-
     model = ModernTCNBaseline.from_config(
         run_config,
+    )
+
+    run.config.update(
+        {
+            "experiment_name": (
+                model.experiment_name
+            ),
+            "variable_layout": (
+                model.variable_layout
+            ),
+            "target_channels": list(
+                model.target_channels
+            ),
+            "num_channels": (
+                model.num_channels
+            ),
+            "revin": model.revin,
+            "loss_space": model.loss_space,
+        },
+        allow_val_change=True,
+    )
+
+    checkpoint_path = build_run_checkpoint_path(
+        checkpoint_root=checkpoint_root,
+        experiment_name=model.experiment_name,
+        run_id=run.id,
     )
 
     start_time = perf_counter()
@@ -690,6 +865,9 @@ def log_evaluation_outputs(
         metadata={
             "wandb_run_id": run.id,
             "evaluation_split": split_name,
+            "experiment_name": run.config[
+                "experiment_name"
+            ],
         },
     )
 
@@ -768,6 +946,54 @@ def record_run_summary(
         model.device
     )
 
+    if model.num_assets is None:
+        raise RuntimeError(
+            "Model asset dimensions were not resolved."
+        )
+
+    if model.num_variables is None:
+        raise RuntimeError(
+            "Model variable dimensions were not resolved."
+        )
+    
+    run.summary["experiment_name"] = (
+        model.experiment_name
+    )
+
+    run.summary["variable_layout"] = (
+        model.variable_layout
+    )
+
+    run.summary["target_channels"] = list(
+        model.target_channels
+    )
+
+    run.summary["num_channels"] = int(
+        model.num_channels
+    )
+
+    run.summary["num_assets"] = int(
+        model.num_assets
+    )
+
+    run.summary["num_variables"] = int(
+        model.num_variables
+    )
+
+    run.summary["revin"] = bool(
+        model.revin
+    )
+
+    run.summary["loss_space"] = (
+        model.loss_space
+    )
+
+    run.summary["normalisation_clip"] = (
+        None
+        if model.normaliser is None
+        else bool(model.normaliser.clip)
+    )
+
     for metric_name, metric_value in evaluation_metrics.items():
         run.summary[metric_name] = float(
             metric_value
@@ -808,6 +1034,16 @@ def log_checkpoint_artifact(
             "best_validation_mse": float(
                 model.best_validation_loss
             ),
+            "experiment_name": (
+                model.experiment_name
+            ),
+            "variable_layout": (
+                model.variable_layout
+            ),
+            "target_channels": list(
+                model.target_channels
+            ),
+            "loss_space": model.loss_space,
         },
     )
 
@@ -840,6 +1076,29 @@ def main() -> None:
         data_dir=data_dir,
     )
 
+    train_split = limit_split_days(
+        train_split,
+        args.smoke_days,
+    )
+
+    val_split = limit_split_days(
+        val_split,
+        args.smoke_days,
+    )
+
+    test_split = limit_split_days(
+        test_split,
+        args.smoke_days,
+    )
+
+    if args.smoke_days is not None:
+        print(
+            "Smoke-test data: "
+            f"{len(train_split['samples'])} train session(s), "
+            f"{len(val_split['samples'])} validation session(s), "
+            f"{len(test_split['samples'])} test session(s)."
+        )
+
     base_config = apply_cli_overrides(
         config=config,
         args=args,
@@ -851,6 +1110,14 @@ def main() -> None:
         evaluation_split=args.evaluation_split,
     )
 
+    wandb_config["is_smoke_run"] = (
+        args.smoke_days is not None
+    )
+
+    wandb_config["smoke_days_per_split"] = (
+        args.smoke_days
+    )
+    
     evaluation_split = (
         val_split
         if args.evaluation_split == "val"

@@ -3,7 +3,10 @@ import torch
 from typing import Any
 from types import SimpleNamespace
 from pathlib import Path
-from src.data.data_generator import WindowedCandleDataset
+from src.data.data_generator import (
+    WindowedCandleDataset,
+    WindowContextNormaliser,)
+from src.evaluation.prediction_transforms import inverse_window_normalisation
 from torch.utils.data import DataLoader
 import random
 import numpy as np
@@ -43,92 +46,6 @@ Params:
 6. The default uses 1 ModernTCN block. It ablates for 2 and 3 blocks. We initially use 1. 
 """
 
-#function to flatten our input data to the correct shape, [B,T,N,C] -> [B,T,N*C]
-def flatten_asset_channels(x: torch.Tensor)->torch.Tensor:
-    """Flatten the asset and channel axes into ModernTCN's variable axis.
-
-    Args:
-        x:
-            Tensor with shape ``[B, T, N, C]``, where:
-
-            - ``B`` is the batch size;
-            - ``T`` is the number of context time steps;
-            - ``N`` is the number of assets;
-            - ``C`` is the number of channels per asset.
-
-    Returns:
-        Tensor with shape ``[B, T, N * C]``.
-
-        The flattened variable order is asset-major and channel-minor:
-
-        ``flat_index = asset_index * C + channel_index``.
-
-        For OHLC data this gives:
-
-        ``asset_0_open, asset_0_high, asset_0_low, asset_0_close,``
-        ``asset_1_open, ...``
-
-    Raises:
-        TypeError:
-            If ``x`` is not a PyTorch tensor.
-        ValueError:
-            If ``x`` does not have exactly four dimensions.
-    """
-
-    if not isinstance(x,torch.Tensor):
-        raise TypeError(
-            'x must be a torch.Tensor with shape [B,T,N,C]'
-        )
-    
-    if x.ndim != 4:
-        raise ValueError(
-            "x must have shape [B, T, N, C]. "
-            f"Received shape {tuple(x.shape)}."
-        )
-    
-    batch_size, time_steps, num_asset, num_channels = x.shape
-    
-    return x.reshape(
-        batch_size,
-        time_steps,
-        num_asset * num_channels,
-    )
-
-#function to unflatten the output from [B,T,N*C] -> [B,T,N,C]
-def unflatten_asset_channels(
-        x: torch.Tensor,
-        num_assets: int,
-        num_channels: int)->torch.Tensor:
-    """Restore ModernTCN's variable axis to separate asset/channel axes."""
-
-    if not isinstance(x, torch.Tensor):
-        raise TypeError(
-            'x must be a torch.Tensor with shape [B, T, N * C].'
-        )
-    
-    if x.ndim != 3:
-        raise ValueError(
-            "x must have shape [B, N, N * C]. "
-            f"Received shape {tuple(x.shape)}."
-        )   
-    
-    expected_final_dim = num_assets * num_channels
-
-    if expected_final_dim != x.shape[-1]:
-        raise ValueError(
-            "The final dimension of x must equal number of channels * number of assets. "
-            f"Expected final dimension of {expected_final_dim}, got {x.shape[-1]} "
-        )
-    
-    batch_size, time_steps, _ = x.shape
-
-    return x.reshape(
-        batch_size,
-        time_steps,
-        num_assets,
-        num_channels
-    )
-
 class ModernTCNBaseline:
     """
     Project wrapper for the official ModernTCN forecasting model.
@@ -151,7 +68,9 @@ class ModernTCNBaseline:
         small_kernel: int = 5,
         dropout: float = 0.05,
         head_dropout: float = 0.0,
+        variable_layout: str = 'joint',
         revin: bool = True,
+        normaliser: WindowContextNormaliser | None=None,
         revin_affine: bool = False,
         subtract_last: bool = False,
         individual_head: bool = False,
@@ -172,6 +91,23 @@ class ModernTCNBaseline:
         self.target_channels = target_channels
         self.stride = stride
 
+        if variable_layout not in {"joint", "per_asset"}:
+            raise ValueError(
+                "variable_layout must be either 'joint' or 'per_asset', "
+                f"got {variable_layout!r}."
+            )
+
+        if not target_channels:
+            raise ValueError("target_channels must contain at least one channel.")
+
+        if len(target_channels) != len(set(target_channels)):
+            raise ValueError(
+                f"target_channels contains duplicates: {target_channels}."
+            )
+
+        self.variable_layout = variable_layout
+        self.num_channels = len(target_channels)
+
         # Agreed ModernTCN architecture.
         self.patch_size = patch_size
         self.patch_stride = patch_stride
@@ -184,7 +120,37 @@ class ModernTCNBaseline:
         self.head_dropout = head_dropout
 
         # Official architecture flags.
+        if revin and normaliser is not None:
+            raise ValueError(
+                "A project normaliser must not be supplied when revin=True."
+            )
+
+        if not revin and normaliser is None:
+            raise ValueError(
+                "WindowContextNormaliser is required when revin=False."
+            )
+
+        if normaliser is not None:
+            if not normaliser.apply_to_target:
+                raise ValueError(
+                    "ModernTCN requires normalisation.window_context."
+                    "apply_to_target: true when revin=False."
+                )
+
+            if not normaliser.include_stats:
+                raise ValueError(
+                    "ModernTCN requires normalisation.window_context."
+                    "include_stats: true when revin=False."
+                )
+
         self.revin = revin
+        self.normaliser = normaliser
+        self.loss_space = (
+            "raw"
+            if self.revin
+            else "window_context_normalised"
+        )
+
         self.revin_affine = revin_affine
         self.subtract_last = subtract_last
         self.individual_head = individual_head
@@ -203,6 +169,13 @@ class ModernTCNBaseline:
         self.asset_cols: list[str] | None = None
         self.num_assets: int | None = None
         self.num_variables: int | None = None
+
+        channel_code = "".join(channel.strip().lower()[0]
+                               for channel in self.target_channels)
+        
+        self.experiment_name = (
+            f"{self.variable_layout}_{channel_code}"
+        )
 
         # These are populated later by fit(...).
         self.model: Any | None = None
@@ -239,6 +212,30 @@ class ModernTCNBaseline:
 
         global_training_config = config.get("training", {})
 
+        revin = bool(
+            modern_tcn_config.get("revin", True)
+        )
+
+        normaliser = None
+
+        if not revin:
+            normalisation_config = config.get(
+                "normalisation",
+                {},
+            )
+
+            if not bool(
+                normalisation_config.get("enabled", False)
+            ):
+                raise ValueError(
+                    "normalisation.enabled must be true when "
+                    "ModernTCN revin is false."
+                )
+
+            normaliser = WindowContextNormaliser.from_config(
+                config
+            )
+
         return cls(
             context_length=int(forecasting_config["context_length"]),
             horizons=[int(horizon) for horizon in forecasting_config["horizons"]],
@@ -253,7 +250,9 @@ class ModernTCNBaseline:
             small_kernel=int(modern_tcn_config.get("small_kernel", 5)),
             dropout=float(modern_tcn_config.get("dropout", 0.05)),
             head_dropout=float(modern_tcn_config.get("head_dropout", 0.0)),
-            revin=bool(modern_tcn_config.get("revin", True)),
+            variable_layout=str(modern_tcn_config.get("variable_layout", "joint")),
+            revin=revin,
+            normaliser=normaliser,
             revin_affine=bool(modern_tcn_config.get("revin_affine", False)),
             subtract_last=bool(modern_tcn_config.get("subtract_last", False)),
             individual_head=bool(modern_tcn_config.get("individual_head", False)),
@@ -287,21 +286,51 @@ class ModernTCNBaseline:
             }
         }
     
+    def _expected_num_variables(
+        self,
+        num_assets: int,
+    ) -> int:
+        """
+        Return the number of variables presented to ModernTCN.
+
+        joint:
+            M = N * C
+
+        per_asset:
+            M = C
+        """
+        if num_assets < 1:
+            raise ValueError(
+                f"num_assets must be at least 1, got {num_assets}."
+            )
+
+        if self.variable_layout == "joint":
+            return num_assets * self.num_channels
+
+        if self.variable_layout == "per_asset":
+            return self.num_channels
+
+        raise RuntimeError(
+            f"Unsupported variable_layout: {self.variable_layout!r}."
+        )
+
     def _resolve_data_dimensions(
         self,
         train_split: dict[str, Any],
         val_split: dict[str, Any],
     ) -> None:
         """
-        Resolve ModernTCN's variable dimension from the supplied data splits.
+        Resolve the dimensions required by ModernTCN.
 
-        ModernTCN treats every asset-channel pair as one scalar variable:
+        joint:
+            num_variables = num_assets * num_channels
 
-            num_variables = num_assets * num_target_channels
+        per_asset:
+            num_variables = num_channels
 
-        The validation split must contain the same assets in the same order,
-        because one flattened variable index must retain the same meaning across
-        training, validation, and later prediction.
+        Training and validation must contain the same assets in the same
+        order. This is required for project-facing tensors [B, T, N, C]
+        under both layouts.
         """
         train_asset_cols = list(train_split["asset_cols"])
         val_asset_cols = list(val_split["asset_cols"])
@@ -341,8 +370,8 @@ class ModernTCNBaseline:
 
         self.asset_cols = train_asset_cols
         self.num_assets = len(train_asset_cols)
-        self.num_variables = (
-            self.num_assets * len(self.target_channels)
+        self.num_variables = self._expected_num_variables(
+            num_assets=self.num_assets,
         )
 
     def _build_official_config(self) -> SimpleNamespace:
@@ -351,7 +380,7 @@ class ModernTCNBaseline:
         ModernTCN forecasting Model class.
 
         This method must be called only after _resolve_data_dimensions(...),
-        because enc_in depends on the number of assets in the training split.
+        because enc_in depends on the resolved data dimensions and variable layout
         """
         if self.num_variables is None:
             raise RuntimeError(
@@ -441,16 +470,18 @@ class ModernTCNBaseline:
         split: dict[str, Any],
     ) -> WindowedCandleDataset:
         """
-        Build the raw OHLC window dataset used by ModernTCN.
+        Build the window dataset used by ModernTCN.
 
-        The project dataset retains the established chronological, within-session
-        windowing and direct sparse-horizon target construction. No project
-        normaliser is applied because ModernTCN uses its native RevIN.
+        When revin=True, the dataset remains in raw value space and the
+        official model handles RevIN internally.
+
+        When revin=False, the project WindowContextNormaliser normalises
+        both context inputs and targets using context-only statistics.
         """
         return WindowedCandleDataset.from_config(
             split=split,
             config=self._dataset_config(),
-            normaliser=None,
+            normaliser=self.normaliser,
         )
     
     def _build_data_loader(
@@ -493,22 +524,168 @@ class ModernTCNBaseline:
             generator=generator,
         )
     
+    def _flatten_input(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Convert a project-format tensor [B, T, N, C] into the variable
+        layout expected by ModernTCN.
+
+        joint:
+            [B, T, N, C] -> [B, T, N * C]
+
+        per_asset:
+            [B, T, N, C] -> [B, N, T, C] -> [B * N, T, C]
+        """
+
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(
+                "x must be a torch.Tensor with shape [B,T,N,C]"
+            )
+    
+        if x.ndim != 4:
+            raise ValueError(
+                "x must have shape [B,T,N,C]. "
+                f"Received shape {tuple(x.shape)}."
+            )
+        
+        batch_size, time_steps, num_assets, num_channels = x.shape
+
+        if self.num_assets is not None and num_assets != self.num_assets:
+            raise ValueError(
+                "The asset dimension of x does not match the model. "
+                f"Expected {self.num_assets}, got {num_assets}."
+            )
+
+        if num_channels != self.num_channels:
+            raise ValueError(
+                "The channel dimension of x does not match target_channels. "
+                f"Expected {self.num_channels}, got {num_channels}."
+            )
+        
+        if self.variable_layout == "joint":
+            return x.reshape(
+                batch_size,
+                time_steps,
+                num_assets * num_channels
+            )
+        
+        if self.variable_layout == "per_asset":
+            return (
+                x.permute(0, 2, 1, 3)
+                .contiguous()
+                .reshape(
+                    batch_size * num_assets,
+                    time_steps,
+                    num_channels,
+                )
+            )
+        
+        raise RuntimeError(
+            f"Unsupported variable_layout: {self.variable_layout!r}."
+        )
+
+
+    def _unflatten_output(
+        self,
+        x: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """
+        Convert ModernTCN output back to project format [B, H, N, C].
+
+        joint:
+            [B, H, N * C] -> [B, H, N, C]
+
+        per_asset:
+            [B * N, H, C] -> [B, N, H, C] -> [B, H, N, C]
+        """
+
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(
+                "x must be a torch.Tensor containing ModernTCN output."
+            )
+
+        if x.ndim != 3:
+            raise ValueError(
+                "ModernTCN output must have exactly three dimensions. "
+                f"Received shape {tuple(x.shape)}."
+            )
+
+        if self.num_assets is None:
+            raise RuntimeError(
+                "The number of assets has not been resolved."
+            )
+        
+        horizon_count = x.shape[1]
+
+        if self.variable_layout == "joint":
+            expected_shape = (
+                batch_size,
+                horizon_count,
+                self.num_assets * self.num_channels,
+            )
+
+            if tuple(x.shape) != expected_shape:
+                raise ValueError(
+                    "Unexpected joint ModernTCN output shape. "
+                    f"Expected {expected_shape}, got {tuple(x.shape)}."
+                )
+
+            return x.reshape(
+                batch_size,
+                horizon_count,
+                self.num_assets,
+                self.num_channels,
+            )
+        
+        if self.variable_layout == "per_asset":
+            expected_shape = (
+                batch_size * self.num_assets,
+                horizon_count,
+                self.num_channels,
+            )
+
+            if tuple(x.shape) != expected_shape:
+                raise ValueError(
+                    "Unexpected per-asset ModernTCN output shape. "
+                    f"Expected {expected_shape}, got {tuple(x.shape)}."
+                )
+
+            return (
+                x.reshape(
+                    batch_size,
+                    self.num_assets,
+                    horizon_count,
+                    self.num_channels,
+                )
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )
+
+        raise RuntimeError(
+            f"Unsupported variable_layout: {self.variable_layout!r}."
+        )
+
     def _forward_project_tensor(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Run a project-format OHLC tensor through the official ModernTCN model.
+        Run a project-format tensor through the official ModernTCN model.
 
         Args:
             x:
-                Raw OHLC context tensor with shape [B, T, N, C].
+                Context tensor with shape [B, T, N, C].
 
         Returns:
-            Raw OHLC prediction tensor with shape [B, H, N, C], where H is
+            Prediction tensor with shape [B, H, N, C], where H is
             len(self.horizons).
 
-        The caller is responsible for placing x on the same device as the model.
+        The tensor may be raw or normalised depending on the configured
+        normalisation pipeline. The caller is responsible for placing x on
+        the same device as the model.
         """
         if self.model is None:
             raise RuntimeError(
@@ -520,17 +697,15 @@ class ModernTCNBaseline:
                 "The number of assets has not been resolved."
             )
 
-        x_flat = flatten_asset_channels(x)
+        batch_size = x.shape[0]
 
-        y_pred_flat = self.model(x_flat)
+        model_input = self._flatten_input(x)
+        model_output = self.model(model_input)
 
-        y_pred = unflatten_asset_channels(
-            y_pred_flat,
-            num_assets=self.num_assets,
-            num_channels=len(self.target_channels),
+        return self._unflatten_output(
+            model_output,
+            batch_size=batch_size,
         )
-
-        return y_pred
     
     def _compute_batch_loss(
         self,
@@ -539,15 +714,13 @@ class ModernTCNBaseline:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Move one project batch to the selected device, run ModernTCN, and
-        calculate the paper-native mean squared error.
+        calculate mean squared error in the configured loss space.
 
-        Returns:
-            loss:
-                Scalar MSE tensor.
-            y_pred:
-                Raw OHLC predictions with shape [B, H, N, C].
-            y_true:
-                Raw OHLC targets with shape [B, H, N, C].
+        When revin=True:
+            y_pred and y_true are in raw value space.
+
+        When revin=False:
+            y_pred and y_true are in window-context-normalised space.
         """
         x = batch["x"].to(
             device=device,
@@ -686,6 +859,87 @@ class ModernTCNBaseline:
 
         return total_loss / total_examples
     
+
+    def _checkpoint_metadata(
+        self,
+        asset_cols: list[str] | None = None,
+        num_assets: int | None = None,
+        num_variables: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Return the resolved configuration required to interpret a checkpoint.
+        """
+        resolved_asset_cols = (
+            self.asset_cols
+            if asset_cols is None
+            else list(asset_cols)
+        )
+
+        resolved_num_assets = (
+            self.num_assets
+            if num_assets is None
+            else int(num_assets)
+        )
+
+        resolved_num_variables = (
+            self.num_variables
+            if num_variables is None
+            else int(num_variables)
+        )
+
+        if resolved_asset_cols is None:
+            raise RuntimeError(
+                "Asset metadata must be resolved before checkpointing."
+            )
+
+        if resolved_num_assets is None:
+            raise RuntimeError(
+                "num_assets must be resolved before checkpointing."
+            )
+
+        if resolved_num_variables is None:
+            raise RuntimeError(
+                "num_variables must be resolved before checkpointing."
+            )
+
+        normalisation_clip = (
+            None
+            if self.normaliser is None
+            else bool(self.normaliser.clip)
+        )
+
+        return {
+            "experiment_name": self.experiment_name,
+            "variable_layout": self.variable_layout,
+            "target_channels": list(self.target_channels),
+            "horizons": list(self.horizons),
+            "context_length": self.context_length,
+            "stride": self.stride,
+            "revin": self.revin,
+            "loss_space": self.loss_space,
+            "normalisation_clip": normalisation_clip,
+            "asset_cols": list(resolved_asset_cols),
+            "num_assets": resolved_num_assets,
+            "num_channels": self.num_channels,
+            "num_variables": resolved_num_variables,
+            "architecture": {
+                "patch_size": self.patch_size,
+                "patch_stride": self.patch_stride,
+                "hidden_dim": self.hidden_dim,
+                "ffn_ratio": self.ffn_ratio,
+                "num_blocks": self.num_blocks,
+                "large_kernel": self.large_kernel,
+                "small_kernel": self.small_kernel,
+                "dropout": self.dropout,
+                "head_dropout": self.head_dropout,
+                "revin_affine": self.revin_affine,
+                "subtract_last": self.subtract_last,
+                "individual_head": self.individual_head,
+                "use_multi_scale": self.use_multi_scale,
+                "small_kernel_merged": self.small_kernel_merged,
+            },
+        }
+    
     def _save_checkpoint(
         self,
         checkpoint_path: Path,
@@ -726,11 +980,7 @@ class ModernTCNBaseline:
             "optimizer_state_dict": optimizer.state_dict(),
             "best_validation_loss": best_validation_loss,
             "patience_counter": patience_counter,
-            "asset_cols": self.asset_cols,
-            "target_channels": list(self.target_channels),
-            "horizons": list(self.horizons),
-            "num_assets": self.num_assets,
-            "num_variables": self.num_variables,
+            **self._checkpoint_metadata(),
         }
 
         torch.save(
@@ -773,13 +1023,7 @@ class ModernTCNBaseline:
             map_location=device,
         )
 
-        expected_metadata = {
-            "asset_cols": self.asset_cols,
-            "target_channels": list(self.target_channels),
-            "horizons": list(self.horizons),
-            "num_assets": self.num_assets,
-            "num_variables": self.num_variables,
-        }
+        expected_metadata = self._checkpoint_metadata()
 
         for key, expected_value in expected_metadata.items():
             if checkpoint.get(key) != expected_value:
@@ -849,11 +1093,20 @@ class ModernTCNBaseline:
             "epoch",
             "model_state_dict",
             "best_validation_loss",
-            "asset_cols",
+            "experiment_name",
+            "variable_layout",
             "target_channels",
             "horizons",
+            "context_length",
+            "stride",
+            "revin",
+            "loss_space",
+            "normalisation_clip",
+            "asset_cols",
             "num_assets",
+            "num_channels",
             "num_variables",
+            "architecture",
         }
 
         missing_keys = required_keys.difference(checkpoint)
@@ -864,54 +1117,57 @@ class ModernTCNBaseline:
                 f"{sorted(missing_keys)}"
             )
 
-        checkpoint_channels = list(
-            checkpoint["target_channels"]
-        )
-
-        checkpoint_horizons = [
-            int(horizon)
-            for horizon in checkpoint["horizons"]
-        ]
-
-        if checkpoint_channels != list(self.target_channels):
-            raise ValueError(
-                "Checkpoint target channels do not match the "
-                "current configuration."
-            )
-
-        if checkpoint_horizons != list(self.horizons):
-            raise ValueError(
-                "Checkpoint horizons do not match the "
-                "current configuration."
-            )
-
-        self.asset_cols = list(
+        checkpoint_asset_cols = list(
             checkpoint["asset_cols"]
         )
 
-        self.num_assets = int(
+        checkpoint_num_assets = int(
             checkpoint["num_assets"]
         )
 
-        self.num_variables = int(
+        checkpoint_num_variables = int(
             checkpoint["num_variables"]
         )
 
-        if len(self.asset_cols) != self.num_assets:
+        if len(checkpoint_asset_cols) != checkpoint_num_assets:
             raise ValueError(
-                "Checkpoint asset metadata is inconsistent."
+                "Checkpoint asset metadata is inconsistent: "
+                f"received {len(checkpoint_asset_cols)} asset names but "
+                f"num_assets={checkpoint_num_assets}."
             )
 
-        expected_num_variables = (
-            self.num_assets
-            * len(self.target_channels)
+        expected_num_variables = self._expected_num_variables(
+            num_assets=checkpoint_num_assets,
         )
 
-        if self.num_variables != expected_num_variables:
+        expected_metadata = self._checkpoint_metadata(
+            asset_cols=checkpoint_asset_cols,
+            num_assets=checkpoint_num_assets,
+            num_variables=expected_num_variables,
+        )
+
+        for key, expected_value in expected_metadata.items():
+            checkpoint_value = checkpoint.get(key)
+
+            if checkpoint_value != expected_value:
+                raise ValueError(
+                    f"Checkpoint metadata for {key!r} is incompatible "
+                    "with the current ModernTCN configuration. "
+                    f"Expected {expected_value!r}, "
+                    f"got {checkpoint_value!r}."
+                )
+
+        if checkpoint_num_variables != expected_num_variables:
             raise ValueError(
-                "Checkpoint num_variables is inconsistent with "
-                "the number of assets and target channels."
+                "Checkpoint num_variables is inconsistent with its "
+                "number of assets, channels and variable layout. "
+                f"Expected {expected_num_variables}, "
+                f"got {checkpoint_num_variables}."
             )
+
+        self.asset_cols = checkpoint_asset_cols
+        self.num_assets = checkpoint_num_assets
+        self.num_variables = checkpoint_num_variables
 
         self.model = self._build_official_model()
 
@@ -1210,14 +1466,54 @@ class ModernTCNBaseline:
                     non_blocking=True,
                 )
 
-                y_pred = self._forward_project_tensor(x)
+                y_pred_model_space = self._forward_project_tensor(x)
+
+                if self.revin:
+                    y_pred_raw = y_pred_model_space
+                    y_true_raw = batch["y"].float()
+                else:
+                    required_stats = {
+                        "target_norm_mean",
+                        "target_norm_std",
+                        "y_unnormalised",
+                    }
+
+                    missing_stats = required_stats.difference(batch)
+
+                    if missing_stats:
+                        raise KeyError(
+                            "Normalised prediction requires dataset fields: "
+                            f"{sorted(missing_stats)}"
+                        )
+                    
+                    target_norm_mean = batch["target_norm_mean"].to(
+                        device=device,
+                        dtype=y_pred_model_space.dtype,
+                        non_blocking=True,
+                    )
+
+                    target_norm_std = batch["target_norm_std"].to(
+                        device=device,
+                        dtype=y_pred_model_space.dtype,
+                        non_blocking=True,
+                    )
+
+                    y_pred_raw = inverse_window_normalisation(
+                        y_norm=y_pred_model_space,
+                        target_norm_mean=target_norm_mean,
+                        target_norm_std=target_norm_std,
+                    )
+
+                    y_true_raw = batch["y_unnormalised"].float()
 
                 all_y_pred.append(
-                    y_pred.detach().cpu()
+                    y_pred_raw.detach().cpu()
                 )
+                
                 all_y_true.append(
-                    batch["y"].float().cpu()
+                    y_true_raw.detach().cpu()
                 )
+                
                 all_last_context_target.append(
                     batch["last_context_target"].float().cpu()
                 )
