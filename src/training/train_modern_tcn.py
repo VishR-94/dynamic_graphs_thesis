@@ -171,6 +171,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--temporal-encoding",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable or disable absolute session-position "
+            "encoding. When omitted, use the YAML value."
+        ),
+    )
+
     return parser
 
 
@@ -298,6 +308,22 @@ def apply_cli_overrides(
         "models"
     ]["modern_tcn"]
 
+    temporal_encoding_config = (
+        modern_tcn_config.setdefault(
+            "temporal_encoding",
+            {},
+        )
+    )
+
+    if not isinstance(
+        temporal_encoding_config,
+        dict,
+    ):
+        raise TypeError(
+            "models.modern_tcn.temporal_encoding "
+            "must be a mapping."
+        )
+
     training_config = modern_tcn_config[
         "training"
     ]
@@ -404,6 +430,9 @@ def apply_cli_overrides(
 
         training_config["batch_size"] = args.batch_size
 
+    if args.temporal_encoding is not None:
+        temporal_encoding_config["enabled"] = bool(args.temporal_encoding)
+
     return resolved_config
 
 def build_wandb_config(
@@ -421,6 +450,21 @@ def build_wandb_config(
     """
     forecasting_config = config["forecasting"]
     modern_tcn_config = config["models"]["modern_tcn"]
+
+    temporal_encoding_config = modern_tcn_config.get("temporal_encoding",{},)
+
+    if not isinstance(
+        temporal_encoding_config,
+        dict,
+    ):
+        raise TypeError(
+            "models.modern_tcn.temporal_encoding "
+            "must be a mapping."
+        )
+
+    temporal_encoding_enabled = bool(temporal_encoding_config.get("enabled",False,))
+
+
     training_config = modern_tcn_config["training"]
     global_training_config = config.get("training", {})
 
@@ -515,6 +559,9 @@ def build_wandb_config(
         ),
         "normalisation_enabled": (
             not revin_enabled
+        ),
+        "temporal_encoding_enabled": (
+            temporal_encoding_enabled
         ),
         "normalisation_method": str(
             config["normalisation"]["method"]
@@ -712,30 +759,17 @@ def fit_modern_tcn_run(
 
     run.config.update(
         {
-            "experiment_name": (
-                model.experiment_name
-            ),
-            "input_channels": list(
-                model.input_channels
-            ),
-            "target_channels": list(
-                model.target_channels
-            ),
-            "target_input_indices": list(
-                model.target_input_indices
-            ),
-            "num_input_channels": (
-                model.num_input_channels
-            ),
-            "num_target_channels": (
-                model.num_target_channels
-            ),
+            "experiment_name": (model.experiment_name),
+            "input_channels": list(model.input_channels),
+            "target_channels": list(model.target_channels),
+            "target_input_indices": list(model.target_input_indices),
+            "num_input_channels": (model.num_input_channels),
+            "num_target_channels": (model.num_target_channels),
             # Legacy alias.
-            "num_channels": (
-                model.num_input_channels
-            ),
+            "num_channels": (model.num_input_channels),
             "revin": model.revin,
             "loss_space": model.loss_space,
+            "temporal_encoding_enabled": bool(model.temporal_encoding_enabled),
         },
         allow_val_change=True,
     )
@@ -989,6 +1023,16 @@ def record_run_summary(
             f"Best checkpoint not found: {checkpoint_path}"
         )
 
+    if model.num_assets is None:
+        raise RuntimeError(
+            "Model asset dimensions were not resolved."
+        )
+
+    if model.num_variables is None:
+        raise RuntimeError(
+            "Model variable dimensions were not resolved."
+        )
+
     total_parameters = sum(
         parameter.numel()
         for parameter in model.model.parameters()
@@ -1000,97 +1044,113 @@ def record_run_summary(
         if parameter.requires_grad
     )
 
-    run.summary["best_epoch"] = int(
-        model.best_epoch
-    )
-    run.summary["best_validation_mse"] = float(
-        model.best_validation_loss
-    )
-    run.summary["training_duration_seconds"] = float(
-        training_duration_seconds
-    )
-    run.summary["total_parameters"] = int(
-        total_parameters
-    )
-    run.summary["trainable_parameters"] = int(
-        trainable_parameters
-    )
-    run.summary["checkpoint_path"] = str(
-        checkpoint_path
-    )
-    run.summary["device"] = str(
-        model.device
+    temporal_encoding_parameters = (
+        4 * model.hidden_dim
+        if model.temporal_encoding_enabled
+        else 0
     )
 
-    if model.num_assets is None:
-        raise RuntimeError(
-            "Model asset dimensions were not resolved."
-        )
+    # Log numerical outcomes through run.log(). The final logged
+    # value for each key is automatically stored in W&B Summary.
+    scalar_results: dict[str, float | int | bool] = {
+        "best_epoch": int(model.best_epoch),
+        "best_validation_mse": float(
+            model.best_validation_loss
+        ),
+        "training_duration_seconds": float(
+            training_duration_seconds
+        ),
+        "total_parameters": int(
+            total_parameters
+        ),
+        "trainable_parameters": int(
+            trainable_parameters
+        ),
+        "num_input_channels": int(
+            model.num_input_channels
+        ),
+        "num_target_channels": int(
+            model.num_target_channels
+        ),
+        "num_channels": int(
+            model.num_input_channels
+        ),
+        "num_assets": int(
+            model.num_assets
+        ),
+        "num_variables": int(
+            model.num_variables
+        ),
+        "revin": bool(
+            model.revin
+        ),
+        "temporal_encoding_enabled": bool(
+            model.temporal_encoding_enabled
+        ),
+        "temporal_encoding_parameters": int(
+            temporal_encoding_parameters
+        ),
+    }
 
-    if model.num_variables is None:
-        raise RuntimeError(
-            "Model variable dimensions were not resolved."
-        )
-    
-    run.summary["experiment_name"] = (
-        model.experiment_name
-    )
-
-    run.summary["variable_layout"] = (
-        model.variable_layout
-    )
-
-    run.summary["input_channels"] = list(
-        model.input_channels
-    )
-
-    run.summary["target_channels"] = list(
-        model.target_channels
-    )
-
-    run.summary["num_input_channels"] = int(
-        model.num_input_channels
-    )
-
-    run.summary["num_target_channels"] = int(
-        model.num_target_channels
-    )
-
-    run.summary["target_input_indices"] = list(
-        model.target_input_indices
-    )
-
-    # Legacy alias.
-    run.summary["num_channels"] = int(
-        model.num_input_channels
-    )
-
-    run.summary["num_assets"] = int(
-        model.num_assets
-    )
-
-    run.summary["num_variables"] = int(
-        model.num_variables
-    )
-
-    run.summary["revin"] = bool(
-        model.revin
-    )
-
-    run.summary["loss_space"] = (
-        model.loss_space
-    )
-
-    run.summary["normalisation_clip"] = (
-        None
-        if model.normaliser is None
-        else bool(model.normaliser.clip)
-    )
-
-    for metric_name, metric_value in evaluation_metrics.items():
-        run.summary[metric_name] = float(
+    for metric_name, metric_value in (
+        evaluation_metrics.items()
+    ):
+        scalar_results[metric_name] = float(
             metric_value
         )
+
+    run.log(
+        scalar_results
+    )
+
+    # Explicitly update Summary as well. This records metadata that
+    # is unsuitable for run.log(), such as paths and channel lists.
+    run.summary.update(
+        {
+            **scalar_results,
+            "checkpoint_path": str(
+                checkpoint_path
+            ),
+            "device": str(
+                model.device
+            ),
+            "experiment_name": (
+                model.experiment_name
+            ),
+            "variable_layout": (
+                model.variable_layout
+            ),
+            "input_channels": list(
+                model.input_channels
+            ),
+            "target_channels": list(
+                model.target_channels
+            ),
+            "target_input_indices": list(
+                model.target_input_indices
+            ),
+            "loss_space": (
+                model.loss_space
+            ),
+            "normalisation_clip": (
+                None
+                if model.normaliser is None
+                else bool(
+                    model.normaliser.clip
+                )
+            ),
+        }
+    )
+
+    print(
+        "Recorded W&B summary with "
+        f"{len(scalar_results)} scalar values."
+    )
+
+    print(
+        "Temporal encoding parameters:",
+        temporal_encoding_parameters,
+    )
 
 def log_checkpoint_artifact(
     run: Any,
@@ -1118,30 +1178,17 @@ def log_checkpoint_artifact(
     artifact = wandb.Artifact(
         name=f"modern-tcn-checkpoint-{run.id}",
         type="model",
-        description=(
-            "Best validation checkpoint for one ModernTCN run."
-        ),
+        description=("Best validation checkpoint for one ModernTCN run."),
         metadata={
             "wandb_run_id": run.id,
             "best_epoch": int(model.best_epoch),
-            "best_validation_mse": float(
-                model.best_validation_loss
-            ),
-            "experiment_name": (
-                model.experiment_name
-            ),
-            "variable_layout": (
-                model.variable_layout
-            ),
-            "input_channels": list(
-                model.input_channels
-            ),
-            "target_input_indices": list(
-                model.target_input_indices
-            ),
-            "target_channels": list(
-                model.target_channels
-            ),
+            "best_validation_mse": float(model.best_validation_loss),
+            "experiment_name": (model.experiment_name),
+            "variable_layout": (model.variable_layout),
+            "input_channels": list(model.input_channels),
+            "target_input_indices": list(model.target_input_indices),
+            "target_channels": list(model.target_channels),
+            "temporal_encoding_enabled": bool(model.temporal_encoding_enabled),
             "loss_space": model.loss_space,
         },
     )
@@ -1333,11 +1380,22 @@ def main() -> None:
                 torch.cuda.max_memory_allocated()
             )
 
-        log_checkpoint_artifact(
-            run=run,
-            model=model,
-            checkpoint_path=checkpoint_path,
-        )
+        if bool(
+            run.config.get(
+                "is_smoke_run",
+                False,
+            )
+        ):
+            print(
+                "Skipping checkpoint artifact upload "
+                "for smoke run."
+            )
+        else:
+            log_checkpoint_artifact(
+                run=run,
+                model=model,
+                checkpoint_path=checkpoint_path,
+            )
 
         print(
             "ModernTCN run completed.\n"

@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader
 import random
 import numpy as np
 from collections.abc import Callable
+import math
+from torch import nn
 
 """
 Here we will implement the Modern-TCN benchmark. ModernTCN is a convolution based neural model with the following design:
@@ -46,6 +48,426 @@ Params:
 6. The default uses 1 ModernTCN block. It ablates for 2 and 3 blocks. We initially use 1. 
 """
 
+class _TemporalEncodingModernTCNAdapter(nn.Module):
+    """
+    Local extension of the official ModernTCN forecasting model.
+
+    The external submodule remains unchanged. This adapter reproduces
+    the official forward path while adding a projected temporal
+    descriptor immediately after the first patch-embedding stem.
+
+    Inputs:
+        x:
+            Official ModernTCN input [B_model, T, M].
+
+        temporal_patch_features:
+            Absolute session-position descriptors [B_model, T_p, 3].
+
+    Output:
+        Official ModernTCN output [B_model, H, M].
+    """
+
+    TEMPORAL_FEATURE_DIM = 3
+
+    def __init__(
+        self,
+        official_model: nn.Module,
+        hidden_dim: int,
+    ) -> None:
+        super().__init__()
+
+        if hidden_dim <= 0:
+            raise ValueError(
+                "hidden_dim must be greater than zero."
+            )
+
+        if bool(
+            getattr(
+                official_model,
+                "decomposition",
+                False,
+            )
+        ):
+            raise ValueError(
+                "Temporal encoding currently requires "
+                "ModernTCN decomposition to remain disabled."
+            )
+
+        if not hasattr(official_model, "model"):
+            raise TypeError(
+                "The supplied official model does not expose "
+                "its ModernTCN backbone through .model."
+            )
+
+        backbone = official_model.model
+
+        if not hasattr(backbone, "downsample_layers"):
+            raise TypeError(
+                "The official ModernTCN backbone does not expose "
+                "downsample_layers."
+            )
+
+        if len(backbone.downsample_layers) < 1:
+            raise ValueError(
+                "The official ModernTCN backbone contains no "
+                "patch-embedding stem."
+            )
+
+        stem = backbone.downsample_layers[0]
+
+        if len(stem) < 1:
+            raise ValueError(
+                "The official ModernTCN patch-embedding stem "
+                "contains no convolution."
+            )
+
+        stem_convolution = stem[0]
+
+        stem_output_dim = int(
+            stem_convolution.out_channels
+        )
+
+        if stem_output_dim != hidden_dim:
+            raise ValueError(
+                "Configured hidden_dim does not match the output "
+                "dimension of the official patch embedding. "
+                f"Expected {stem_output_dim}, received {hidden_dim}."
+            )
+
+        self.official_model = official_model
+        self.hidden_dim = int(hidden_dim)
+
+        self.temporal_projection = nn.Linear(
+            in_features=self.TEMPORAL_FEATURE_DIM,
+            out_features=self.hidden_dim,
+            bias=True,
+        )
+
+    def _forward_features_with_temporal_encoding(
+        self,
+        x: torch.Tensor,
+        temporal_patch_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run the official feature extractor and inject temporal
+        information after its first patch-embedding stem.
+
+        Args:
+            x:
+                Official backbone input [B_model, M, T].
+
+            temporal_patch_features:
+                Temporal patch descriptors [B_model, T_p, 3].
+
+        Returns:
+            Backbone output [B_model, M, D_final, T_p_final].
+        """
+        backbone = self.official_model.model
+
+        batch_size, num_variables, _ = x.shape
+
+        # Match the official forward_feature input preparation:
+        # [B_model, M, T] -> [B_model, M, 1, T].
+        x = x.unsqueeze(-2)
+
+        for stage_index in range(
+            backbone.num_stage
+        ):
+            (
+                current_batch_size,
+                current_num_variables,
+                current_hidden_dim,
+                current_length,
+            ) = x.shape
+
+            if current_batch_size != batch_size:
+                raise RuntimeError(
+                    "The batch dimension changed unexpectedly "
+                    "inside the ModernTCN backbone."
+                )
+
+            if current_num_variables != num_variables:
+                raise RuntimeError(
+                    "The variable dimension changed unexpectedly "
+                    "inside the ModernTCN backbone."
+                )
+
+            x = x.reshape(
+                batch_size * num_variables,
+                current_hidden_dim,
+                current_length,
+            )
+
+            if stage_index == 0:
+                # Match the official repeated-final-value padding
+                # used before its patch-embedding convolution.
+                if (
+                    backbone.patch_size
+                    != backbone.patch_stride
+                ):
+                    padding_length = (
+                        backbone.patch_size
+                        - backbone.patch_stride
+                    )
+
+                    padding = (
+                        x[
+                            :,
+                            :,
+                            -1:,
+                        ]
+                        .repeat(
+                            1,
+                            1,
+                            padding_length,
+                        )
+                    )
+
+                    x = torch.cat(
+                        [
+                            x,
+                            padding,
+                        ],
+                        dim=-1,
+                    )
+
+            else:
+                # Preserve the official later-stage downsampling
+                # behaviour unchanged.
+                if (
+                    current_length
+                    % backbone.downsample_ratio
+                    != 0
+                ):
+                    padding_length = (
+                        backbone.downsample_ratio
+                        - (
+                            current_length
+                            % backbone.downsample_ratio
+                        )
+                    )
+
+                    x = torch.cat(
+                        [
+                            x,
+                            x[
+                                :,
+                                :,
+                                -padding_length:,
+                            ],
+                        ],
+                        dim=-1,
+                    )
+
+            # Stage 0 is the value patch embedding:
+            # [B_model*M, 1, T_padded]
+            # -> [B_model*M, D, T_p].
+            x = backbone.downsample_layers[
+                stage_index
+            ](x)
+
+            _, output_hidden_dim, output_length = (
+                x.shape
+            )
+
+            x = x.reshape(
+                batch_size,
+                num_variables,
+                output_hidden_dim,
+                output_length,
+            )
+
+            if stage_index == 0:
+                if (
+                    temporal_patch_features.shape[1]
+                    != output_length
+                ):
+                    raise ValueError(
+                        "Temporal and value patch counts do not "
+                        "match. "
+                        f"Value patches: {output_length}; "
+                        "temporal patches: "
+                        f"{temporal_patch_features.shape[1]}."
+                    )
+
+                # [B_model, T_p, 3]
+                # -> [B_model, T_p, D].
+                temporal_embedding = (
+                    self.temporal_projection(
+                        temporal_patch_features
+                    )
+                )
+
+                # [B_model, T_p, D]
+                # -> [B_model, 1, D, T_p].
+                temporal_embedding = (
+                    temporal_embedding
+                    .permute(
+                        0,
+                        2,
+                        1,
+                    )
+                    .unsqueeze(1)
+                )
+
+                expected_temporal_shape = (
+                    batch_size,
+                    1,
+                    output_hidden_dim,
+                    output_length,
+                )
+
+                if (
+                    tuple(temporal_embedding.shape)
+                    != expected_temporal_shape
+                ):
+                    raise RuntimeError(
+                        "Unexpected projected temporal shape. "
+                        f"Expected {expected_temporal_shape}, "
+                        f"received "
+                        f"{tuple(temporal_embedding.shape)}."
+                    )
+
+                # Broadcast the same session-time embedding across
+                # all M variables:
+                #
+                # value:    [B_model, M, D, T_p]
+                # temporal: [B_model, 1, D, T_p]
+                # result:   [B_model, M, D, T_p]
+                x = x + temporal_embedding
+
+            # Continue through the unmodified official stage.
+            x = backbone.stages[
+                stage_index
+            ](x)
+
+        return x
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        temporal_patch_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run ModernTCN with absolute session-position conditioning.
+        """
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(
+                "x must be a torch.Tensor."
+            )
+
+        if not isinstance(
+            temporal_patch_features,
+            torch.Tensor,
+        ):
+            raise TypeError(
+                "temporal_patch_features must be a "
+                "torch.Tensor."
+            )
+
+        if x.ndim != 3:
+            raise ValueError(
+                "Official ModernTCN input must have shape "
+                "[B_model,T,M]. "
+                f"Received {tuple(x.shape)}."
+            )
+
+        if temporal_patch_features.ndim != 3:
+            raise ValueError(
+                "temporal_patch_features must have shape "
+                "[B_model,T_p,3]. "
+                f"Received "
+                f"{tuple(temporal_patch_features.shape)}."
+            )
+
+        if (
+            temporal_patch_features.shape[0]
+            != x.shape[0]
+        ):
+            raise ValueError(
+                "Financial and temporal inputs must have the "
+                "same model batch dimension."
+            )
+
+        if (
+            temporal_patch_features.shape[-1]
+            != self.TEMPORAL_FEATURE_DIM
+        ):
+            raise ValueError(
+                "The temporal feature dimension must equal "
+                f"{self.TEMPORAL_FEATURE_DIM}. "
+                f"Received "
+                f"{temporal_patch_features.shape[-1]}."
+            )
+
+        backbone = self.official_model.model
+
+        # Match the outer official Model.forward:
+        # [B_model,T,M] -> [B_model,M,T].
+        x = x.permute(
+            0,
+            2,
+            1,
+        )
+
+        # Preserve the official RevIN path when enabled.
+        if backbone.revin:
+            x = x.permute(
+                0,
+                2,
+                1,
+            )
+
+            x = backbone.revin_layer(
+                x,
+                "norm",
+            )
+
+            x = x.permute(
+                0,
+                2,
+                1,
+            )
+
+        x = (
+            self._forward_features_with_temporal_encoding(
+                x=x,
+                temporal_patch_features=(
+                    temporal_patch_features
+                ),
+            )
+        )
+
+        # Unmodified official forecasting head.
+        x = backbone.head(x)
+
+        if backbone.revin:
+            x = x.permute(
+                0,
+                2,
+                1,
+            )
+
+            x = backbone.revin_layer(
+                x,
+                "denorm",
+            )
+
+            x = x.permute(
+                0,
+                2,
+                1,
+            )
+
+        # Match the final permutation in official Model.forward:
+        # [B_model,M,H] -> [B_model,H,M].
+        return x.permute(
+            0,
+            2,
+            1,
+        )
+
+
 class ModernTCNBaseline:
     """
     Project wrapper for the official ModernTCN forecasting model.
@@ -77,6 +499,7 @@ class ModernTCNBaseline:
         individual_head: bool = False,
         use_multi_scale: bool = False,
         small_kernel_merged: bool = False,
+        temporal_encoding_enabled: bool = False,
         learning_rate: float = 1.0e-4,
         weight_decay: float = 0.0,
         batch_size: int = 16,
@@ -206,6 +629,7 @@ class ModernTCNBaseline:
         self.individual_head = individual_head
         self.use_multi_scale = use_multi_scale
         self.small_kernel_merged = small_kernel_merged
+        self.temporal_encoding_enabled = bool(temporal_encoding_enabled)
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.batch_size = batch_size
@@ -240,6 +664,11 @@ class ModernTCNBaseline:
             self.experiment_name = (
                 f"{self.variable_layout}_"
                 f"{input_channel_code}_to_{target_channel_code}"
+            )
+        
+        if self.temporal_encoding_enabled:
+            self.experiment_name = (
+                f"{self.experiment_name}_tod"
             )
 
         # These are populated later by fit(...).
@@ -300,6 +729,12 @@ class ModernTCNBaseline:
             normaliser = WindowContextNormaliser.from_config(
                 config
             )
+        
+        temporal_encoding_config = modern_tcn_config.get("temporal_encoding",{},)
+        if not isinstance(temporal_encoding_config, dict):
+            raise TypeError(
+                "models.modern_tcn.temporal_encoding must be a mapping."
+            )
 
         return cls(
             context_length=int(forecasting_config["context_length"]),
@@ -324,6 +759,7 @@ class ModernTCNBaseline:
             individual_head=bool(modern_tcn_config.get("individual_head", False)),
             use_multi_scale=bool(modern_tcn_config.get("use_multi_scale", False)),
             small_kernel_merged=bool(modern_tcn_config.get("small_kernel_merged",False)),
+            temporal_encoding_enabled=bool(temporal_encoding_config.get("enabled",False,)),
             learning_rate=float(modern_tcn_training_config.get("learning_rate",1.0e-4)),
             weight_decay=float(modern_tcn_training_config.get("weight_decay",0.0)),
             batch_size=int(modern_tcn_training_config.get("batch_size",16)),
@@ -550,8 +986,16 @@ class ModernTCNBaseline:
 
         from models.ModernTCN import Model as OfficialModernTCNModel
 
-        official_config = self._build_official_config()
-        self.model = OfficialModernTCNModel(official_config)
+        official_config = (self._build_official_config())
+
+        official_model = OfficialModernTCNModel(official_config)
+
+        if self.temporal_encoding_enabled:
+            self.model = (
+                _TemporalEncodingModernTCNAdapter(official_model=official_model,hidden_dim=self.hidden_dim,)
+            )
+        else:
+            self.model = official_model
 
         return self.model
     
@@ -804,10 +1248,131 @@ class ModernTCNBaseline:
             dim=-1,
             index=target_indices,
         )
+
+    def _prepare_temporal_patch_features_for_model(
+        self,
+        x: torch.Tensor,
+        context_start: torch.Tensor,
+        session_length: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Construct temporal patch descriptors and align their batch
+        dimension with the selected ModernTCN variable layout.
+
+        Args:
+            x:
+                Project-format context tensor [B,T,N,C_input].
+
+            context_start:
+                Absolute session index of the first context observation
+                for each example. Shape [B].
+
+            session_length:
+                Number of retained observations in each example's
+                session. Shape [B].
+
+        Returns:
+            joint:
+                [B,T_p,3]
+
+            per_asset:
+                [B*N,T_p,3]
+        """
+        if not self.temporal_encoding_enabled:
+            raise RuntimeError(
+                "Temporal patch features should only be prepared "
+                "when temporal encoding is enabled."
+            )
+
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(
+                "x must be a torch.Tensor."
+            )
+
+        if x.ndim != 4:
+            raise ValueError(
+                "x must have shape [B,T,N,C_input]. "
+                f"Received {tuple(x.shape)}."
+            )
+
+        if self.num_assets is None:
+            raise RuntimeError(
+                "The number of assets must be resolved before "
+                "preparing temporal features."
+            )
+
+        batch_size, _, num_assets, _ = x.shape
+
+        if num_assets != self.num_assets:
+            raise ValueError(
+                "The asset dimension of x does not match the "
+                "resolved model dimensions. "
+                f"Expected {self.num_assets}, received {num_assets}."
+            )
+
+        temporal_features = (
+            self._build_context_temporal_features(
+                context_start=context_start,
+                session_length=session_length,
+                device=x.device,
+                dtype=x.dtype,
+            )
+        )
+
+        temporal_patch_features = (
+            self._build_temporal_patch_features(
+                temporal_features
+            )
+        )
+
+        if self.variable_layout == "joint":
+            expected_batch_size = batch_size
+
+        elif self.variable_layout == "per_asset":
+            # _flatten_input orders the model batch as:
+            #
+            # sample 0 asset 0
+            # sample 0 asset 1
+            # ...
+            # sample 1 asset 0
+            # sample 1 asset 1
+            #
+            # repeat_interleave reproduces exactly that ordering.
+            temporal_patch_features = (
+                temporal_patch_features.repeat_interleave(
+                    repeats=self.num_assets,
+                    dim=0,
+                )
+            )
+
+            expected_batch_size = (
+                batch_size
+                * self.num_assets
+            )
+
+        else:
+            raise RuntimeError(
+                "Unsupported variable_layout: "
+                f"{self.variable_layout!r}."
+            )
+
+        if (
+            temporal_patch_features.shape[0]
+            != expected_batch_size
+        ):
+            raise RuntimeError(
+                "Unexpected temporal model-batch dimension. "
+                f"Expected {expected_batch_size}, received "
+                f"{temporal_patch_features.shape[0]}."
+            )
+
+        return temporal_patch_features
             
     def _forward_project_tensor(
         self,
         x: torch.Tensor,
+        context_start: torch.Tensor | None = None,
+        session_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Run a project-format tensor through the official ModernTCN model.
@@ -837,7 +1402,66 @@ class ModernTCNBaseline:
         batch_size = x.shape[0]
 
         model_input = self._flatten_input(x)
-        model_output = self.model(model_input)
+
+        if self.temporal_encoding_enabled:
+            if context_start is None:
+                raise ValueError(
+                    "context_start is required when temporal "
+                    "encoding is enabled."
+                )
+
+            if session_length is None:
+                raise ValueError(
+                    "session_length is required when temporal "
+                    "encoding is enabled."
+                )
+
+            if not isinstance(
+                self.model,
+                _TemporalEncodingModernTCNAdapter,
+            ):
+                raise RuntimeError(
+                    "Temporal encoding is enabled, but the constructed "
+                    "model is not the temporal ModernTCN adapter."
+                )
+
+            temporal_patch_features = (
+                self._prepare_temporal_patch_features_for_model(
+                    x=x,
+                    context_start=context_start,
+                    session_length=session_length,
+                )
+            )
+
+            if (
+                temporal_patch_features.shape[0]
+                != model_input.shape[0]
+            ):
+                raise RuntimeError(
+                    "Financial and temporal model-batch dimensions "
+                    "do not match. "
+                    f"Financial={model_input.shape[0]}, "
+                    f"temporal={temporal_patch_features.shape[0]}."
+                )
+
+            model_output = self.model(
+                model_input,
+                temporal_patch_features,
+            )
+
+        else:
+            if isinstance(
+                self.model,
+                _TemporalEncodingModernTCNAdapter,
+            ):
+                raise RuntimeError(
+                    "The temporal adapter was constructed while temporal "
+                    "encoding is disabled."
+                )
+
+            model_output = self.model(
+                model_input
+            )
 
         all_predictions = self._unflatten_output(
             model_output,
@@ -875,7 +1499,15 @@ class ModernTCNBaseline:
             non_blocking=True,
         )
 
-        y_pred = self._forward_project_tensor(x)
+        y_pred = self._forward_project_tensor(
+            x=x,
+            context_start=batch.get(
+                "context_start"
+            ),
+            session_length=batch.get(
+                "session_length"
+            ),
+        )
 
         loss = torch.nn.functional.mse_loss(
             y_pred,
@@ -1059,6 +1691,7 @@ class ModernTCNBaseline:
             "context_length": self.context_length,
             "stride": self.stride,
             "revin": self.revin,
+            "temporal_encoding_enabled": (self.temporal_encoding_enabled),
             "loss_space": self.loss_space,
             "normalisation_clip": normalisation_clip,
             "asset_cols": list(resolved_asset_cols),
@@ -1100,16 +1733,9 @@ class ModernTCNBaseline:
         """
         normalised = dict(checkpoint)
 
-        target_channels = list(
-            normalised["target_channels"]
-        )
+        target_channels = list(normalised["target_channels"])
 
-        input_channels = list(
-            normalised.get(
-                "input_channels",
-                target_channels,
-            )
-        )
+        input_channels = list(normalised.get("input_channels",target_channels,))
 
         missing_targets = [
             channel
@@ -1125,6 +1751,7 @@ class ModernTCNBaseline:
 
         normalised["input_channels"] = input_channels
         normalised["target_channels"] = target_channels
+        normalised["temporal_encoding_enabled"] = bool(normalised.get("temporal_encoding_enabled",False,))
 
         normalised["num_input_channels"] = int(
             normalised.get(
@@ -1272,6 +1899,248 @@ class ModernTCNBaseline:
             )
 
         return checkpoint
+    
+    def _build_context_temporal_features(
+        self,
+        context_start: torch.Tensor,
+        session_length: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Build absolute session-position features for each context step.
+
+        Args:
+            context_start:
+                First absolute session index for each context window.
+                Shape [B].
+
+            session_length:
+                Number of retained observations in each session.
+                Shape [B].
+
+            device:
+                Device on which the returned features should be created.
+
+            dtype:
+                Floating-point dtype for the returned features.
+
+        Returns:
+            Temporal features with shape [B, T, 3], where:
+
+                feature 0 = normalised absolute session position
+                feature 1 = sin(2πp)
+                feature 2 = cos(2πp)
+        """
+        if not isinstance(context_start, torch.Tensor):
+            raise TypeError(
+                "context_start must be a torch.Tensor."
+            )
+
+        if not isinstance(session_length, torch.Tensor):
+            raise TypeError(
+                "session_length must be a torch.Tensor."
+            )
+
+        if context_start.ndim != 1:
+            raise ValueError(
+                "context_start must have shape [B]. "
+                f"Received {tuple(context_start.shape)}."
+            )
+
+        if session_length.ndim != 1:
+            raise ValueError(
+                "session_length must have shape [B]. "
+                f"Received {tuple(session_length.shape)}."
+            )
+
+        if context_start.shape != session_length.shape:
+            raise ValueError(
+                "context_start and session_length must have "
+                "the same shape."
+            )
+
+        if torch.any(context_start < 0):
+            raise ValueError(
+                "context_start cannot contain negative values."
+            )
+
+        if torch.any(session_length <= 1):
+            raise ValueError(
+                "Every session_length must be greater than 1."
+            )
+
+        context_end = (
+            context_start
+            + self.context_length
+        )
+
+        if torch.any(context_end > session_length):
+            raise ValueError(
+                "A context window extends beyond its session."
+            )
+
+        context_start_device = context_start.to(
+            device=device,
+            dtype=torch.long,
+        )
+
+        session_length_device = session_length.to(
+            device=device,
+            dtype=torch.long,
+        )
+
+        relative_positions = torch.arange(
+            self.context_length,
+            device=device,
+            dtype=torch.long,
+        )
+
+        absolute_positions = (
+            context_start_device.unsqueeze(1)
+            + relative_positions.unsqueeze(0)
+        )
+
+        denominator = (
+            session_length_device
+            .sub(1)
+            .to(dtype=dtype)
+            .unsqueeze(1)
+        )
+
+        normalised_position = (
+            absolute_positions.to(dtype=dtype)
+            / denominator
+        )
+
+        temporal_features = torch.stack(
+            [
+                normalised_position,
+                torch.sin(
+                    2.0
+                    * math.pi
+                    * normalised_position
+                ),
+                torch.cos(
+                    2.0
+                    * math.pi
+                    * normalised_position
+                ),
+            ],
+            dim=-1,
+        )
+
+        return temporal_features
+
+
+    def _build_temporal_patch_features(
+        self,
+        temporal_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Align observation-level temporal features with ModernTCN patches.
+
+        ModernTCN repeats the final observed value by:
+
+            patch_size - patch_stride
+
+        before extracting patches. We apply the same padding and patch
+        boundaries to the temporal features.
+
+        Args:
+            temporal_features:
+                Observation-level temporal features [B, T, 3].
+
+        Returns:
+            Mean temporal descriptor for each patch [B, T_p, 3].
+        """
+        if not isinstance(temporal_features, torch.Tensor):
+            raise TypeError(
+                "temporal_features must be a torch.Tensor."
+            )
+
+        if temporal_features.ndim != 3:
+            raise ValueError(
+                "temporal_features must have shape [B,T,3]. "
+                f"Received {tuple(temporal_features.shape)}."
+            )
+
+        if temporal_features.shape[1] != self.context_length:
+            raise ValueError(
+                "Temporal feature length does not match "
+                f"context_length={self.context_length}. "
+                f"Received {temporal_features.shape[1]}."
+            )
+
+        if temporal_features.shape[2] != 3:
+            raise ValueError(
+                "The temporal feature dimension must be 3. "
+                f"Received {temporal_features.shape[2]}."
+            )
+
+        padding_length = (
+            self.patch_size
+            - self.patch_stride
+        )
+
+        if padding_length < 0:
+            raise ValueError(
+                "patch_size must be greater than or equal to "
+                "patch_stride for replicated right padding."
+            )
+
+        padded_features = temporal_features
+
+        if padding_length > 0:
+            repeated_final_feature = (
+                temporal_features[
+                    :,
+                    -1:,
+                    :,
+                ]
+                .expand(
+                    -1,
+                    padding_length,
+                    -1,
+                )
+            )
+
+            padded_features = torch.cat(
+                [
+                    temporal_features,
+                    repeated_final_feature,
+                ],
+                dim=1,
+            )
+
+        # Shape after unfold:
+        # [B, T_p, 3, patch_size]
+        temporal_patches = padded_features.unfold(
+            dimension=1,
+            size=self.patch_size,
+            step=self.patch_stride,
+        )
+
+        # Average over the observations inside each patch.
+        # [B, T_p, 3, patch_size] -> [B, T_p, 3]
+        patch_features = temporal_patches.mean(
+            dim=-1
+        )
+
+        expected_patch_count = (
+            self.context_length
+            // self.patch_stride
+        )
+
+        if patch_features.shape[1] != expected_patch_count:
+            raise RuntimeError(
+                "Temporal patch count does not match ModernTCN. "
+                f"Expected {expected_patch_count}, "
+                f"received {patch_features.shape[1]}."
+            )
+
+        return patch_features
     
     def load_checkpoint(
         self,
@@ -1715,7 +2584,17 @@ class ModernTCNBaseline:
                     non_blocking=True,
                 )
 
-                y_pred_model_space = self._forward_project_tensor(x)
+                y_pred_model_space = (
+                    self._forward_project_tensor(
+                        x=x,
+                        context_start=batch.get(
+                            "context_start"
+                        ),
+                        session_length=batch.get(
+                            "session_length"
+                        ),
+                    )
+                )
 
                 if self.revin:
                     y_pred_raw = y_pred_model_space

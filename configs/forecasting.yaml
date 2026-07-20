@@ -67,6 +67,9 @@ models:
     dropout: 0.05
     head_dropout: 0.0
 
+    temporal_encoding:
+      enabled: False
+
     variable_layout: joint
     revin: false
     revin_affine: false

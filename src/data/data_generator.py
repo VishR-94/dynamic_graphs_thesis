@@ -97,6 +97,8 @@ class WindowedCandleDataset(Dataset):
 
         x_day, _, day = self.split["samples"][sample_idx]
 
+        session_length = int(x_day.shape[0])
+
         context_start = origin_idx - self.context_length + 1
         context_end = origin_idx + 1
 
@@ -147,6 +149,7 @@ class WindowedCandleDataset(Dataset):
             "target_channels": self.target_channels,
             "horizons": self.horizons,
             "asset_cols": self.split["asset_cols"],
+            "session_length": session_length,
         }
 
         if self.normaliser is not None:
