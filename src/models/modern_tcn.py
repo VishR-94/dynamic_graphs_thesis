@@ -59,6 +59,7 @@ class ModernTCNBaseline:
         horizons: list[int],
         target_channels: list[str],
         stride: int,
+        input_channels: list[str]|None=None,
         patch_size: int = 8,
         patch_stride: int = 4,
         hidden_dim: int = 64,
@@ -86,10 +87,19 @@ class ModernTCNBaseline:
         scheduler_type: str = "type3",
     ) -> None:
         # Project forecasting contract.
-        self.context_length = context_length
-        self.horizons = horizons
-        self.target_channels = target_channels
-        self.stride = stride
+        self.context_length = int(context_length)
+        self.horizons = list(horizons)
+        self.stride = int(stride)
+
+        self.target_channels = list(target_channels)
+
+        # Backward compatibility: older constructors used target channels
+        # as both inputs and targets.
+        self.input_channels = list(
+            self.target_channels
+            if input_channels is None
+            else input_channels
+        )
 
         if variable_layout not in {"joint", "per_asset"}:
             raise ValueError(
@@ -97,16 +107,56 @@ class ModernTCNBaseline:
                 f"got {variable_layout!r}."
             )
 
-        if not target_channels:
-            raise ValueError("target_channels must contain at least one channel.")
-
-        if len(target_channels) != len(set(target_channels)):
+        if not self.input_channels:
             raise ValueError(
-                f"target_channels contains duplicates: {target_channels}."
+                "input_channels must contain at least one channel."
+            )
+
+        if not self.target_channels:
+            raise ValueError(
+                "target_channels must contain at least one channel."
+            )
+
+        if len(self.input_channels) != len(set(self.input_channels)):
+            raise ValueError(
+                "input_channels contains duplicates: "
+                f"{self.input_channels}."
+            )
+
+        if len(self.target_channels) != len(set(self.target_channels)):
+            raise ValueError(
+                "target_channels contains duplicates: "
+                f"{self.target_channels}."
+            )
+
+        missing_targets = [
+            channel
+            for channel in self.target_channels
+            if channel not in self.input_channels
+        ]
+
+        if missing_targets:
+            raise ValueError(
+                "Every target channel must also be present in "
+                "input_channels. Missing targets: "
+                f"{missing_targets}."
             )
 
         self.variable_layout = variable_layout
-        self.num_channels = len(target_channels)
+
+        self.num_input_channels = len(self.input_channels)
+        self.num_target_channels = len(self.target_channels)
+
+        # Indices used later to select forecast targets from the
+        # full ModernTCN output.
+        self.target_input_indices = [
+            self.input_channels.index(channel)
+            for channel in self.target_channels
+        ]
+
+        # Temporary compatibility alias. Existing shape code still uses
+        # num_channels to mean the number of model input variables.
+        self.num_channels = self.num_input_channels
 
         # Agreed ModernTCN architecture.
         self.patch_size = patch_size
@@ -170,12 +220,27 @@ class ModernTCNBaseline:
         self.num_assets: int | None = None
         self.num_variables: int | None = None
 
-        channel_code = "".join(channel.strip().lower()[0]
-                               for channel in self.target_channels)
-        
-        self.experiment_name = (
-            f"{self.variable_layout}_{channel_code}"
+        input_channel_code = "".join(
+            channel.strip().lower()[0]
+            for channel in self.input_channels
         )
+
+        target_channel_code = "".join(
+            channel.strip().lower()[0]
+            for channel in self.target_channels
+        )
+
+        # Preserve existing names such as joint_c for models whose
+        # input and target channels are identical.
+        if self.input_channels == self.target_channels:
+            self.experiment_name = (
+                f"{self.variable_layout}_{target_channel_code}"
+            )
+        else:
+            self.experiment_name = (
+                f"{self.variable_layout}_"
+                f"{input_channel_code}_to_{target_channel_code}"
+            )
 
         # These are populated later by fit(...).
         self.model: Any | None = None
@@ -241,6 +306,7 @@ class ModernTCNBaseline:
             horizons=[int(horizon) for horizon in forecasting_config["horizons"]],
             target_channels=list(forecasting_config["target_channels"]),
             stride=int(forecasting_config["stride"]),
+            input_channels=list(forecasting_config.get("input_channels",forecasting_config["target_channels"],)),
             patch_size=int(modern_tcn_config.get("patch_size", 8)),
             patch_stride=int(modern_tcn_config.get("patch_stride", 4)),
             hidden_dim=int(modern_tcn_config.get("hidden_dim", 64)),
@@ -281,7 +347,7 @@ class ModernTCNBaseline:
                 "context_length": self.context_length,
                 "horizons": list(self.horizons),
                 "stride": self.stride,
-                "input_channels": list(self.target_channels),
+                "input_channels": list(self.input_channels),
                 "target_channels": list(self.target_channels),
             }
         }
@@ -294,10 +360,10 @@ class ModernTCNBaseline:
         Return the number of variables presented to ModernTCN.
 
         joint:
-            M = N * C
+            M = N * C_input
 
         per_asset:
-            M = C
+            M = C_input
         """
         if num_assets < 1:
             raise ValueError(
@@ -305,10 +371,10 @@ class ModernTCNBaseline:
             )
 
         if self.variable_layout == "joint":
-            return num_assets * self.num_channels
+            return num_assets * self.num_input_channels
 
         if self.variable_layout == "per_asset":
-            return self.num_channels
+            return self.num_input_channels
 
         raise RuntimeError(
             f"Unsupported variable_layout: {self.variable_layout!r}."
@@ -344,28 +410,52 @@ class ModernTCNBaseline:
                 "in the same order."
             )
 
-        missing_train_channels = [
+        missing_train_input_channels = [
+            channel
+            for channel in self.input_channels
+            if channel not in train_split["channels"]
+        ]
+
+        missing_val_input_channels = [
+            channel
+            for channel in self.input_channels
+            if channel not in val_split["channels"]
+        ]
+
+        missing_train_target_channels = [
             channel
             for channel in self.target_channels
             if channel not in train_split["channels"]
         ]
 
-        missing_val_channels = [
+        missing_val_target_channels = [
             channel
             for channel in self.target_channels
             if channel not in val_split["channels"]
         ]
 
-        if missing_train_channels:
+        if missing_train_input_channels:
             raise ValueError(
-                "The training split is missing one or more configured "
-                "ModernTCN channels."
+                "The training split is missing configured ModernTCN "
+                f"input channels: {missing_train_input_channels}."
             )
 
-        if missing_val_channels:
+        if missing_val_input_channels:
             raise ValueError(
-                "The validation split is missing one or more configured "
-                "ModernTCN channels."
+                "The validation split is missing configured ModernTCN "
+                f"input channels: {missing_val_input_channels}."
+            )
+
+        if missing_train_target_channels:
+            raise ValueError(
+                "The training split is missing configured ModernTCN "
+                f"target channels: {missing_train_target_channels}."
+            )
+
+        if missing_val_target_channels:
+            raise ValueError(
+                "The validation split is missing configured ModernTCN "
+                f"target channels: {missing_val_target_channels}."
             )
 
         self.asset_cols = train_asset_cols
@@ -558,10 +648,10 @@ class ModernTCNBaseline:
                 f"Expected {self.num_assets}, got {num_assets}."
             )
 
-        if num_channels != self.num_channels:
+        if num_channels != self.num_input_channels:
             raise ValueError(
                 "The channel dimension of x does not match target_channels. "
-                f"Expected {self.num_channels}, got {num_channels}."
+                f"Expected {self.num_input_channels}, got {num_channels}."
             )
         
         if self.variable_layout == "joint":
@@ -624,7 +714,7 @@ class ModernTCNBaseline:
             expected_shape = (
                 batch_size,
                 horizon_count,
-                self.num_assets * self.num_channels,
+                self.num_assets * self.num_input_channels,
             )
 
             if tuple(x.shape) != expected_shape:
@@ -637,14 +727,14 @@ class ModernTCNBaseline:
                 batch_size,
                 horizon_count,
                 self.num_assets,
-                self.num_channels,
+                self.num_input_channels,
             )
         
         if self.variable_layout == "per_asset":
             expected_shape = (
                 batch_size * self.num_assets,
                 horizon_count,
-                self.num_channels,
+                self.num_input_channels,
             )
 
             if tuple(x.shape) != expected_shape:
@@ -658,7 +748,7 @@ class ModernTCNBaseline:
                     batch_size,
                     self.num_assets,
                     horizon_count,
-                    self.num_channels,
+                    self.num_input_channels,
                 )
                 .permute(0, 2, 1, 3)
                 .contiguous()
@@ -667,7 +757,54 @@ class ModernTCNBaseline:
         raise RuntimeError(
             f"Unsupported variable_layout: {self.variable_layout!r}."
         )
+    
+    def _select_target_outputs(
+        self,
+        all_predictions: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Select configured target channels from the full ModernTCN output.
 
+        Args:
+            all_predictions:
+                Tensor with shape [B, H, N, C_input].
+
+        Returns:
+            Tensor with shape [B, H, N, C_target].
+
+        ModernTCN forecasts every input variable. Only channels listed in
+        target_channels are retained for loss calculation and prediction.
+        """
+        if not isinstance(all_predictions, torch.Tensor):
+            raise TypeError(
+                "all_predictions must be a torch.Tensor."
+            )
+
+        if all_predictions.ndim != 4:
+            raise ValueError(
+                "all_predictions must have shape [B,H,N,C_input]. "
+                f"Received shape {tuple(all_predictions.shape)}."
+            )
+
+        if all_predictions.shape[-1] != self.num_input_channels:
+            raise ValueError(
+                "The final dimension of all_predictions does not match "
+                "input_channels. "
+                f"Expected {self.num_input_channels}, "
+                f"got {all_predictions.shape[-1]}."
+            )
+
+        target_indices = torch.tensor(
+            self.target_input_indices,
+            dtype=torch.long,
+            device=all_predictions.device,
+        )
+
+        return all_predictions.index_select(
+            dim=-1,
+            index=target_indices,
+        )
+            
     def _forward_project_tensor(
         self,
         x: torch.Tensor,
@@ -702,9 +839,13 @@ class ModernTCNBaseline:
         model_input = self._flatten_input(x)
         model_output = self.model(model_input)
 
-        return self._unflatten_output(
+        all_predictions = self._unflatten_output(
             model_output,
             batch_size=batch_size,
+        )
+
+        return self._select_target_outputs(
+            all_predictions
         )
     
     def _compute_batch_loss(
@@ -911,7 +1052,9 @@ class ModernTCNBaseline:
         return {
             "experiment_name": self.experiment_name,
             "variable_layout": self.variable_layout,
+            "input_channels": list(self.input_channels),
             "target_channels": list(self.target_channels),
+            "target_input_indices": list(self.target_input_indices),
             "horizons": list(self.horizons),
             "context_length": self.context_length,
             "stride": self.stride,
@@ -920,7 +1063,11 @@ class ModernTCNBaseline:
             "normalisation_clip": normalisation_clip,
             "asset_cols": list(resolved_asset_cols),
             "num_assets": resolved_num_assets,
-            "num_channels": self.num_channels,
+            # num_channels is retained as a legacy alias so existing
+            # close-only checkpoints remain loadable.
+            "num_channels": self.num_input_channels,
+            "num_input_channels": self.num_input_channels,
+            "num_target_channels": self.num_target_channels,
             "num_variables": resolved_num_variables,
             "architecture": {
                 "patch_size": self.patch_size,
@@ -940,6 +1087,83 @@ class ModernTCNBaseline:
             },
         }
     
+    def _normalise_checkpoint_metadata(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Add input/target metadata fields that are absent from older
+        ModernTCN checkpoints.
+
+        Older checkpoints used target_channels as both the model inputs
+        and forecast targets.
+        """
+        normalised = dict(checkpoint)
+
+        target_channels = list(
+            normalised["target_channels"]
+        )
+
+        input_channels = list(
+            normalised.get(
+                "input_channels",
+                target_channels,
+            )
+        )
+
+        missing_targets = [
+            channel
+            for channel in target_channels
+            if channel not in input_channels
+        ]
+
+        if missing_targets:
+            raise ValueError(
+                "Checkpoint target channels are not present in its "
+                f"input channels: {missing_targets}."
+            )
+
+        normalised["input_channels"] = input_channels
+        normalised["target_channels"] = target_channels
+
+        normalised["num_input_channels"] = int(
+            normalised.get(
+                "num_input_channels",
+                normalised.get(
+                    "num_channels",
+                    len(input_channels),
+                ),
+            )
+        )
+
+        normalised["num_target_channels"] = int(
+            normalised.get(
+                "num_target_channels",
+                len(target_channels),
+            )
+        )
+
+        normalised["target_input_indices"] = list(
+            normalised.get(
+                "target_input_indices",
+                [
+                    input_channels.index(channel)
+                    for channel in target_channels
+                ],
+            )
+        )
+
+        # Retain the old metadata field as an alias.
+        normalised["num_channels"] = int(
+            normalised.get(
+                "num_channels",
+                normalised["num_input_channels"],
+            )
+        )
+
+        return normalised
+
+
     def _save_checkpoint(
         self,
         checkpoint_path: Path,
@@ -1023,10 +1247,16 @@ class ModernTCNBaseline:
             map_location=device,
         )
 
+        checkpoint_metadata = (
+            self._normalise_checkpoint_metadata(
+                checkpoint
+            )
+        )
+
         expected_metadata = self._checkpoint_metadata()
 
         for key, expected_value in expected_metadata.items():
-            if checkpoint.get(key) != expected_value:
+            if checkpoint_metadata.get(key) != expected_value:
                 raise ValueError(
                     f"Checkpoint metadata for {key!r} is incompatible with "
                     "the current ModernTCN baseline."
@@ -1116,6 +1346,12 @@ class ModernTCNBaseline:
                 "ModernTCN checkpoint is missing required keys: "
                 f"{sorted(missing_keys)}"
             )
+        
+        checkpoint_metadata = (
+            self._normalise_checkpoint_metadata(
+                checkpoint
+            )
+        )
 
         checkpoint_asset_cols = list(
             checkpoint["asset_cols"]
@@ -1147,7 +1383,7 @@ class ModernTCNBaseline:
         )
 
         for key, expected_value in expected_metadata.items():
-            checkpoint_value = checkpoint.get(key)
+            checkpoint_value = checkpoint_metadata.get(key)
 
             if checkpoint_value != expected_value:
                 raise ValueError(
@@ -1408,7 +1644,7 @@ class ModernTCNBaseline:
         Generate raw ModernTCN predictions.
 
         Returns tensors with shape:
-            [num_examples, num_horizons, num_assets, num_channels]
+            [num_examples, num_horizons, num_assets, num_target_channels]
         """
         if self.model is None:
             raise RuntimeError(
@@ -1427,15 +1663,28 @@ class ModernTCNBaseline:
                 "fitted ModernTCN model."
             )
 
-        missing_channels = [
+        missing_input_channels = [
+            channel
+            for channel in self.input_channels
+            if channel not in split["channels"]
+        ]
+
+        missing_target_channels = [
             channel
             for channel in self.target_channels
             if channel not in split["channels"]
         ]
 
-        if missing_channels:
+        if missing_input_channels:
             raise ValueError(
-                "Prediction split is missing required target channels."
+                "Prediction split is missing required input channels: "
+                f"{missing_input_channels}."
+            )
+
+        if missing_target_channels:
+            raise ValueError(
+                "Prediction split is missing required target channels: "
+                f"{missing_target_channels}."
             )
 
         dataset = self._build_dataset(split)
@@ -1535,7 +1784,7 @@ class ModernTCNBaseline:
         return {
             "y_pred": torch.cat(all_y_pred, dim=0),
             "y_true": torch.cat(all_y_true, dim=0),
-            "channels": self.target_channels,
+            "channels": list(self.target_channels),
             "horizons": self.horizons,
             "sample_idx": torch.cat(all_sample_idx, dim=0),
             "origin_idx": torch.cat(all_origin_idx, dim=0),

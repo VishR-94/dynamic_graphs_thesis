@@ -20,12 +20,8 @@ forecasting:
     - low
     - close
     - volume
-    - amount
 
   target_channels:
-    - open
-    - high
-    - low
     - close
 
 features:

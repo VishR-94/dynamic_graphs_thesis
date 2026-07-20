@@ -127,8 +127,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Optional explicit override for the configured training "
-            "batch size."
+            "Optional explicit override for the configured "
+            "ModernTCN training batch size."
+        ),
+    )
+
+    parser.add_argument(
+        "--input-channels",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional ordered input-channel override. "
+            "Example: --input-channels open high low close volume"
         ),
     )
 
@@ -137,9 +147,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help=(
-            "Optional ordered target-channel override. "
-            "The same channels are used as ModernTCN inputs and targets. "
-            "Example: --target-channels close volume"
+            "Optional ordered forecast-target override. "
+            "Example: --target-channels close"
         ),
     )
 
@@ -293,6 +302,32 @@ def apply_cli_overrides(
         "training"
     ]
 
+    if args.input_channels is not None:
+        input_channels = [
+            str(channel).strip()
+            for channel in args.input_channels
+        ]
+
+        if not input_channels:
+            raise ValueError(
+                "--input-channels must contain at least one channel."
+            )
+
+        if any(not channel for channel in input_channels):
+            raise ValueError(
+                "--input-channels cannot contain empty names."
+            )
+
+        if len(input_channels) != len(set(input_channels)):
+            raise ValueError(
+                "--input-channels cannot contain duplicates."
+            )
+
+        forecasting_config[
+            "input_channels"
+        ] = input_channels
+
+
     if args.target_channels is not None:
         target_channels = [
             str(channel).strip()
@@ -322,6 +357,31 @@ def apply_cli_overrides(
         forecasting_config[
             "target_channels"
         ] = target_channels
+
+
+    resolved_input_channels = list(
+        forecasting_config.get(
+            "input_channels",
+            forecasting_config["target_channels"],
+        )
+    )
+
+    resolved_target_channels = list(
+        forecasting_config["target_channels"]
+    )
+
+    missing_targets = [
+        channel
+        for channel in resolved_target_channels
+        if channel not in resolved_input_channels
+    ]
+
+    if missing_targets:
+        raise ValueError(
+            "Every target channel must also be present in "
+            "input_channels. Missing targets: "
+            f"{missing_targets}."
+        )
 
     if args.variable_layout is not None:
         modern_tcn_config[
@@ -391,6 +451,12 @@ def build_wandb_config(
             int(horizon)
             for horizon in forecasting_config["horizons"]
         ],
+        "input_channels": list(
+            forecasting_config.get(
+                "input_channels",
+                forecasting_config["target_channels"],
+            )
+        ),
         "target_channels": list(
             forecasting_config["target_channels"]
         ),
@@ -649,14 +715,24 @@ def fit_modern_tcn_run(
             "experiment_name": (
                 model.experiment_name
             ),
-            "variable_layout": (
-                model.variable_layout
+            "input_channels": list(
+                model.input_channels
             ),
             "target_channels": list(
                 model.target_channels
             ),
+            "target_input_indices": list(
+                model.target_input_indices
+            ),
+            "num_input_channels": (
+                model.num_input_channels
+            ),
+            "num_target_channels": (
+                model.num_target_channels
+            ),
+            # Legacy alias.
             "num_channels": (
-                model.num_channels
+                model.num_input_channels
             ),
             "revin": model.revin,
             "loss_space": model.loss_space,
@@ -964,12 +1040,29 @@ def record_run_summary(
         model.variable_layout
     )
 
+    run.summary["input_channels"] = list(
+        model.input_channels
+    )
+
     run.summary["target_channels"] = list(
         model.target_channels
     )
 
+    run.summary["num_input_channels"] = int(
+        model.num_input_channels
+    )
+
+    run.summary["num_target_channels"] = int(
+        model.num_target_channels
+    )
+
+    run.summary["target_input_indices"] = list(
+        model.target_input_indices
+    )
+
+    # Legacy alias.
     run.summary["num_channels"] = int(
-        model.num_channels
+        model.num_input_channels
     )
 
     run.summary["num_assets"] = int(
@@ -1039,6 +1132,12 @@ def log_checkpoint_artifact(
             ),
             "variable_layout": (
                 model.variable_layout
+            ),
+            "input_channels": list(
+                model.input_channels
+            ),
+            "target_input_indices": list(
+                model.target_input_indices
             ),
             "target_channels": list(
                 model.target_channels
