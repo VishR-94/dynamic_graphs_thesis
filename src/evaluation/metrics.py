@@ -1,5 +1,6 @@
 from collections.abc import Callable, Sequence
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 from functools import partial
 import torch
 from torchmetrics.functional.regression import pearson_corrcoef
@@ -78,6 +79,176 @@ def reduce_metric(
     return values.mean(dim=reduce_dims)
 
 
+def absolute_error_values(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Return pointwise absolute errors without reducing dimensions.
+
+    Input/output shape:
+        [B, H, N, C]
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    return torch.abs(
+        y_pred - y_true
+    )
+
+
+def mase_values(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    mase_scale: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Return pointwise MASE contributions without reducing dimensions.
+
+    Input/output shape:
+        y_pred, y_true: [B, H, N, C]
+        mase_scale:     [N, C]
+        output:         [B, H, N, C]
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    if not isinstance(
+        mase_scale,
+        torch.Tensor,
+    ):
+        raise TypeError(
+            "mase_scale must be a torch.Tensor."
+        )
+
+    if mase_scale.ndim != 2:
+        raise ValueError(
+            "Expected mase_scale to have shape [N, C], "
+            f"got {tuple(mase_scale.shape)}."
+        )
+
+    expected_scale_shape = (
+        y_pred.shape[-2],
+        y_pred.shape[-1],
+    )
+
+    if mase_scale.shape != expected_scale_shape:
+        raise ValueError(
+            "mase_scale has an incompatible shape. "
+            f"Expected {expected_scale_shape}, "
+            f"got {tuple(mase_scale.shape)}."
+        )
+
+    if not torch.isfinite(
+        mase_scale
+    ).all():
+        raise ValueError(
+            "mase_scale contains NaN or infinite values."
+        )
+
+    mase_scale = mase_scale.to(
+        device=y_pred.device,
+        dtype=y_pred.dtype,
+    )
+
+    valid_scale = (
+        mase_scale > eps
+    )
+
+    safe_scale = torch.where(
+        valid_scale,
+        mase_scale,
+        torch.full_like(
+            mase_scale,
+            torch.nan,
+        ),
+    )
+
+    return (
+        absolute_error_values(
+            y_pred=y_pred,
+            y_true=y_true,
+        )
+        / safe_scale
+    )
+
+
+def persistence_win_score_values(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    persistence_pred: torch.Tensor,
+    tie_value: float = 0.5,
+    rtol: float = 1e-6,
+    atol: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Return pointwise win scores against Persistence.
+
+    Each element is:
+        1.0 if model error is lower
+        0.0 if model error is higher
+        tie_value if errors are numerically tied
+
+    Input/output shape:
+        [B, H, N, C]
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    validate_prediction_shapes(
+        y_pred=persistence_pred,
+        y_true=y_true,
+    )
+
+    if not 0.0 <= tie_value <= 1.0:
+        raise ValueError(
+            "tie_value must lie between 0 and 1, "
+            f"got {tie_value}."
+        )
+
+    model_absolute_error = (
+        absolute_error_values(
+            y_pred=y_pred,
+            y_true=y_true,
+        )
+    )
+
+    persistence_absolute_error = (
+        absolute_error_values(
+            y_pred=persistence_pred,
+            y_true=y_true,
+        )
+    )
+
+    ties = torch.isclose(
+        model_absolute_error,
+        persistence_absolute_error,
+        rtol=rtol,
+        atol=atol,
+    )
+
+    wins = (
+        model_absolute_error
+        < persistence_absolute_error
+    ) & ~ties
+
+    return (
+        wins.to(
+            dtype=model_absolute_error.dtype
+        )
+        + tie_value
+        * ties.to(
+            dtype=model_absolute_error.dtype
+        )
+    )
+
 def mae(
     y_pred: torch.Tensor,
     y_true: torch.Tensor,
@@ -85,22 +256,16 @@ def mae(
 ) -> torch.Tensor:
     """
     Mean absolute error.
-
-    Args:
-        y_pred:
-            Prediction tensor.
-
-        y_true:
-            Ground-truth tensor.
-
-        reduce_dims:
-            Dimensions to average over. If None, average over all dimensions.
     """
-    validate_prediction_shapes(y_pred, y_true)
+    values = absolute_error_values(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
 
-    values = (y_pred - y_true).abs()
-
-    return reduce_metric(values, reduce_dims=reduce_dims)
+    return reduce_metric(
+        values,
+        reduce_dims=reduce_dims,
+    )
 
 
 def mse(
@@ -191,9 +356,18 @@ def relative_mae_vs_persistence(
     validate_prediction_shapes(y_pred, y_true)
     validate_prediction_shapes(persistence_pred, y_true)
 
-    model_absolute_error = torch.abs(y_pred - y_true)
-    persistence_absolute_error = torch.abs(
-        persistence_pred - y_true
+    model_absolute_error = (
+        absolute_error_values(
+            y_pred=y_pred,
+            y_true=y_true,
+        )
+    )
+
+    persistence_absolute_error = (
+        absolute_error_values(
+            y_pred=persistence_pred,
+            y_true=y_true,
+        )
     )
 
     model_mae = reduce_metric(
@@ -252,35 +426,15 @@ def persistence_win_rate(
         Win-rate proportions between 0 and 1 after the requested
         reductions.
     """
-    validate_prediction_shapes(y_pred, y_true)
-    validate_prediction_shapes(persistence_pred, y_true)
-
-    if not 0.0 <= tie_value <= 1.0:
-        raise ValueError(
-            "tie_value must lie between 0 and 1, "
-            f"got {tie_value}."
-        )
-
-    model_absolute_error = torch.abs(y_pred - y_true)
-    persistence_absolute_error = torch.abs(
-        persistence_pred - y_true
-    )
-
-    ties = torch.isclose(
-        model_absolute_error,
-        persistence_absolute_error,
-        rtol=rtol,
-        atol=atol,
-    )
-
-    wins = (
-        model_absolute_error < persistence_absolute_error
-    ) & ~ties
-
     pointwise_scores = (
-        wins.to(dtype=model_absolute_error.dtype)
-        + tie_value
-        * ties.to(dtype=model_absolute_error.dtype)
+        persistence_win_score_values(
+            y_pred=y_pred,
+            y_true=y_true,
+            persistence_pred=persistence_pred,
+            tie_value=tie_value,
+            rtol=rtol,
+            atol=atol,
+        )
     )
 
     return reduce_metric(
@@ -471,52 +625,11 @@ def mase(
     Returns:
         MASE after the requested reduction.
     """
-    validate_prediction_shapes(y_pred, y_true)
-
-    if not isinstance(mase_scale, torch.Tensor):
-        raise TypeError(
-            "mase_scale must be a torch.Tensor."
-        )
-
-    if mase_scale.ndim != 2:
-        raise ValueError(
-            "Expected mase_scale to have shape [N, C], "
-            f"got {tuple(mase_scale.shape)}."
-        )
-
-    expected_scale_shape = (
-        y_pred.shape[-2],
-        y_pred.shape[-1],
-    )
-
-    if mase_scale.shape != expected_scale_shape:
-        raise ValueError(
-            "mase_scale has an incompatible shape. "
-            f"Expected {expected_scale_shape}, "
-            f"got {tuple(mase_scale.shape)}."
-        )
-
-    if not torch.isfinite(mase_scale).all():
-        raise ValueError(
-            "mase_scale contains NaN or infinite values."
-        )
-
-    mase_scale = mase_scale.to(
-        device=y_pred.device,
-        dtype=y_pred.dtype,
-    )
-
-    valid_scale = mase_scale > eps
-
-    safe_scale = torch.where(
-        valid_scale,
-        mase_scale,
-        torch.full_like(mase_scale, torch.nan),
-    )
-
-    scaled_absolute_error = (
-        torch.abs(y_pred - y_true)
-        / safe_scale
+    scaled_absolute_error = mase_values(
+        y_pred=y_pred,
+        y_true=y_true,
+        mase_scale=mase_scale,
+        eps=eps,
     )
 
     return reduce_metric(
@@ -559,6 +672,103 @@ def pearson_correlation(
     return correlations.reshape(num_horizons, num_channels)
 
 MetricFunction = Callable[..., torch.Tensor]
+
+@dataclass(frozen=True)
+class BootstrapMetricComponents:
+    """
+    Pointwise information required to bootstrap one metric.
+
+    All component tensors initially have shape:
+
+        [B, H, N, C]
+
+    Kinds:
+        mean:
+            values contains pointwise contributions that are averaged.
+
+        ratio:
+            values contains numerator contributions.
+            reference_values contains denominator contributions.
+
+        correlation:
+            values contains x.
+            reference_values contains y.
+    """
+
+    kind: Literal[
+        "mean",
+        "ratio",
+        "correlation",
+    ]
+
+    values: torch.Tensor
+
+    reference_values: torch.Tensor | None = None
+
+
+BootstrapComponentFunction = Callable[
+    ...,
+    BootstrapMetricComponents,
+]
+
+@dataclass(frozen=True)
+class BootstrapSessionStatistics:
+    """
+    Metric contributions aggregated into complete trading-session
+    blocks.
+
+    Shapes:
+        session_ids:              [D]
+        observation_count:        [D]
+        value_sum:                 [D, H, C]
+
+    Additional tensors are populated according to metric kind:
+
+        mean:
+            value_sum
+
+        ratio:
+            value_sum
+            reference_sum
+
+        correlation:
+            value_sum
+            reference_sum
+            value_squared_sum
+            reference_squared_sum
+            cross_sum
+    """
+
+    kind: Literal[
+        "mean",
+        "ratio",
+        "correlation",
+    ]
+
+    session_ids: torch.Tensor
+
+    observation_count: torch.Tensor
+
+    value_sum: torch.Tensor
+
+    reference_sum: torch.Tensor | None = None
+
+    value_squared_sum: torch.Tensor | None = None
+
+    reference_squared_sum: torch.Tensor | None = None
+
+    cross_sum: torch.Tensor | None = None
+
+@dataclass(frozen=True)
+class MetricDefinition:
+    """
+    Define both ordinary and bootstrap evaluation for one metric.
+    """
+
+    compute: MetricFunction
+
+    bootstrap_components: BootstrapComponentFunction
+
 class ForecastEvaluator:
     """
     Evaluate forecasts returned in raw value space.
@@ -580,6 +790,7 @@ class ForecastEvaluator:
 
         self.channels = list(prediction_result["channels"])
         self.horizons = list(prediction_result["horizons"])
+        self.sample_idx = prediction_result.get("sample_idx")
 
         self.mase_scale: torch.Tensor | None = None
 
@@ -744,33 +955,177 @@ class ForecastEvaluator:
             reduce_dims=reduce_dims,
             eps=eps,
         )
+    
+    def _build_cumulative_log_change_mae_bootstrap_components(
+        self,
+    ) -> BootstrapMetricComponents:
+        """
+        Return pointwise cumulative-log-change absolute errors.
+        """
+        y_pred, y_true = self.get_predictions(
+            output_space="cumulative_log_change",
+        )
 
+        values = absolute_error_values(
+            y_pred=y_pred,
+            y_true=y_true,
+        )
+
+        return BootstrapMetricComponents(
+            kind="mean",
+            values=values,
+        )
+    
+    def _build_cumulative_log_change_pearson_bootstrap_components(
+        self,
+    ) -> BootstrapMetricComponents:
+        """
+        Return cumulative-log-change predictions and targets for
+        Pearson sufficient-statistic aggregation.
+        """
+        y_pred, y_true = self.get_predictions(
+            output_space="cumulative_log_change",
+        )
+
+        return BootstrapMetricComponents(
+            kind="correlation",
+            values=y_pred,
+            reference_values=y_true,
+        )
+    
+    def _build_mase_bootstrap_components(
+        self,
+        eps: float = 1e-8,
+    ) -> BootstrapMetricComponents:
+        """
+        Return pointwise MASE contributions.
+
+        The training-derived MASE scale remains fixed.
+        """
+        if self.mase_scale is None:
+            raise ValueError(
+                "MASE requires a training split. Construct the evaluator "
+                "with ForecastEvaluator(prediction_result, "
+                "train_split=train_split)."
+            )
+
+        values = mase_values(
+            y_pred=self.y_pred_raw,
+            y_true=self.y_true_raw,
+            mase_scale=self.mase_scale,
+            eps=eps,
+        )
+
+        return BootstrapMetricComponents(
+            kind="mean",
+            values=values,
+        )
+    
+    def _build_relative_mae_bootstrap_components(
+        self,
+        eps: float = 1e-8,
+    ) -> BootstrapMetricComponents:
+        """
+        Return the numerator and denominator contributions required
+        for relative MAE.
+
+        The eps threshold will be applied after aggregating each
+        bootstrap sample.
+        """
+        del eps
+
+        model_absolute_error = absolute_error_values(
+            y_pred=self.y_pred_raw,
+            y_true=self.y_true_raw,
+        )
+
+        persistence_absolute_error = absolute_error_values(
+            y_pred=self.persistence_pred_raw,
+            y_true=self.y_true_raw,
+        )
+
+        return BootstrapMetricComponents(
+            kind="ratio",
+            values=model_absolute_error,
+            reference_values=persistence_absolute_error,
+        )
+    
+    def _build_persistence_win_rate_bootstrap_components(
+        self,
+        tie_value: float = 0.5,
+        rtol: float = 1e-6,
+        atol: float = 1e-8,
+    ) -> BootstrapMetricComponents:
+        """
+        Return pointwise Persistence win scores.
+        """
+        values = persistence_win_score_values(
+            y_pred=self.y_pred_raw,
+            y_true=self.y_true_raw,
+            persistence_pred=self.persistence_pred_raw,
+            tie_value=tie_value,
+            rtol=rtol,
+            atol=atol,
+        )
+
+        return BootstrapMetricComponents(
+            kind="mean",
+            values=values,
+        )
+    
     def _build_metric_registry(
         self,
-    ) -> dict[str, MetricFunction]:
+    ) -> dict[str, MetricDefinition]:
         """
-        Map public metric names to evaluator callables.
-
-        Every registered callable must accept reduce_dims and return a
-        torch.Tensor.
+        Map each public metric name to its ordinary computation and
+        bootstrap-component builder.
         """
         return {
-            "cumulative_log_change_mae": partial(
-                self.compute_pairwise_metric,
-                metric_fn=mae,
-                output_space="cumulative_log_change",
+            "cumulative_log_change_mae": MetricDefinition(
+                compute=partial(
+                    self.compute_pairwise_metric,
+                    metric_fn=mae,
+                    output_space="cumulative_log_change",
+                ),
+                bootstrap_components=(
+                    self
+                    ._build_cumulative_log_change_mae_bootstrap_components
+                ),
             ),
-            "cumulative_log_change_pearson_correlation": partial(
-                self.compute_pairwise_metric,
-                metric_fn=pearson_correlation,
-                output_space="cumulative_log_change",
+
+            "cumulative_log_change_pearson_correlation": (
+                MetricDefinition(
+                    compute=partial(
+                        self.compute_pairwise_metric,
+                        metric_fn=pearson_correlation,
+                        output_space="cumulative_log_change",
+                    ),
+                    bootstrap_components=(
+                        self
+                        ._build_cumulative_log_change_pearson_bootstrap_components
+                    ),
+                )
             ),
-            "mase": self.compute_mase,
-            "relative_mae_vs_persistence": (
-                self.compute_relative_mae_vs_persistence
+
+            "mase": MetricDefinition(
+                compute=self.compute_mase,
+                bootstrap_components=(
+                    self._build_mase_bootstrap_components
+                ),
             ),
-            "persistence_win_rate": (
-                self.compute_persistence_win_rate
+
+            "relative_mae_vs_persistence": MetricDefinition(
+                compute=self.compute_relative_mae_vs_persistence,
+                bootstrap_components=(
+                    self._build_relative_mae_bootstrap_components
+                ),
+            ),
+
+            "persistence_win_rate": MetricDefinition(
+                compute=self.compute_persistence_win_rate,
+                bootstrap_components=(
+                    self._build_persistence_win_rate_bootstrap_components
+                ),
             ),
         }
     
@@ -782,12 +1137,154 @@ class ForecastEvaluator:
         """
         return tuple(self._metric_registry)
     
+
+    def _summarise_bootstrap_samples(
+        self,
+        bootstrap_samples: torch.Tensor,
+        confidence_level: float,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Summarise a bootstrap distribution.
+
+        Args:
+            bootstrap_samples:
+                Bootstrap metric values with shape [R, H, C].
+
+            confidence_level:
+                Confidence level for the percentile interval.
+
+        Returns:
+            Dictionary containing tensors with shape [H, C]:
+                bootstrap_mean
+                bootstrap_std
+                ci_lower
+                ci_upper
+        """
+        if not isinstance(
+            bootstrap_samples,
+            torch.Tensor,
+        ):
+            raise TypeError(
+                "bootstrap_samples must be a torch.Tensor."
+            )
+
+        if bootstrap_samples.ndim != 3:
+            raise ValueError(
+                "Expected bootstrap_samples to have shape "
+                "[R, H, C], got "
+                f"{tuple(bootstrap_samples.shape)}."
+            )
+
+        if bootstrap_samples.shape[0] < 2:
+            raise ValueError(
+                "At least two bootstrap samples are required."
+            )
+
+        if not isinstance(
+            confidence_level,
+            (float, int),
+        ):
+            raise TypeError(
+                "confidence_level must be numeric."
+            )
+
+        confidence_level = float(
+            confidence_level
+        )
+
+        if not 0.0 < confidence_level < 1.0:
+            raise ValueError(
+                "confidence_level must lie strictly between "
+                f"0 and 1, got {confidence_level}."
+            )
+
+        samples = (
+            bootstrap_samples
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        finite_mask = torch.isfinite(
+            samples
+        )
+
+        finite_count = finite_mask.sum(
+            dim=0
+        )
+
+        bootstrap_mean = torch.nanmean(
+            samples,
+            dim=0,
+        )
+
+        centred_samples = torch.where(
+            finite_mask,
+            samples - bootstrap_mean.unsqueeze(0),
+            torch.zeros_like(samples),
+        )
+
+        squared_deviation_sum = (
+            centred_samples
+            .square()
+            .sum(dim=0)
+        )
+
+        standard_deviation_denominator = (
+            finite_count - 1
+        ).clamp_min(1)
+
+        bootstrap_std = torch.sqrt(
+            squared_deviation_sum
+            / standard_deviation_denominator
+        )
+
+        bootstrap_std = torch.where(
+            finite_count > 1,
+            bootstrap_std,
+            torch.full_like(
+                bootstrap_std,
+                torch.nan,
+            ),
+        )
+
+        alpha = (
+            1.0 - confidence_level
+        )
+
+        ci_lower = torch.nanquantile(
+            samples,
+            q=alpha / 2.0,
+            dim=0,
+        )
+
+        ci_upper = torch.nanquantile(
+            samples,
+            q=1.0 - alpha / 2.0,
+            dim=0,
+        )
+
+        return {
+            "bootstrap_mean": bootstrap_mean,
+            "bootstrap_std": bootstrap_std,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+        }
+    
     def evaluate(
         self,
         metrics: str | Sequence[str],
         reduce_dims: Sequence[int] | None = None,
         metric_kwargs: dict[str, dict[str, Any]] | None = None,
-    ) -> dict[str, torch.Tensor]:
+        *,
+        bootstrap: bool = False,
+        n_bootstrap: int = 10_000,
+        confidence_level: float = 0.95,
+        bootstrap_seed: int = 42,
+    ) -> (
+        dict[str, torch.Tensor]
+        | dict[str, dict[str, torch.Tensor]]
+    ):
         """
         Compute one or more registered forecast metrics.
 
@@ -800,29 +1297,57 @@ class ForecastEvaluator:
                 reduced.
 
                 For prediction tensors with shape [B, H, N, C],
-                reduce_dims=(0, 2) retains horizon and channel, returning
-                tensors with shape [H, C].
+                reduce_dims=(0, 2) retains horizon and channel and
+                returns tensors with shape [H, C].
 
             metric_kwargs:
                 Optional metric-specific keyword arguments.
 
-                Example:
-                    {
-                        "persistence_win_rate": {
-                            "tie_value": 0.0,
-                        },
-                        "mase": {
-                            "eps": 1e-10,
-                        },
-                    }
+            bootstrap:
+                If False, return ordinary metric tensors.
+
+                If True, compute trading-session block-bootstrap
+                confidence intervals.
+
+            n_bootstrap:
+                Number of bootstrap replicates.
+
+            confidence_level:
+                Confidence level for percentile intervals.
+
+            bootstrap_seed:
+                Random seed for session resampling.
 
         Returns:
-            Dictionary mapping each requested metric name to its result.
+            When bootstrap=False:
+
+                {
+                    metric_name: Tensor[H, C]
+                }
+
+            When bootstrap=True:
+
+                {
+                    metric_name: {
+                        "value": Tensor[H, C],
+                        "bootstrap_mean": Tensor[H, C],
+                        "bootstrap_std": Tensor[H, C],
+                        "ci_lower": Tensor[H, C],
+                        "ci_upper": Tensor[H, C],
+                    }
+                }
         """
-        if isinstance(metrics, str):
-            metric_names = [metrics]
+        if isinstance(
+            metrics,
+            str,
+        ):
+            metric_names = [
+                metrics
+            ]
         else:
-            metric_names = list(metrics)
+            metric_names = list(
+                metrics
+            )
 
         if len(metric_names) == 0:
             raise ValueError(
@@ -850,44 +1375,257 @@ class ForecastEvaluator:
         if unknown_metrics:
             raise ValueError(
                 f"Unknown metrics: {unknown_metrics}. "
-                f"Available metrics: {list(self.available_metrics)}."
+                f"Available metrics: "
+                f"{list(self.available_metrics)}."
             )
 
         if metric_kwargs is None:
             metric_kwargs = {}
 
-        unknown_kwargs_metrics = set(metric_kwargs).difference(
+        unknown_kwargs_metrics = set(
+            metric_kwargs
+        ).difference(
             metric_names
         )
 
         if unknown_kwargs_metrics:
             raise ValueError(
-                "metric_kwargs contains entries for metrics that were "
-                "not requested: "
+                "metric_kwargs contains entries for metrics "
+                "that were not requested: "
                 f"{sorted(unknown_kwargs_metrics)}."
             )
 
-        results: dict[str, torch.Tensor] = {}
+        ordinary_results: dict[
+            str,
+            torch.Tensor,
+        ] = {}
+
+        resolved_metric_kwargs: dict[
+            str,
+            dict[str, Any],
+        ] = {}
 
         for metric_name in metric_names:
             kwargs = dict(
-                metric_kwargs.get(metric_name, {})
+                metric_kwargs.get(
+                    metric_name,
+                    {},
+                )
             )
 
             if "reduce_dims" in kwargs:
                 raise ValueError(
-                    "Pass reduce_dims through evaluate(), not through "
+                    "Pass reduce_dims through evaluate(), not "
+                    "through "
                     f"metric_kwargs[{metric_name!r}]."
                 )
 
-            metric_fn = self._metric_registry[metric_name]
+            metric_definition = (
+                self._metric_registry[
+                    metric_name
+                ]
+            )
 
-            results[metric_name] = metric_fn(
+            ordinary_results[
+                metric_name
+            ] = metric_definition.compute(
                 reduce_dims=reduce_dims,
                 **kwargs,
             )
 
-        return results
+            resolved_metric_kwargs[
+                metric_name
+            ] = kwargs
+
+        if not isinstance(
+            bootstrap,
+            bool,
+        ):
+            raise TypeError(
+                "bootstrap must be a boolean."
+            )
+
+        if not bootstrap:
+            return ordinary_results
+
+        if reduce_dims is None:
+            raise ValueError(
+                "Bootstrap evaluation currently requires "
+                "reduce_dims=(0, 2)."
+            )
+
+        if tuple(reduce_dims) != (0, 2):
+            raise ValueError(
+                "Bootstrap evaluation currently supports only "
+                "reduce_dims=(0, 2), got "
+                f"{tuple(reduce_dims)}."
+            )
+
+        if not isinstance(
+            n_bootstrap,
+            int,
+        ):
+            raise TypeError(
+                "n_bootstrap must be an integer."
+            )
+
+        if n_bootstrap < 2:
+            raise ValueError(
+                "n_bootstrap must be at least 2."
+            )
+
+        if not isinstance(
+            bootstrap_seed,
+            int,
+        ):
+            raise TypeError(
+                "bootstrap_seed must be an integer."
+            )
+
+        if not isinstance(
+            confidence_level,
+            (float, int),
+        ):
+            raise TypeError(
+                "confidence_level must be numeric."
+            )
+
+        confidence_level = float(
+            confidence_level
+        )
+
+        if not 0.0 < confidence_level < 1.0:
+            raise ValueError(
+                "confidence_level must lie strictly between "
+                f"0 and 1, got {confidence_level}."
+            )
+
+        session_ids, _ = (
+            self._get_bootstrap_session_mapping()
+        )
+
+        num_sessions = int(
+            session_ids.numel()
+        )
+
+        bootstrap_session_counts = (
+            self._generate_bootstrap_session_counts(
+                num_sessions=num_sessions,
+                n_bootstrap=n_bootstrap,
+                bootstrap_seed=bootstrap_seed,
+            )
+        )
+
+        bootstrap_results: dict[
+            str,
+            dict[str, torch.Tensor],
+        ] = {}
+
+        for metric_name in metric_names:
+            metric_definition = (
+                self._metric_registry[
+                    metric_name
+                ]
+            )
+
+            kwargs = resolved_metric_kwargs[
+                metric_name
+            ]
+
+            components = (
+                metric_definition
+                .bootstrap_components(
+                    **kwargs,
+                )
+            )
+
+            statistics = (
+                self
+                ._aggregate_bootstrap_components_by_session(
+                    components
+                )
+            )
+
+            if statistics.kind in {
+                "mean",
+                "ratio",
+            }:
+                ratio_eps = float(
+                    kwargs.get(
+                        "eps",
+                        1e-8,
+                    )
+                )
+
+                bootstrap_samples = (
+                    self
+                    ._compute_mean_or_ratio_bootstrap_samples(
+                        statistics=statistics,
+                        bootstrap_session_counts=(
+                            bootstrap_session_counts
+                        ),
+                        eps=ratio_eps,
+                    )
+                )
+
+            elif statistics.kind == "correlation":
+                bootstrap_samples = (
+                    self
+                    ._compute_correlation_bootstrap_samples(
+                        statistics=statistics,
+                        bootstrap_session_counts=(
+                            bootstrap_session_counts
+                        ),
+                    )
+                )
+
+            else:
+                raise ValueError(
+                    "Unknown bootstrap statistics kind: "
+                    f"{statistics.kind!r}."
+                )
+
+            expected_metric_shape = (
+                ordinary_results[
+                    metric_name
+                ].shape
+            )
+
+            if bootstrap_samples.shape[1:] != (
+                expected_metric_shape
+            ):
+                raise RuntimeError(
+                    "Bootstrap metric shape does not match the "
+                    "ordinary metric result for "
+                    f"{metric_name!r}. "
+                    f"Expected [R, "
+                    f"{expected_metric_shape[0]}, "
+                    f"{expected_metric_shape[1]}], got "
+                    f"{tuple(bootstrap_samples.shape)}."
+                )
+
+            bootstrap_summary = (
+                self._summarise_bootstrap_samples(
+                    bootstrap_samples=bootstrap_samples,
+                    confidence_level=confidence_level,
+                )
+            )
+
+            bootstrap_results[
+                metric_name
+            ] = {
+                "value": (
+                    ordinary_results[
+                        metric_name
+                    ]
+                    .detach()
+                    .cpu()
+                    .clone()
+                ),
+                **bootstrap_summary,
+            }
+
+        return bootstrap_results
 
     @staticmethod
     def _validate_prediction_result(
@@ -990,3 +1728,877 @@ class ForecastEvaluator:
                 raise ValueError(
                     f"{name} contains NaN or infinite values."
                 )
+    
+    def _get_bootstrap_session_mapping(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Validate the bootstrap session identifiers and map each
+        forecast window to a compact session position.
+
+        Returns:
+            unique_sessions:
+                Original session identifiers with shape [D].
+
+            session_inverse:
+                For every forecast window, the corresponding compact
+                session position with shape [B].
+
+                Values lie in [0, D - 1].
+
+        Here:
+            B = number of forecast windows
+            D = number of unique trading sessions
+        """
+        if self.sample_idx is None:
+            raise ValueError(
+                "Bootstrap evaluation requires prediction_result "
+                "to contain 'sample_idx'."
+            )
+
+        if not isinstance(
+            self.sample_idx,
+            torch.Tensor,
+        ):
+            raise TypeError(
+                "prediction_result['sample_idx'] must be "
+                "a torch.Tensor."
+            )
+
+        if self.sample_idx.ndim != 1:
+            raise ValueError(
+                "Expected sample_idx to have shape [B], "
+                f"got {tuple(self.sample_idx.shape)}."
+            )
+
+        expected_num_examples = (
+            self.y_pred_raw.shape[0]
+        )
+
+        if self.sample_idx.shape[0] != expected_num_examples:
+            raise ValueError(
+                "sample_idx is not aligned with the prediction "
+                "example dimension. "
+                f"Expected {expected_num_examples} entries, "
+                f"got {self.sample_idx.shape[0]}."
+            )
+
+        integer_dtypes = {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }
+
+        if self.sample_idx.dtype not in integer_dtypes:
+            raise TypeError(
+                "sample_idx must use an integer dtype, "
+                f"got {self.sample_idx.dtype}."
+            )
+
+        sample_idx = (
+            self.sample_idx
+            .detach()
+            .cpu()
+            .to(dtype=torch.long)
+        )
+
+        unique_sessions, session_inverse = torch.unique(
+            sample_idx,
+            sorted=True,
+            return_inverse=True,
+        )
+
+        if unique_sessions.numel() < 2:
+            raise ValueError(
+                "Bootstrap evaluation requires at least two "
+                "unique trading sessions."
+            )
+
+        return (
+            unique_sessions,
+            session_inverse,
+        )
+    
+    def _sum_bootstrap_values_by_session(
+        self,
+        values: torch.Tensor,
+        session_inverse: torch.Tensor,
+        num_sessions: int,
+    ) -> torch.Tensor:
+        """
+        Sum pointwise metric contributions by trading session.
+
+        Args:
+            values:
+                Pointwise values with shape [B, H, N, C].
+
+            session_inverse:
+                Compact session position for each forecast window,
+                with shape [B].
+
+            num_sessions:
+                Number of unique trading sessions D.
+
+        Returns:
+            Session-level sums with shape [D, H, C].
+        """
+        if not isinstance(values, torch.Tensor):
+            raise TypeError(
+                "Bootstrap component values must be a torch.Tensor."
+            )
+
+        expected_shape = self.y_pred_raw.shape
+
+        if values.shape != expected_shape:
+            raise ValueError(
+                "Bootstrap component tensor has an incompatible shape. "
+                f"Expected {tuple(expected_shape)}, "
+                f"got {tuple(values.shape)}."
+            )
+
+        values_cpu = (
+            values
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        # Sum over assets:
+        #
+        # [B, H, N, C] -> [ over assets:
+        #
+        # [B, H, N, C] -> [B, H, C]
+        per_window_sum = values_cpu.sum(
+            dim=2
+        )
+
+        num_horizons = values_cpu.shape[1]
+        num_channels = values_cpu.shape[3]
+
+        session_sum = torch.zeros(
+            (
+                num_sessions,
+                num_horizons,
+                num_channels,
+            ),
+            dtype=torch.float64,
+        )
+
+        session_sum.index_add_(
+            dim=0,
+            index=session_inverse,
+            source=per_window_sum,
+        )
+
+        return session_sum
+    
+    def _aggregate_bootstrap_components_by_session(
+        self,
+        components: BootstrapMetricComponents,
+    ) -> BootstrapSessionStatistics:
+        """
+        Aggregate one metric's pointwise bootstrap components into
+        complete trading-session blocks.
+
+        Session statistics are stored as sums and counts rather than
+        daily averages.
+        """
+        if not isinstance(
+            components,
+            BootstrapMetricComponents,
+        ):
+            raise TypeError(
+                "components must be a BootstrapMetricComponents "
+                "instance."
+            )
+
+        session_ids, session_inverse = (
+            self._get_bootstrap_session_mapping()
+        )
+
+        num_sessions = int(
+            session_ids.numel()
+        )
+
+        num_assets = int(
+            self.y_pred_raw.shape[2]
+        )
+
+        windows_per_session = torch.bincount(
+            session_inverse,
+            minlength=num_sessions,
+        )
+
+        # Each forecast window contributes one observation per asset
+        # for every horizon and channel.
+        observation_count = (
+            windows_per_session
+            * num_assets
+        )
+
+        value_sum = (
+            self._sum_bootstrap_values_by_session(
+                values=components.values,
+                session_inverse=session_inverse,
+                num_sessions=num_sessions,
+            )
+        )
+
+        if components.kind == "mean":
+            if components.reference_values is not None:
+                raise ValueError(
+                    "Mean bootstrap components must not contain "
+                    "reference_values."
+                )
+
+            return BootstrapSessionStatistics(
+                kind="mean",
+                session_ids=session_ids,
+                observation_count=observation_count,
+                value_sum=value_sum,
+            )
+
+        if components.reference_values is None:
+            raise ValueError(
+                f"{components.kind!r} bootstrap components require "
+                "reference_values."
+            )
+
+        reference_sum = (
+            self._sum_bootstrap_values_by_session(
+                values=components.reference_values,
+                session_inverse=session_inverse,
+                num_sessions=num_sessions,
+            )
+        )
+
+        if components.kind == "ratio":
+            return BootstrapSessionStatistics(
+                kind="ratio",
+                session_ids=session_ids,
+                observation_count=observation_count,
+                value_sum=value_sum,
+                reference_sum=reference_sum,
+            )
+
+        if components.kind == "correlation":
+            # Convert to float64 before squaring or multiplying so
+            # Pearson sufficient statistics are accumulated with
+            # consistent numerical precision.
+            correlation_values = (
+                components.values
+                .detach()
+                .cpu()
+                .to(dtype=torch.float64)
+            )
+
+            correlation_references = (
+                components.reference_values
+                .detach()
+                .cpu()
+                .to(dtype=torch.float64)
+            )
+
+            value_squared_sum = (
+                self._sum_bootstrap_values_by_session(
+                    values=correlation_values.square(),
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            reference_squared_sum = (
+                self._sum_bootstrap_values_by_session(
+                    values=correlation_references.square(),
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            cross_sum = (
+                self._sum_bootstrap_values_by_session(
+                    values=(
+                        correlation_values
+                        * correlation_references
+                    ),
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            return BootstrapSessionStatistics(
+                kind="correlation",
+                session_ids=session_ids,
+                observation_count=observation_count,
+                value_sum=value_sum,
+                reference_sum=reference_sum,
+                value_squared_sum=value_squared_sum,
+                reference_squared_sum=(
+                    reference_squared_sum
+                ),
+                cross_sum=cross_sum,
+            )
+
+        raise ValueError(
+            "Unknown bootstrap component kind: "
+            f"{components.kind!r}."
+        )
+    
+    def _generate_bootstrap_session_counts(
+        self,
+        num_sessions: int,
+        n_bootstrap: int,
+        bootstrap_seed: int,
+    ) -> torch.Tensor:
+        """
+        Generate vectorised trading-session bootstrap samples.
+
+        Each bootstrap replicate samples num_sessions complete trading
+        sessions with replacement.
+
+        Args:
+            num_sessions:
+                Number of unique trading sessions D.
+
+            n_bootstrap:
+                Number of bootstrap replicates R.
+
+            bootstrap_seed:
+                Random seed used for reproducible resampling.
+
+        Returns:
+            Float64 tensor with shape [R, D].
+
+            Each row contains the number of times each session was
+            selected in that bootstrap replicate. Every row sums to D.
+        """
+        if not isinstance(num_sessions, int):
+            raise TypeError(
+                "num_sessions must be an integer."
+            )
+
+        if num_sessions < 2:
+            raise ValueError(
+                "Bootstrap evaluation requires at least two "
+                "trading sessions."
+            )
+
+        if not isinstance(n_bootstrap, int):
+            raise TypeError(
+                "n_bootstrap must be an integer."
+            )
+
+        if n_bootstrap < 1:
+            raise ValueError(
+                "n_bootstrap must be at least 1."
+            )
+
+        if not isinstance(bootstrap_seed, int):
+            raise TypeError(
+                "bootstrap_seed must be an integer."
+            )
+
+        generator = torch.Generator(
+            device="cpu"
+        )
+
+        generator.manual_seed(
+            bootstrap_seed
+        )
+
+        # For every replicate, sample D session positions from
+        # {0, ..., D - 1}, with replacement.
+        #
+        # Shape: [R, D]
+        sampled_session_positions = torch.randint(
+            low=0,
+            high=num_sessions,
+            size=(
+                n_bootstrap,
+                num_sessions,
+            ),
+            generator=generator,
+            dtype=torch.long,
+            device="cpu",
+        )
+
+        bootstrap_session_counts = torch.zeros(
+            (
+                n_bootstrap,
+                num_sessions,
+            ),
+            dtype=torch.float64,
+            device="cpu",
+        )
+
+        bootstrap_session_counts.scatter_add_(
+            dim=1,
+            index=sampled_session_positions,
+            src=torch.ones(
+                (
+                    n_bootstrap,
+                    num_sessions,
+                ),
+                dtype=torch.float64,
+                device="cpu",
+            ),
+        )
+
+        return bootstrap_session_counts
+    
+    def _compute_mean_or_ratio_bootstrap_samples(
+        self,
+        statistics: BootstrapSessionStatistics,
+        bootstrap_session_counts: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        Reconstruct bootstrapped mean or ratio metrics from
+        session-level sufficient statistics.
+
+        Args:
+            statistics:
+                Session-level statistics for a metric whose kind is
+                either "mean" or "ratio".
+
+            bootstrap_session_counts:
+                Number of times each session appears in each bootstrap
+                replicate, with shape [R, D].
+
+            eps:
+                Minimum denominator mean required for a defined ratio.
+
+        Returns:
+            Bootstrap metric samples with shape [R, H, C].
+
+        Here:
+            R = number of bootstrap replicates
+            D = number of trading sessions
+            H = number of horizons
+            C = number of channels
+        """
+        if not isinstance(
+            statistics,
+            BootstrapSessionStatistics,
+        ):
+            raise TypeError(
+                "statistics must be a "
+                "BootstrapSessionStatistics instance."
+            )
+
+        if statistics.kind not in {
+            "mean",
+            "ratio",
+        }:
+            raise ValueError(
+                "Expected bootstrap statistics of kind "
+                f"'mean' or 'ratio', got {statistics.kind!r}."
+            )
+
+        if not isinstance(
+            bootstrap_session_counts,
+            torch.Tensor,
+        ):
+            raise TypeError(
+                "bootstrap_session_counts must be a torch.Tensor."
+            )
+
+        if bootstrap_session_counts.ndim != 2:
+            raise ValueError(
+                "Expected bootstrap_session_counts to have "
+                "shape [R, D], got "
+                f"{tuple(bootstrap_session_counts.shape)}."
+            )
+
+        num_sessions = int(
+            statistics.session_ids.numel()
+        )
+
+        if bootstrap_session_counts.shape[1] != num_sessions:
+            raise ValueError(
+                "bootstrap_session_counts is not aligned with the "
+                "session statistics. "
+                f"Expected {num_sessions} session columns, got "
+                f"{bootstrap_session_counts.shape[1]}."
+            )
+
+        if not torch.isfinite(
+            bootstrap_session_counts
+        ).all():
+            raise ValueError(
+                "bootstrap_session_counts contains NaN or "
+                "infinite values."
+            )
+
+        if torch.any(
+            bootstrap_session_counts < 0
+        ):
+            raise ValueError(
+                "bootstrap_session_counts cannot contain "
+                "negative values."
+            )
+
+        bootstrap_session_counts = (
+            bootstrap_session_counts
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        value_sum = (
+            statistics.value_sum
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        observation_count = (
+            statistics.observation_count
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        # [R, D] x [D, H, C] -> [R, H, C]
+        bootstrap_value_sum = torch.einsum(
+            "rd,dhc->rhc",
+            bootstrap_session_counts,
+            value_sum,
+        )
+
+        # [R, D] x [D] -> [R]
+        bootstrap_observation_count = (
+            bootstrap_session_counts
+            @ observation_count
+        )
+
+        if torch.any(
+            bootstrap_observation_count <= 0
+        ):
+            raise ValueError(
+                "Every bootstrap replicate must contain at least "
+                "one forecast observation."
+            )
+
+        if statistics.kind == "mean":
+            return (
+                bootstrap_value_sum
+                / bootstrap_observation_count[
+                    :,
+                    None,
+                    None,
+                ]
+            )
+
+        if statistics.reference_sum is None:
+            raise ValueError(
+                "Ratio statistics require reference_sum."
+            )
+
+        reference_sum = (
+            statistics.reference_sum
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        bootstrap_reference_sum = torch.einsum(
+            "rd,dhc->rhc",
+            bootstrap_session_counts,
+            reference_sum,
+        )
+
+        # The ordinary relative-MAE implementation checks whether
+        # Persistence MAE is greater than eps. Reproduce that rule
+        # using the resampled denominator mean.
+        bootstrap_reference_mean = (
+            bootstrap_reference_sum
+            / bootstrap_observation_count[
+                :,
+                None,
+                None,
+            ]
+        )
+
+        valid_denominator = (
+            bootstrap_reference_mean > eps
+        )
+
+        return torch.where(
+            valid_denominator,
+            bootstrap_value_sum
+            / bootstrap_reference_sum,
+            torch.full_like(
+                bootstrap_value_sum,
+                torch.nan,
+            ),
+        )
+    
+    def _compute_correlation_bootstrap_samples(
+        self,
+        statistics: BootstrapSessionStatistics,
+        bootstrap_session_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Reconstruct bootstrapped Pearson correlations from
+        session-level sufficient statistics.
+
+        Args:
+            statistics:
+                Session-level statistics with kind="correlation".
+
+            bootstrap_session_counts:
+                Number of times each trading session appears in each
+                bootstrap replicate. Shape [R, D].
+
+        Returns:
+            Pearson correlation samples with shape [R, H, C].
+
+        Shapes:
+            R = number of bootstrap replicates
+            D = number of trading sessions
+            H = number of forecast horizons
+            C = number of target channels
+        """
+        if not isinstance(
+            statistics,
+            BootstrapSessionStatistics,
+        ):
+            raise TypeError(
+                "statistics must be a "
+                "BootstrapSessionStatistics instance."
+            )
+
+        if statistics.kind != "correlation":
+            raise ValueError(
+                "Expected statistics with kind='correlation', "
+                f"got {statistics.kind!r}."
+            )
+
+        if statistics.reference_sum is None:
+            raise ValueError(
+                "Correlation statistics require reference_sum."
+            )
+
+        if statistics.value_squared_sum is None:
+            raise ValueError(
+                "Correlation statistics require value_squared_sum."
+            )
+
+        if statistics.reference_squared_sum is None:
+            raise ValueError(
+                "Correlation statistics require "
+                "reference_squared_sum."
+            )
+
+        if statistics.cross_sum is None:
+            raise ValueError(
+                "Correlation statistics require cross_sum."
+            )
+
+        if not isinstance(
+            bootstrap_session_counts,
+            torch.Tensor,
+        ):
+            raise TypeError(
+                "bootstrap_session_counts must be a torch.Tensor."
+            )
+
+        if bootstrap_session_counts.ndim != 2:
+            raise ValueError(
+                "Expected bootstrap_session_counts to have shape "
+                "[R, D], got "
+                f"{tuple(bootstrap_session_counts.shape)}."
+            )
+
+        num_sessions = int(
+            statistics.session_ids.numel()
+        )
+
+        if bootstrap_session_counts.shape[1] != num_sessions:
+            raise ValueError(
+                "bootstrap_session_counts is not aligned with the "
+                "session statistics. "
+                f"Expected {num_sessions} session columns, got "
+                f"{bootstrap_session_counts.shape[1]}."
+            )
+
+        if not torch.isfinite(
+            bootstrap_session_counts
+        ).all():
+            raise ValueError(
+                "bootstrap_session_counts contains NaN or "
+                "infinite values."
+            )
+
+        if torch.any(
+            bootstrap_session_counts < 0
+        ):
+            raise ValueError(
+                "bootstrap_session_counts cannot contain "
+                "negative values."
+            )
+
+        counts = (
+            bootstrap_session_counts
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        observation_count = (
+            statistics.observation_count
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        value_sum = (
+            statistics.value_sum
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        reference_sum = (
+            statistics.reference_sum
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        value_squared_sum = (
+            statistics.value_squared_sum
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        reference_squared_sum = (
+            statistics.reference_squared_sum
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        cross_sum = (
+            statistics.cross_sum
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        # [R, D] @ [D] -> [R]
+        bootstrap_observation_count = (
+            counts
+            @ observation_count
+        )
+
+        if torch.any(
+            bootstrap_observation_count <= 1
+        ):
+            raise ValueError(
+                "Every Pearson bootstrap replicate requires at "
+                "least two observations."
+            )
+
+        # [R, D] x [D, H, C] -> [R, H, C]
+        bootstrap_value_sum = torch.einsum(
+            "rd,dhc->rhc",
+            counts,
+            value_sum,
+        )
+
+        bootstrap_reference_sum = torch.einsum(
+            "rd,dhc->rhc",
+            counts,
+            reference_sum,
+        )
+
+        bootstrap_value_squared_sum = torch.einsum(
+            "rd,dhc->rhc",
+            counts,
+            value_squared_sum,
+        )
+
+        bootstrap_reference_squared_sum = torch.einsum(
+            "rd,dhc->rhc",
+            counts,
+            reference_squared_sum,
+        )
+
+        bootstrap_cross_sum = torch.einsum(
+            "rd,dhc->rhc",
+            counts,
+            cross_sum,
+        )
+
+        # [R] -> [R, 1, 1] for broadcasting over H and C.
+        n = bootstrap_observation_count[
+            :,
+            None,
+            None,
+        ]
+
+        numerator = (
+            n * bootstrap_cross_sum
+            - (
+                bootstrap_value_sum
+                * bootstrap_reference_sum
+            )
+        )
+
+        value_variation = (
+            n * bootstrap_value_squared_sum
+            - bootstrap_value_sum.square()
+        )
+
+        reference_variation = (
+            n * bootstrap_reference_squared_sum
+            - bootstrap_reference_sum.square()
+        )
+
+        # Theoretically these terms are non-negative. Tiny negative
+        # values may arise from floating-point cancellation.
+        value_variation = torch.clamp_min(
+            value_variation,
+            0.0,
+        )
+
+        reference_variation = torch.clamp_min(
+            reference_variation,
+            0.0,
+        )
+
+        denominator = torch.sqrt(
+            value_variation
+            * reference_variation
+        )
+
+        valid_correlation = (
+            denominator > 0
+        )
+
+        safe_denominator = torch.where(
+            valid_correlation,
+            denominator,
+            torch.ones_like(
+                denominator
+            ),
+        )
+
+        correlation = (
+            numerator
+            / safe_denominator
+        )
+
+        return torch.where(
+            valid_correlation,
+            correlation,
+            torch.full_like(
+                correlation,
+                torch.nan,
+            ),
+        )

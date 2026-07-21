@@ -68,9 +68,9 @@ models:
     head_dropout: 0.0
 
     temporal_encoding:
-      enabled: False
+      enabled: True
 
-    variable_layout: joint
+    variable_layout: per_asset
     revin: false
     revin_affine: false
     subtract_last: false
