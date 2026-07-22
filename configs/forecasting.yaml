@@ -84,3 +84,26 @@ models:
       seed: 42
       scheduler_type: type3
   
+  kronos:
+    model_id: "NeoQuasar/Kronos-small"
+    model_revision: "ac5c409a313c4eadd1ca78201322f5cadb9c34ab"
+
+    tokenizer_id: "NeoQuasar/Kronos-Tokenizer-base"
+    tokenizer_revision: "9ef143b98ee3c2488eebd85404e0c215c112b46a"
+
+    inference:
+      device: "auto"
+      dtype: "float32"
+
+      max_context: 512
+      clip: 5.0
+
+      temperature: 0.6
+      top_k: 0
+      top_p: 0.9
+      sample_count: 10
+
+      seed: 42
+      series_batch_size: 1
+      verbose: false
+  

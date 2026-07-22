@@ -1,3 +1,6 @@
 [submodule "external/ModernTCN"]
 	path = external/ModernTCN
 	url = https://github.com/luodhhh/ModernTCN.git
+[submodule "external/Kronos"]
+	path = external/Kronos
+	url = https://github.com/shiyu-coder/Kronos.git
