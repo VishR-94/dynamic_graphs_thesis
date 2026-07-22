@@ -788,6 +788,179 @@ def cross_sectional_pearson_ic(
         dim=0,
     )
 
+
+def _average_ranks_across_assets(
+    values: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Assign average ranks across the asset dimension.
+
+    Tied values receive their average rank.
+
+    Input/output shape:
+        [B, H, N, C]
+    """
+    if values.ndim != 4:
+        raise ValueError(
+            "Expected values with shape [B, H, N, C], "
+            f"got {tuple(values.shape)}."
+        )
+
+    if not torch.isfinite(values).all():
+        raise ValueError(
+            "Cannot rank values containing NaN or infinite values."
+        )
+
+    original_device = values.device
+    original_dtype = values.dtype
+
+    # [B, H, N, C] -> [B, H, C, N]
+    values_cpu = (
+        values
+        .permute(0, 1, 3, 2)
+        .contiguous()
+        .reshape(-1, values.shape[2])
+        .detach()
+        .cpu()
+        .to(dtype=torch.float64)
+    )
+
+    ranks_cpu = torch.empty_like(values_cpu)
+
+    for row_idx in range(values_cpu.shape[0]):
+        sorted_values, sorted_indices = torch.sort(
+            values_cpu[row_idx]
+        )
+
+        _, counts = torch.unique_consecutive(
+            sorted_values,
+            return_counts=True,
+        )
+
+        group_ends = counts.cumsum(dim=0)
+        group_starts = group_ends - counts
+
+        # Ranks are one-indexed. For a tied group occupying sorted
+        # positions [start, end), its average rank is:
+        # ((start + 1) + end) / 2
+        average_ranks = (
+            group_starts.to(dtype=torch.float64)
+            + group_ends.to(dtype=torch.float64)
+            + 1.0
+        ) / 2.0
+
+        sorted_ranks = torch.repeat_interleave(
+            average_ranks,
+            counts,
+        )
+
+        ranks_cpu[row_idx].scatter_(
+            dim=0,
+            index=sorted_indices,
+            src=sorted_ranks,
+        )
+
+    ranks = (
+        ranks_cpu
+        .reshape(
+            values.shape[0],
+            values.shape[1],
+            values.shape[3],
+            values.shape[2],
+        )
+        .permute(0, 1, 3, 2)
+        .contiguous()
+    )
+
+    return ranks.to(
+        device=original_device,
+        dtype=original_dtype,
+    )
+
+
+def cross_sectional_spearman_rank_ic_values(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Compute one cross-sectional Spearman Rank IC per forecast window,
+    horizon and channel.
+
+    Correlation is calculated across the asset dimension.
+
+    Input:
+        y_pred, y_true: [B, H, N, C]
+
+    Output:
+        [B, H, C]
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    if y_pred.ndim != 4:
+        raise ValueError(
+            "Expected y_pred and y_true with shape [B, H, N, C], "
+            f"got {tuple(y_pred.shape)}."
+        )
+
+    if y_pred.shape[2] < 2:
+        raise ValueError(
+            "Cross-sectional Rank IC requires at least two assets."
+        )
+
+    pred_ranks = _average_ranks_across_assets(
+        y_pred
+    )
+
+    true_ranks = _average_ranks_across_assets(
+        y_true
+    )
+
+    return cross_sectional_pearson_ic_values(
+        y_pred=pred_ranks,
+        y_true=true_ranks,
+        eps=eps,
+    )
+
+
+def cross_sectional_spearman_rank_ic(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    reduce_dims: Sequence[int] = (0, 2),
+) -> torch.Tensor:
+    """
+    Compute mean cross-sectional Spearman Rank IC.
+
+    Rank IC is calculated across assets separately for every forecast
+    window, horizon and channel, then averaged over forecast windows.
+
+    Input:
+        [B, H, N, C]
+
+    Output:
+        [H, C]
+    """
+    if tuple(reduce_dims) != (0, 2):
+        raise ValueError(
+            "cross_sectional_spearman_rank_ic currently supports "
+            "reduce_dims=(0, 2) only."
+        )
+
+    rank_ic_values = (
+        cross_sectional_spearman_rank_ic_values(
+            y_pred=y_pred,
+            y_true=y_true,
+        )
+    )
+
+    return torch.nanmean(
+        rank_ic_values,
+        dim=0,
+    )
+
 @dataclass(frozen=True)
 class BootstrapMetricComponents:
     """
@@ -1217,6 +1390,31 @@ class ForecastEvaluator:
             values=values,
         )
     
+    def _build_cumulative_log_change_cross_sectional_spearman_rank_ic_bootstrap_components(
+        self,
+    ) -> BootstrapMetricComponents:
+        """
+        Return one cross-sectional Spearman Rank IC per forecast window,
+        horizon and channel.
+
+        Values have shape [B, H, C].
+        """
+        y_pred, y_true = self.get_predictions(
+            output_space="cumulative_log_change",
+        )
+
+        values = (
+            cross_sectional_spearman_rank_ic_values(
+                y_pred=y_pred,
+                y_true=y_true,
+            )
+        )
+
+        return BootstrapMetricComponents(
+            kind="window_mean",
+            values=values,
+        )
+    
     def _build_metric_registry(
         self,
     ) -> dict[str, MetricDefinition]:
@@ -1281,6 +1479,20 @@ class ForecastEvaluator:
                     bootstrap_components=(
                         self
                         ._build_cumulative_log_change_cross_sectional_pearson_ic_bootstrap_components
+                    ),
+                )
+            ),
+
+            "cumulative_log_change_cross_sectional_spearman_rank_ic": (
+                MetricDefinition(
+                    compute=partial(
+                        self.compute_pairwise_metric,
+                        metric_fn=cross_sectional_spearman_rank_ic,
+                        output_space="cumulative_log_change",
+                    ),
+                    bootstrap_components=(
+                        self
+                        ._build_cumulative_log_change_cross_sectional_spearman_rank_ic_bootstrap_components
                     ),
                 )
             ),
