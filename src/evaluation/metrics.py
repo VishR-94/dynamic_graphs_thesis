@@ -673,6 +673,121 @@ def pearson_correlation(
 
 MetricFunction = Callable[..., torch.Tensor]
 
+def cross_sectional_pearson_ic_values(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Compute one cross-sectional Pearson IC per forecast window,
+    horizon and channel.
+
+    Correlation is calculated across the asset dimension.
+
+    Input:
+        y_pred, y_true: [B, H, N, C]
+
+    Output:
+        [B, H, C]
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    if y_pred.ndim != 4:
+        raise ValueError(
+            "Expected y_pred and y_true to have shape [B, H, N, C], "
+            f"got {tuple(y_pred.shape)}."
+        )
+
+    if y_pred.shape[2] < 2:
+        raise ValueError(
+            "Cross-sectional IC requires at least two assets."
+        )
+
+    pred_centred = (
+        y_pred
+        - y_pred.mean(
+            dim=2,
+            keepdim=True,
+        )
+    )
+
+    true_centred = (
+        y_true
+        - y_true.mean(
+            dim=2,
+            keepdim=True,
+        )
+    )
+
+    covariance_sum = (
+        pred_centred
+        * true_centred
+    ).sum(dim=2)
+
+    pred_sum_squared = (
+        pred_centred
+        .square()
+        .sum(dim=2)
+    )
+
+    true_sum_squared = (
+        true_centred
+        .square()
+        .sum(dim=2)
+    )
+
+    denominator = torch.sqrt(
+        pred_sum_squared
+        * true_sum_squared
+    )
+
+    return torch.where(
+        denominator > eps,
+        covariance_sum / denominator,
+        torch.full_like(
+            covariance_sum,
+            torch.nan,
+        ),
+    )
+
+
+def cross_sectional_pearson_ic(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    reduce_dims: Sequence[int] = (0, 2),
+) -> torch.Tensor:
+    """
+    Compute mean cross-sectional Pearson IC.
+
+    First computes correlation across assets separately for every
+    forecast window, horizon and channel, then averages over forecast
+    windows.
+
+    Input:
+        [B, H, N, C]
+
+    Output:
+        [H, C]
+    """
+    if tuple(reduce_dims) != (0, 2):
+        raise ValueError(
+            "cross_sectional_pearson_ic currently supports "
+            "reduce_dims=(0, 2) only."
+        )
+
+    ic_values = cross_sectional_pearson_ic_values(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    return torch.nanmean(
+        ic_values,
+        dim=0,
+    )
+
 @dataclass(frozen=True)
 class BootstrapMetricComponents:
     """
@@ -693,12 +808,17 @@ class BootstrapMetricComponents:
         correlation:
             values contains x.
             reference_values contains y.
+        
+        window_mean:
+            values contains one metric value per forecast window,
+            horizon and channel, with shape [B, H, C].
     """
 
     kind: Literal[
         "mean",
         "ratio",
         "correlation",
+        "window_mean",
     ]
 
     values: torch.Tensor
@@ -743,6 +863,7 @@ class BootstrapSessionStatistics:
         "mean",
         "ratio",
         "correlation",
+        "window_mean",
     ]
 
     session_ids: torch.Tensor
@@ -993,6 +1114,29 @@ class ForecastEvaluator:
             reference_values=y_true,
         )
     
+    def _build_cumulative_log_change_cross_sectional_pearson_ic_bootstrap_components(
+        self,
+    ) -> BootstrapMetricComponents:
+        """
+        Return one cross-sectional Pearson IC per forecast window,
+        horizon and channel.
+
+        Values have shape [B, H, C].
+        """
+        y_pred, y_true = self.get_predictions(
+            output_space="cumulative_log_change",
+        )
+
+        values = cross_sectional_pearson_ic_values(
+            y_pred=y_pred,
+            y_true=y_true,
+        )
+
+        return BootstrapMetricComponents(
+            kind="window_mean",
+            values=values,
+        )
+    
     def _build_mase_bootstrap_components(
         self,
         eps: float = 1e-8,
@@ -1126,6 +1270,19 @@ class ForecastEvaluator:
                 bootstrap_components=(
                     self._build_persistence_win_rate_bootstrap_components
                 ),
+            ),
+
+            "cumulative_log_change_cross_sectional_pearson_ic": (MetricDefinition(
+                    compute=partial(
+                        self.compute_pairwise_metric,
+                        metric_fn=cross_sectional_pearson_ic,
+                        output_space="cumulative_log_change",
+                    ),
+                    bootstrap_components=(
+                        self
+                        ._build_cumulative_log_change_cross_sectional_pearson_ic_bootstrap_components
+                    ),
+                )
             ),
         }
     
@@ -1549,6 +1706,7 @@ class ForecastEvaluator:
             if statistics.kind in {
                 "mean",
                 "ratio",
+                "window_mean",
             }:
                 ratio_eps = float(
                     kwargs.get(
@@ -1922,6 +2080,77 @@ class ForecastEvaluator:
             session_ids.numel()
         )
 
+        if components.kind == "window_mean":
+            if components.reference_values is not None:
+                raise ValueError(
+                    "window_mean bootstrap components must not contain "
+                    "reference_values."
+                )
+
+            expected_shape = (
+                self.y_pred_raw.shape[0],
+                self.y_pred_raw.shape[1],
+                self.y_pred_raw.shape[3],
+            )
+
+            if components.values.shape != expected_shape:
+                raise ValueError(
+                    "window_mean bootstrap values must have shape "
+                    f"[B, H, C]. Expected {expected_shape}, "
+                    f"got {tuple(components.values.shape)}."
+                )
+
+            values = (
+                components.values
+                .detach()
+                .cpu()
+                .to(dtype=torch.float64)
+            )
+
+            finite_mask = torch.isfinite(
+                values
+            )
+
+            safe_values = torch.where(
+                finite_mask,
+                values,
+                torch.zeros_like(values),
+            )
+
+            session_value_sum = torch.zeros(
+                (
+                    num_sessions,
+                    values.shape[1],
+                    values.shape[2],
+                ),
+                dtype=torch.float64,
+            )
+
+            session_observation_count = torch.zeros_like(
+                session_value_sum
+            )
+
+            session_value_sum.index_add_(
+                dim=0,
+                index=session_inverse,
+                source=safe_values,
+            )
+
+            session_observation_count.index_add_(
+                dim=0,
+                index=session_inverse,
+                source=finite_mask.to(
+                    dtype=torch.float64
+                ),
+            )
+
+            return BootstrapSessionStatistics(
+                kind="window_mean",
+                session_ids=session_ids,
+                observation_count=session_observation_count,
+                value_sum=session_value_sum,
+            )
+
         num_assets = int(
             self.y_pred_raw.shape[2]
         )
@@ -2191,6 +2420,7 @@ class ForecastEvaluator:
         if statistics.kind not in {
             "mean",
             "ratio",
+            "window_mean",
         }:
             raise ValueError(
                 "Expected bootstrap statistics of kind "
@@ -2267,6 +2497,33 @@ class ForecastEvaluator:
             bootstrap_session_counts,
             value_sum,
         )
+
+        if statistics.kind == "window_mean":
+            if observation_count.ndim != 3:
+                raise ValueError(
+                    "window_mean observation_count must have shape "
+                    "[D, H, C]."
+                )
+
+            bootstrap_observation_count = torch.einsum(
+                "rd,dhc->rhc",
+                bootstrap_session_counts,
+                observation_count,
+            )
+
+            valid_count = (
+                bootstrap_observation_count > 0
+            )
+
+            return torch.where(
+                valid_count,
+                bootstrap_value_sum
+                / bootstrap_observation_count.clamp_min(1.0),
+                torch.full_like(
+                    bootstrap_value_sum,
+                    torch.nan,
+                ),
+            )
 
         # [R, D] x [D] -> [R]
         bootstrap_observation_count = (
