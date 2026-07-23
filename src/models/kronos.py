@@ -5,12 +5,13 @@ import sys
 from contextlib import nullcontext
 from datetime import time
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from src.data.data_generator import WindowedCandleDataset
 
@@ -1134,38 +1135,11 @@ class KronosBaseline:
 
         return values
 
-    def predict(
+    def _build_prediction_dataset(
         self,
         split: SplitDict,
-        batch_size: int = 1,
-        num_workers: int = 0,
-        max_examples: int | None = None,
-    ) -> PredictionDict:
-        """
-        Generate raw close-price predictions with frozen Kronos.
-
-        Args:
-            split:
-                Cleaned project split.
-
-            batch_size:
-                Number of project forecast windows prepared together.
-                Each window contains all assets.
-
-            num_workers:
-                DataLoader workers used to fetch project windows.
-
-            max_examples:
-                Optional number of forecast windows to process. This is
-                intended for smoke tests; leave as None for a complete
-                split prediction.
-
-        Returns:
-            Common raw-space project prediction dictionary with:
-
-                y_pred: [B, H, N, 1]
-                y_true: [B, H, N, 1]
-        """
+    ) -> WindowedCandleDataset:
+        """Validate a prediction split and construct its raw dataset."""
         if not self.is_fitted:
             raise RuntimeError(
                 "Call fit(...) before Kronos prediction."
@@ -1181,21 +1155,6 @@ class KronosBaseline:
                 "Kronos asset metadata has not been resolved."
             )
 
-        if batch_size <= 0:
-            raise ValueError(
-                "batch_size must be greater than zero."
-            )
-
-        if num_workers < 0:
-            raise ValueError(
-                "num_workers must be non-negative."
-            )
-
-        if max_examples is not None and max_examples <= 0:
-            raise ValueError(
-                "max_examples must be greater than zero when set."
-            )
-
         self._validate_split(
             split=split,
             split_name="Prediction",
@@ -1207,260 +1166,510 @@ class KronosBaseline:
                 "fitted Kronos wrapper."
             )
 
-        dataset = WindowedCandleDataset.from_config(
+        return WindowedCandleDataset.from_config(
             split=split,
             config=self._dataset_config(),
             normaliser=None,
         )
 
-        loader = DataLoader(
+    def prediction_window_count(
+        self,
+        split: SplitDict,
+    ) -> int:
+        """Return the number of valid project windows in a split."""
+        dataset = self._build_prediction_dataset(split)
+        return len(dataset)
+
+    def _predict_example_batch(
+        self,
+        *,
+        example_batch: list[dict[str, Any]],
+        split: SplitDict,
+    ) -> PredictionDict:
+        """Predict one already-fetched batch of project windows."""
+        if not example_batch:
+            raise ValueError(
+                "example_batch must contain at least one window."
+            )
+
+        if self.predictor is None:
+            raise RuntimeError(
+                "The official Kronos predictor is not initialised."
+            )
+
+        if self.asset_cols is None or self.num_assets is None:
+            raise RuntimeError(
+                "Kronos asset metadata has not been resolved."
+            )
+
+        df_list: list[pd.DataFrame] = []
+        x_timestamp_list: list[pd.Series] = []
+        y_timestamp_list: list[pd.Series] = []
+
+        for example in example_batch:
+            (
+                example_dfs,
+                example_x_timestamps,
+                example_y_timestamps,
+            ) = self._build_window_predictor_inputs(
+                example=example,
+                split=split,
+            )
+            df_list.extend(example_dfs)
+            x_timestamp_list.extend(example_x_timestamps)
+            y_timestamp_list.extend(example_y_timestamps)
+
+        expected_num_series = (
+            len(example_batch) * self.num_assets
+        )
+        if len(df_list) != expected_num_series:
+            raise RuntimeError(
+                "Unexpected number of flattened Kronos series. "
+                f"Expected {expected_num_series}, received "
+                f"{len(df_list)}."
+            )
+
+        prediction_arrays: list[np.ndarray] = []
+
+        for series_start in range(
+            0,
+            expected_num_series,
+            self.series_batch_size,
+        ):
+            series_end = min(
+                series_start + self.series_batch_size,
+                expected_num_series,
+            )
+
+            try:
+                with self._inference_precision_context():
+                    prediction_frames = (
+                        self.predictor.predict_batch(
+                            df_list=df_list[
+                                series_start:series_end
+                            ],
+                            x_timestamp_list=x_timestamp_list[
+                                series_start:series_end
+                            ],
+                            y_timestamp_list=y_timestamp_list[
+                                series_start:series_end
+                            ],
+                            pred_len=self.prediction_length,
+                            T=self.temperature,
+                            top_k=self.top_k,
+                            top_p=self.top_p,
+                            sample_count=self.sample_count,
+                            verbose=self.verbose,
+                        )
+                    )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Kronos inference failed for flattened "
+                    f"series range [{series_start}, "
+                    f"{series_end}). No fallback prediction was "
+                    "used."
+                ) from exc
+
+            expected_chunk_size = series_end - series_start
+            if len(prediction_frames) != expected_chunk_size:
+                raise RuntimeError(
+                    "Kronos predict_batch returned an unexpected "
+                    "number of predictions. Expected "
+                    f"{expected_chunk_size}, received "
+                    f"{len(prediction_frames)}."
+                )
+
+            for local_index, prediction_frame in enumerate(
+                prediction_frames
+            ):
+                expected_timestamps = y_timestamp_list[
+                    series_start + local_index
+                ]
+                prediction_arrays.append(
+                    self._prediction_frame_to_array(
+                        prediction=prediction_frame,
+                        expected_timestamps=expected_timestamps,
+                    )
+                )
+
+        generated_ohlcva = torch.from_numpy(
+            np.stack(prediction_arrays, axis=0)
+        )
+
+        expected_generated_shape = (
+            expected_num_series,
+            self.prediction_length,
+            len(self.output_channels),
+        )
+        if tuple(generated_ohlcva.shape) != (
+            expected_generated_shape
+        ):
+            raise RuntimeError(
+                "Unexpected stacked Kronos output shape. Expected "
+                f"{expected_generated_shape}, received "
+                f"{tuple(generated_ohlcva.shape)}."
+            )
+
+        selected_close = generated_ohlcva[
+            :,
+            self.horizon_indices,
+            self.close_output_index,
+        ].unsqueeze(-1)
+
+        num_windows = len(example_batch)
+        y_pred = (
+            selected_close.reshape(
+                num_windows,
+                self.num_assets,
+                len(self.horizons),
+                1,
+            )
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+
+        y_true = torch.stack(
+            [example["y"].float() for example in example_batch],
+            dim=0,
+        )
+        last_context_target = torch.stack(
+            [
+                example["last_context_target"].float()
+                for example in example_batch
+            ],
+            dim=0,
+        )
+        sample_idx = torch.tensor(
+            [
+                int(example["sample_idx"])
+                for example in example_batch
+            ],
+            dtype=torch.long,
+        )
+        origin_idx = torch.tensor(
+            [
+                int(example["origin_idx"])
+                for example in example_batch
+            ],
+            dtype=torch.long,
+        )
+        target_indices = torch.stack(
+            [
+                example["target_indices"].long()
+                for example in example_batch
+            ],
+            dim=0,
+        )
+
+        expected_project_shape = (
+            num_windows,
+            len(self.horizons),
+            self.num_assets,
+            len(self.target_channels),
+        )
+        if tuple(y_pred.shape) != expected_project_shape:
+            raise RuntimeError(
+                "Unexpected project Kronos prediction shape. "
+                f"Expected {expected_project_shape}, received "
+                f"{tuple(y_pred.shape)}."
+            )
+
+        if tuple(y_true.shape) != expected_project_shape:
+            raise RuntimeError(
+                "Unexpected project Kronos target shape. Expected "
+                f"{expected_project_shape}, received "
+                f"{tuple(y_true.shape)}."
+            )
+
+        return {
+            "y_pred": y_pred.cpu(),
+            "y_true": y_true.cpu(),
+            "channels": list(self.target_channels),
+            "horizons": list(self.horizons),
+            "sample_idx": sample_idx,
+            "origin_idx": origin_idx,
+            "target_indices": target_indices.cpu(),
+            "last_context_target": last_context_target.cpu(),
+            "asset_cols": list(self.asset_cols),
+            "output_space": "raw",
+        }
+
+    def iter_prediction_batches(
+        self,
+        split: SplitDict,
+        batch_size: int = 1,
+        num_workers: int = 0,
+        start_index: int = 0,
+        max_examples: int | None = None,
+        seed_rng: bool = True,
+    ) -> Iterator[PredictionDict]:
+        """
+        Yield raw-space Kronos predictions in chronological batches.
+
+        This iterator is the resumable inference interface. It does not
+        accumulate the full split in memory and it can start at an
+        arbitrary dataset-window index.
+
+        Args:
+            split:
+                Cleaned project split.
+
+            batch_size:
+                Number of project forecast windows prepared together.
+                Each window contains all assets.
+
+            num_workers:
+                DataLoader workers used to fetch project windows.
+
+            start_index:
+                Dataset-window index at which inference begins. Dataset
+                order is unchanged; earlier windows are excluded rather
+                than iterated and discarded.
+
+            max_examples:
+                Optional maximum number of windows to yield beginning at
+                start_index. Leave as None to continue to the split end.
+
+            seed_rng:
+                When True, reset Python, NumPy and PyTorch RNGs to the
+                configured base seed immediately before inference. Use
+                True for a fresh run. For a resumed run, restore the saved
+                RNG states externally and pass False so they are not
+                overwritten.
+
+        Yields:
+            One common project prediction dictionary per DataLoader
+            batch. Tensor fields retain the standard shapes, with the
+            leading dimension equal to the number of windows in that
+            yielded batch.
+        """
+        if batch_size <= 0:
+            raise ValueError(
+                "batch_size must be greater than zero."
+            )
+
+        if num_workers < 0:
+            raise ValueError(
+                "num_workers must be non-negative."
+            )
+
+        if start_index < 0:
+            raise ValueError(
+                "start_index must be non-negative."
+            )
+
+        if max_examples is not None and max_examples <= 0:
+            raise ValueError(
+                "max_examples must be greater than zero when set."
+            )
+
+        dataset = self._build_prediction_dataset(split)
+        total_windows = len(dataset)
+
+        if start_index > total_windows:
+            raise ValueError(
+                "start_index exceeds the number of prediction "
+                f"windows. Received {start_index}; split contains "
+                f"{total_windows}."
+            )
+
+        stop_index = total_windows
+        if max_examples is not None:
+            stop_index = min(
+                total_windows,
+                start_index + max_examples,
+            )
+
+        if start_index == stop_index:
+            return
+
+        prediction_indices = range(
+            start_index,
+            stop_index,
+        )
+        prediction_subset = Subset(
             dataset,
+            prediction_indices,
+        )
+
+        # DataLoader iterator construction can draw a worker base seed.
+        # Supplying a dedicated generator isolates that bookkeeping from
+        # the global PyTorch RNG stream used by stochastic Kronos
+        # sampling. Reconstructing a loader during resume therefore does
+        # not advance the restored model-sampling RNG state.
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(self.seed)
+
+        loader = DataLoader(
+            prediction_subset,
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
             collate_fn=_identity_collate,
+            generator=loader_generator,
         )
 
-        self._set_seed()
-
-        all_y_pred: list[torch.Tensor] = []
-        all_y_true: list[torch.Tensor] = []
-        all_last_context_target: list[torch.Tensor] = []
-        all_sample_idx: list[torch.Tensor] = []
-        all_origin_idx: list[torch.Tensor] = []
-        all_target_indices: list[torch.Tensor] = []
-
-        processed_examples = 0
+        if seed_rng:
+            self._set_seed()
 
         with torch.inference_mode():
             for example_batch in loader:
-                if max_examples is not None:
-                    remaining = max_examples - processed_examples
-                    if remaining <= 0:
-                        break
-                    example_batch = example_batch[:remaining]
-
                 if not example_batch:
-                    break
+                    continue
 
-                df_list: list[pd.DataFrame] = []
-                x_timestamp_list: list[pd.Series] = []
-                y_timestamp_list: list[pd.Series] = []
-
-                for example in example_batch:
-                    (
-                        example_dfs,
-                        example_x_timestamps,
-                        example_y_timestamps,
-                    ) = self._build_window_predictor_inputs(
-                        example=example,
-                        split=split,
-                    )
-                    df_list.extend(example_dfs)
-                    x_timestamp_list.extend(example_x_timestamps)
-                    y_timestamp_list.extend(example_y_timestamps)
-
-                expected_num_series = (
-                    len(example_batch) * self.num_assets
-                )
-                if len(df_list) != expected_num_series:
-                    raise RuntimeError(
-                        "Unexpected number of flattened Kronos series. "
-                        f"Expected {expected_num_series}, received "
-                        f"{len(df_list)}."
-                    )
-
-                prediction_arrays: list[np.ndarray] = []
-
-                for series_start in range(
-                    0,
-                    expected_num_series,
-                    self.series_batch_size,
-                ):
-                    series_end = min(
-                        series_start + self.series_batch_size,
-                        expected_num_series,
-                    )
-
-                    try:
-                        with self._inference_precision_context():
-                            prediction_frames = (
-                                self.predictor.predict_batch(
-                                    df_list=df_list[
-                                        series_start:series_end
-                                    ],
-                                    x_timestamp_list=x_timestamp_list[
-                                        series_start:series_end
-                                    ],
-                                    y_timestamp_list=y_timestamp_list[
-                                        series_start:series_end
-                                    ],
-                                    pred_len=self.prediction_length,
-                                    T=self.temperature,
-                                    top_k=self.top_k,
-                                    top_p=self.top_p,
-                                    sample_count=self.sample_count,
-                                    verbose=self.verbose,
-                                )
-                            )
-                    except Exception as exc:
-                        raise RuntimeError(
-                            "Kronos inference failed for flattened "
-                            f"series range [{series_start}, "
-                            f"{series_end}). No fallback prediction was "
-                            "used."
-                        ) from exc
-
-                    expected_chunk_size = series_end - series_start
-                    if len(prediction_frames) != expected_chunk_size:
-                        raise RuntimeError(
-                            "Kronos predict_batch returned an "
-                            "unexpected number of predictions. Expected "
-                            f"{expected_chunk_size}, received "
-                            f"{len(prediction_frames)}."
-                        )
-
-                    for local_index, prediction_frame in enumerate(
-                        prediction_frames
-                    ):
-                        expected_timestamps = y_timestamp_list[
-                            series_start + local_index
-                        ]
-                        prediction_arrays.append(
-                            self._prediction_frame_to_array(
-                                prediction=prediction_frame,
-                                expected_timestamps=expected_timestamps,
-                            )
-                        )
-
-                generated_ohlcva = torch.from_numpy(
-                    np.stack(prediction_arrays, axis=0)
+                yield self._predict_example_batch(
+                    example_batch=example_batch,
+                    split=split,
                 )
 
-                expected_generated_shape = (
-                    expected_num_series,
-                    self.prediction_length,
-                    len(self.output_channels),
-                )
-                if tuple(generated_ohlcva.shape) != (
-                    expected_generated_shape
-                ):
-                    raise RuntimeError(
-                        "Unexpected stacked Kronos output shape. "
-                        f"Expected {expected_generated_shape}, received "
-                        f"{tuple(generated_ohlcva.shape)}."
-                    )
-
-                selected_close = generated_ohlcva[
-                    :,
-                    self.horizon_indices,
-                    self.close_output_index,
-                ].unsqueeze(-1)
-
-                num_windows = len(example_batch)
-                y_pred = (
-                    selected_close.reshape(
-                        num_windows,
-                        self.num_assets,
-                        len(self.horizons),
-                        1,
-                    )
-                    .permute(0, 2, 1, 3)
-                    .contiguous()
-                )
-
-                y_true = torch.stack(
-                    [example["y"].float() for example in example_batch],
-                    dim=0,
-                )
-                last_context_target = torch.stack(
-                    [
-                        example["last_context_target"].float()
-                        for example in example_batch
-                    ],
-                    dim=0,
-                )
-                sample_idx = torch.tensor(
-                    [
-                        int(example["sample_idx"])
-                        for example in example_batch
-                    ],
-                    dtype=torch.long,
-                )
-                origin_idx = torch.tensor(
-                    [
-                        int(example["origin_idx"])
-                        for example in example_batch
-                    ],
-                    dtype=torch.long,
-                )
-                target_indices = torch.stack(
-                    [
-                        example["target_indices"].long()
-                        for example in example_batch
-                    ],
-                    dim=0,
-                )
-
-                expected_project_shape = (
-                    num_windows,
-                    len(self.horizons),
-                    self.num_assets,
-                    len(self.target_channels),
-                )
-                if tuple(y_pred.shape) != expected_project_shape:
-                    raise RuntimeError(
-                        "Unexpected project Kronos prediction shape. "
-                        f"Expected {expected_project_shape}, received "
-                        f"{tuple(y_pred.shape)}."
-                    )
-
-                if tuple(y_true.shape) != expected_project_shape:
-                    raise RuntimeError(
-                        "Unexpected project Kronos target shape. "
-                        f"Expected {expected_project_shape}, received "
-                        f"{tuple(y_true.shape)}."
-                    )
-
-                all_y_pred.append(y_pred.cpu())
-                all_y_true.append(y_true.cpu())
-                all_last_context_target.append(
-                    last_context_target.cpu()
-                )
-                all_sample_idx.append(sample_idx)
-                all_origin_idx.append(origin_idx)
-                all_target_indices.append(target_indices.cpu())
-
-                processed_examples += num_windows
-
-                if (
-                    max_examples is not None
-                    and processed_examples >= max_examples
-                ):
-                    break
-
-        if not all_y_pred:
+    @staticmethod
+    def concatenate_prediction_batches(
+        prediction_batches: list[PredictionDict],
+    ) -> PredictionDict:
+        """Concatenate chronological prediction batches safely."""
+        if not prediction_batches:
             raise RuntimeError(
                 "Kronos prediction produced no examples."
             )
 
+        reference = prediction_batches[0]
+        static_keys = (
+            "channels",
+            "horizons",
+            "asset_cols",
+            "output_space",
+        )
+        tensor_keys = (
+            "y_pred",
+            "y_true",
+            "sample_idx",
+            "origin_idx",
+            "target_indices",
+            "last_context_target",
+        )
+
+        for batch_index, batch in enumerate(
+            prediction_batches[1:],
+            start=1,
+        ):
+            for key in static_keys:
+                if batch[key] != reference[key]:
+                    raise ValueError(
+                        "Prediction batches disagree for static key "
+                        f"{key!r} at batch {batch_index}."
+                    )
+
+            for key in tensor_keys:
+                if not isinstance(batch[key], torch.Tensor):
+                    raise TypeError(
+                        f"Prediction batch key {key!r} must be a "
+                        "torch.Tensor."
+                    )
+
+                if batch[key].shape[1:] != reference[key].shape[1:]:
+                    raise ValueError(
+                        "Prediction batches disagree in trailing "
+                        f"shape for key {key!r}: reference "
+                        f"{tuple(reference[key].shape)}, batch "
+                        f"{batch_index} {tuple(batch[key].shape)}."
+                    )
+
         return {
-            "y_pred": torch.cat(all_y_pred, dim=0),
-            "y_true": torch.cat(all_y_true, dim=0),
-            "channels": list(self.target_channels),
-            "horizons": list(self.horizons),
-            "sample_idx": torch.cat(all_sample_idx, dim=0),
-            "origin_idx": torch.cat(all_origin_idx, dim=0),
+            "y_pred": torch.cat(
+                [batch["y_pred"] for batch in prediction_batches],
+                dim=0,
+            ),
+            "y_true": torch.cat(
+                [batch["y_true"] for batch in prediction_batches],
+                dim=0,
+            ),
+            "channels": list(reference["channels"]),
+            "horizons": list(reference["horizons"]),
+            "sample_idx": torch.cat(
+                [batch["sample_idx"] for batch in prediction_batches],
+                dim=0,
+            ),
+            "origin_idx": torch.cat(
+                [batch["origin_idx"] for batch in prediction_batches],
+                dim=0,
+            ),
             "target_indices": torch.cat(
-                all_target_indices,
+                [
+                    batch["target_indices"]
+                    for batch in prediction_batches
+                ],
                 dim=0,
             ),
             "last_context_target": torch.cat(
-                all_last_context_target,
+                [
+                    batch["last_context_target"]
+                    for batch in prediction_batches
+                ],
                 dim=0,
             ),
-            "asset_cols": list(self.asset_cols),
-            "output_space": "raw",
+            "asset_cols": list(reference["asset_cols"]),
+            "output_space": str(reference["output_space"]),
         }
+
+    def predict(
+        self,
+        split: SplitDict,
+        batch_size: int = 1,
+        num_workers: int = 0,
+        max_examples: int | None = None,
+        start_index: int = 0,
+        seed_rng: bool = True,
+    ) -> PredictionDict:
+        """
+        Generate and accumulate raw close-price Kronos predictions.
+
+        This preserves the existing project API. Resumable callers should
+        prefer iter_prediction_batches(...) so completed windows can be
+        checkpointed without waiting for the full split to finish.
+
+        Args:
+            split:
+                Cleaned project split.
+
+            batch_size:
+                Number of project forecast windows prepared together.
+                Each window contains all assets.
+
+            num_workers:
+                DataLoader workers used to fetch project windows.
+
+            max_examples:
+                Optional number of forecast windows to process beginning
+                at start_index. Leave as None for every remaining window.
+
+            start_index:
+                Dataset-window index at which prediction begins.
+
+            seed_rng:
+                Reset inference RNGs to the configured base seed when
+                True. A resumed caller that has restored saved RNG states
+                must pass False.
+
+        Returns:
+            Common raw-space project prediction dictionary with:
+
+                y_pred: [B, H, N, 1]
+                y_true: [B, H, N, 1]
+        """
+        prediction_batches = list(
+            self.iter_prediction_batches(
+                split=split,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                start_index=start_index,
+                max_examples=max_examples,
+                seed_rng=seed_rng,
+            )
+        )
+
+        return self.concatenate_prediction_batches(
+            prediction_batches
+        )
+
 
 
