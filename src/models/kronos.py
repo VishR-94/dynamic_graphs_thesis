@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import sys
+from contextlib import nullcontext
 from datetime import time
 from pathlib import Path
 from typing import Any
@@ -233,10 +234,15 @@ class KronosBaseline:
                 f"'cuda:0'. Received {self.requested_device!r}."
             )
 
-        if self.dtype != "float32":
+        supported_dtypes = {
+            "float32",
+            "float16",
+        }
+
+        if self.dtype not in supported_dtypes:
             raise ValueError(
-                "Only dtype='float32' is currently supported, "
-                "matching the official Kronos predictor."
+                "dtype must be either 'float32' or 'float16'. "
+                f"Received {self.dtype!r}."
             )
 
         if self.max_context <= 0:
@@ -355,6 +361,41 @@ class KronosBaseline:
             return "mps"
 
         return "cpu"
+
+    def _inference_precision_context(self) -> Any:
+        """
+        Return the precision context used for official inference.
+
+        float32:
+            No autocast. This reproduces the existing reference path.
+
+        float16:
+            CUDA automatic mixed precision. Model and tokenizer
+            parameters remain stored in float32, while eligible CUDA
+            operations execute in float16. Numerically sensitive
+            operations remain in float32 according to PyTorch's
+            autocast policy.
+        """
+        if self.dtype == "float32":
+            return nullcontext()
+
+        if self.device is None:
+            raise RuntimeError(
+                "Kronos device has not been resolved. Call fit(...) "
+                "before requesting the inference precision context."
+            )
+
+        if not self.device.startswith("cuda"):
+            raise RuntimeError(
+                "dtype='float16' is supported only for CUDA Kronos "
+                "inference. Resolved device: "
+                f"{self.device!r}."
+            )
+
+        return torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+        )
 
     def _validate_split(
         self,
@@ -982,6 +1023,15 @@ class KronosBaseline:
 
         resolved_device = self._resolve_device()
 
+        if (
+            self.dtype == "float16"
+            and not resolved_device.startswith("cuda")
+        ):
+            raise RuntimeError(
+                "dtype='float16' requires CUDA. Resolved device: "
+                f"{resolved_device!r}."
+            )
+
         (
             Kronos,
             KronosPredictor,
@@ -1233,25 +1283,26 @@ class KronosBaseline:
                     )
 
                     try:
-                        prediction_frames = (
-                            self.predictor.predict_batch(
-                                df_list=df_list[
-                                    series_start:series_end
-                                ],
-                                x_timestamp_list=x_timestamp_list[
-                                    series_start:series_end
-                                ],
-                                y_timestamp_list=y_timestamp_list[
-                                    series_start:series_end
-                                ],
-                                pred_len=self.prediction_length,
-                                T=self.temperature,
-                                top_k=self.top_k,
-                                top_p=self.top_p,
-                                sample_count=self.sample_count,
-                                verbose=self.verbose,
+                        with self._inference_precision_context():
+                            prediction_frames = (
+                                self.predictor.predict_batch(
+                                    df_list=df_list[
+                                        series_start:series_end
+                                    ],
+                                    x_timestamp_list=x_timestamp_list[
+                                        series_start:series_end
+                                    ],
+                                    y_timestamp_list=y_timestamp_list[
+                                        series_start:series_end
+                                    ],
+                                    pred_len=self.prediction_length,
+                                    T=self.temperature,
+                                    top_k=self.top_k,
+                                    top_p=self.top_p,
+                                    sample_count=self.sample_count,
+                                    verbose=self.verbose,
+                                )
                             )
-                        )
                     except Exception as exc:
                         raise RuntimeError(
                             "Kronos inference failed for flattened "
@@ -1411,4 +1462,5 @@ class KronosBaseline:
             "asset_cols": list(self.asset_cols),
             "output_space": "raw",
         }
+
 

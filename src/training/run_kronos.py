@@ -81,6 +81,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Override models.kronos.inference.device.",
     )
     parser.add_argument(
+        "--dtype",
+        choices=("float32", "float16"),
+        default=None,
+        help=(
+            "Override models.kronos.inference.dtype. float16 uses "
+            "CUDA automatic mixed precision and therefore requires "
+            "a CUDA device."
+        ),
+    )
+    parser.add_argument(
         "--sample-count",
         type=int,
         default=None,
@@ -206,6 +216,7 @@ def apply_cli_overrides(
 
     overrides = {
         "device": args.device,
+        "dtype": args.dtype,
         "sample_count": args.sample_count,
         "series_batch_size": args.series_batch_size,
         "temperature": args.temperature,
@@ -274,6 +285,45 @@ def git_revision(path: Path) -> str | None:
         return None
 
     return result.stdout.strip()
+
+
+def first_parameter_dtype(module: Any) -> str | None:
+    """Return the dtype of the first parameter in a module."""
+    if module is None:
+        return None
+
+    try:
+        parameter = next(module.parameters())
+    except StopIteration:
+        return None
+
+    return str(parameter.dtype).removeprefix("torch.")
+
+
+def cuda_memory_snapshot(
+    device: torch.device,
+) -> dict[str, float | str]:
+    """Return current and peak CUDA memory statistics in GiB."""
+    properties = torch.cuda.get_device_properties(device)
+
+    return {
+        "gpu_name": properties.name,
+        "gpu_total_memory_gib": (
+            properties.total_memory / (1024 ** 3)
+        ),
+        "cuda_memory_allocated_gib": (
+            torch.cuda.memory_allocated(device) / (1024 ** 3)
+        ),
+        "cuda_memory_reserved_gib": (
+            torch.cuda.memory_reserved(device) / (1024 ** 3)
+        ),
+        "cuda_peak_memory_allocated_gib": (
+            torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        ),
+        "cuda_peak_memory_reserved_gib": (
+            torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+        ),
+    }
 
 
 def build_output_paths(
@@ -432,6 +482,7 @@ def main() -> None:
         {
             "split": args.evaluation_split,
             "device": model.device,
+            "dtype": model.dtype,
             "sample_count": model.sample_count,
             "series_batch_size": model.series_batch_size,
             "window_batch_size": args.window_batch_size,
@@ -440,16 +491,41 @@ def main() -> None:
         },
     )
 
+    cuda_device: torch.device | None = None
+    cuda_memory_before_prediction: dict[str, float | str] | None = None
+    cuda_memory_after_prediction: dict[str, float | str] | None = None
+
+    if model.device is not None and model.device.startswith("cuda"):
+        cuda_device = torch.device(model.device)
+
+        torch.cuda.synchronize(cuda_device)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(cuda_device)
+
+        cuda_memory_before_prediction = cuda_memory_snapshot(
+            cuda_device
+        )
+
     prediction_start = perf_counter()
+
     prediction_result = model.predict(
         split=prediction_split,
         batch_size=args.window_batch_size,
         num_workers=args.num_workers,
         max_examples=args.max_examples,
     )
+
+    if cuda_device is not None:
+        torch.cuda.synchronize(cuda_device)
+
     prediction_seconds = (
         perf_counter() - prediction_start
     )
+
+    if cuda_device is not None:
+        cuda_memory_after_prediction = cuda_memory_snapshot(
+            cuda_device
+        )
 
     summary = prediction_summary(
         prediction_result
@@ -467,6 +543,23 @@ def main() -> None:
         "tokenizer_revision": model.tokenizer_revision,
         "device": model.device,
         "dtype": model.dtype,
+        "precision_mode": (
+            "cuda_autocast_float16"
+            if model.dtype == "float16"
+            else "full_float32"
+        ),
+        "model_parameter_dtype": first_parameter_dtype(
+            model.model
+        ),
+        "tokenizer_parameter_dtype": first_parameter_dtype(
+            model.tokenizer
+        ),
+        "cuda_memory_before_prediction": (
+            cuda_memory_before_prediction
+        ),
+        "cuda_memory_after_prediction": (
+            cuda_memory_after_prediction
+        ),
         "context_length": model.context_length,
         "horizons": model.horizons,
         "input_channels": model.input_channels,
@@ -541,6 +634,42 @@ def main() -> None:
         "prediction seconds:",
         round(prediction_seconds, 3),
     )
+
+    if cuda_memory_after_prediction is not None:
+        print(
+            "CUDA peak allocated GiB:",
+            round(
+                float(
+                    cuda_memory_after_prediction[
+                        "cuda_peak_memory_allocated_gib"
+                    ]
+                ),
+                3,
+            ),
+        )
+        print(
+            "CUDA peak reserved GiB:",
+            round(
+                float(
+                    cuda_memory_after_prediction[
+                        "cuda_peak_memory_reserved_gib"
+                    ]
+                ),
+                3,
+            ),
+        )
+        print(
+            "GPU total memory GiB:",
+            round(
+                float(
+                    cuda_memory_after_prediction[
+                        "gpu_total_memory_gib"
+                    ]
+                ),
+                3,
+            ),
+        )
+
     print("saved predictions:", prediction_path)
     print("saved metadata:", metadata_path)
     print("KRONOS CACHED INFERENCE RUN PASSED")
