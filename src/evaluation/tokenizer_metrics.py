@@ -17,6 +17,7 @@ def plot_tokenizer_reconstruction(
     asset: str | None = None,
     day: str | pd.Timestamp | int | None = None,
     channel: str = "close",
+    reconstruction: str = "both",
     random_seed: int | None = None,
 ) -> tuple[Figure, Axes, dict[str, Any]]:
     """Plot an original intraday channel against its reconstruction.
@@ -39,13 +40,52 @@ def plot_tokenizer_reconstruction(
         channel:
             One of open, high, low, close, or volume.
 
+        reconstruction:
+            Reconstruction series to display:
+
+                "full"
+                "coarse"
+                "both"
+
         random_seed:
-            Optional reproducibility seed. With None, a different
-            random day or asset is selected on each call.
+            Optional reproducibility seed. When None, omitted day and
+            asset values are selected randomly on every call.
 
     Returns:
-        Figure, axis, and selected day/asset/channel metadata.
+        Figure, axis and metadata describing the selected plot.
     """
+    valid_reconstruction_modes = {
+        "full",
+        "coarse",
+        "both",
+    }
+
+    if reconstruction not in valid_reconstruction_modes:
+        raise ValueError(
+            "reconstruction must be one of "
+            f"{sorted(valid_reconstruction_modes)}. "
+            f"Received {reconstruction!r}."
+        )
+
+    required_decoded_keys = {
+        "decoded_full",
+        "decoded_coarse",
+        "valid_mask",
+        "dates",
+        "asset_cols",
+        "channels",
+    }
+
+    missing_keys = (
+        required_decoded_keys - set(decoded_data)
+    )
+
+    if missing_keys:
+        raise KeyError(
+            "decoded_data is missing required keys: "
+            f"{sorted(missing_keys)}."
+        )
+
     decoded_channels = list(
         decoded_data["channels"]
     )
@@ -74,8 +114,15 @@ def plot_tokenizer_reconstruction(
         )
 
     samples = list(split["samples"])
-    decoded = torch.as_tensor(
-        decoded_data["decoded"]
+
+    decoded_full = torch.as_tensor(
+        decoded_data["decoded_full"],
+        dtype=torch.float32,
+    )
+
+    decoded_coarse = torch.as_tensor(
+        decoded_data["decoded_coarse"],
+        dtype=torch.float32,
     )
 
     valid_mask = torch.as_tensor(
@@ -83,9 +130,15 @@ def plot_tokenizer_reconstruction(
         dtype=torch.bool,
     )
 
-    if decoded.ndim != 4:
+    if decoded_full.shape != decoded_coarse.shape:
         raise ValueError(
-            "decoded must have shape [S, T, N, C]."
+            "decoded_full and decoded_coarse must have the "
+            "same shape."
+        )
+
+    if decoded_full.ndim != 4:
+        raise ValueError(
+            "Decoded tensors must have shape [S, T, N, C]."
         )
 
     (
@@ -93,7 +146,20 @@ def plot_tokenizer_reconstruction(
         num_bars,
         num_assets,
         num_channels,
-    ) = decoded.shape
+    ) = decoded_full.shape
+
+    expected_valid_mask_shape = (
+        num_sessions,
+        num_bars,
+    )
+
+    if tuple(valid_mask.shape) != (
+        expected_valid_mask_shape
+    ):
+        raise ValueError(
+            "valid_mask must have shape [S, T]. "
+            f"Received {tuple(valid_mask.shape)}."
+        )
 
     if num_sessions != len(samples):
         raise ValueError(
@@ -107,15 +173,8 @@ def plot_tokenizer_reconstruction(
 
     if num_channels != len(decoded_channels):
         raise ValueError(
-            "Decoded channel metadata does not match its tensor."
-        )
-
-    if tuple(valid_mask.shape) != (
-        num_sessions,
-        num_bars,
-    ):
-        raise ValueError(
-            "valid_mask must have shape [S, T]."
+            "Decoded channel metadata does not match the "
+            "decoded tensor."
         )
 
     split_dates = [
@@ -135,6 +194,10 @@ def plot_tokenizer_reconstruction(
 
     rng = random.Random(random_seed)
 
+    # --------------------------------------------------------
+    # Select the session.
+    # --------------------------------------------------------
+
     if day is None:
         session_idx = rng.randrange(
             num_sessions
@@ -145,7 +208,7 @@ def plot_tokenizer_reconstruction(
 
         if not 0 <= session_idx < num_sessions:
             raise IndexError(
-                f"day index must be between 0 and "
+                "day index must lie between 0 and "
                 f"{num_sessions - 1}."
             )
 
@@ -154,25 +217,30 @@ def plot_tokenizer_reconstruction(
             day
         ).normalize()
 
-        matches = [
+        matching_indices = [
             idx
             for idx, date in enumerate(split_dates)
             if date == requested_date
         ]
 
-        if len(matches) != 1:
+        if len(matching_indices) != 1:
             raise ValueError(
                 f"Expected one session for "
                 f"{requested_date.date()}, found "
-                f"{len(matches)}."
+                f"{len(matching_indices)}."
             )
 
-        session_idx = matches[0]
+        session_idx = matching_indices[0]
+
+    # --------------------------------------------------------
+    # Select the asset.
+    # --------------------------------------------------------
 
     if asset is None:
         asset_idx = rng.randrange(
             num_assets
         )
+
         selected_asset = split_assets[
             asset_idx
         ]
@@ -199,9 +267,17 @@ def plot_tokenizer_reconstruction(
         dtype=torch.float32,
     )
 
-    if x_day.shape[0] != num_bars:
+    expected_original_shape = (
+        num_bars,
+        num_assets,
+        len(split_channels),
+    )
+
+    if tuple(x_day.shape) != expected_original_shape:
         raise ValueError(
-            "Original and decoded bar counts do not match."
+            "Unexpected original session shape: "
+            f"{tuple(x_day.shape)}. Expected "
+            f"{expected_original_shape}."
         )
 
     split_channel_idx = split_channels.index(
@@ -222,8 +298,19 @@ def plot_tokenizer_reconstruction(
         .numpy()
     )
 
-    decoded_values = (
-        decoded[
+    full_values = (
+        decoded_full[
+            session_idx,
+            :,
+            asset_idx,
+            decoded_channel_idx,
+        ]
+        .cpu()
+        .numpy()
+    )
+
+    coarse_values = (
+        decoded_coarse[
             session_idx,
             :,
             asset_idx,
@@ -238,6 +325,15 @@ def plot_tokenizer_reconstruction(
         .cpu()
         .numpy()
     )
+
+    if not selected_valid_mask.any():
+        raise ValueError(
+            "The selected session contains no valid decoded bars."
+        )
+
+    # --------------------------------------------------------
+    # Reconstruct timestamps when they are absent.
+    # --------------------------------------------------------
 
     if sample_timestamps is None:
         timestamps = pd.date_range(
@@ -257,6 +353,20 @@ def plot_tokenizer_reconstruction(
             sample_timestamps
         )
 
+        if len(timestamps) != num_bars:
+            raise ValueError(
+                "Timestamp count does not match the number of "
+                "session bars."
+            )
+
+    valid_timestamps = timestamps[
+        selected_valid_mask
+    ]
+
+    # --------------------------------------------------------
+    # Plot.
+    # --------------------------------------------------------
+
     figure, axis = plt.subplots(
         figsize=(14, 5)
     )
@@ -265,18 +375,34 @@ def plot_tokenizer_reconstruction(
         timestamps,
         true_values,
         color="black",
-        linewidth=1.4,
+        linewidth=1.5,
         label="True",
-        zorder=1,
+        zorder=3,
     )
 
-    axis.plot(
-        timestamps[selected_valid_mask],
-        decoded_values[selected_valid_mask],
-        linewidth=1.2,
-        label="Decoded",
-        zorder=2,
-    )
+    if reconstruction in {
+        "coarse",
+        "both",
+    }:
+        axis.plot(
+            valid_timestamps,
+            coarse_values[selected_valid_mask],
+            linewidth=1.1,
+            label="Coarse reconstruction",
+            zorder=1,
+        )
+
+    if reconstruction in {
+        "full",
+        "both",
+    }:
+        axis.plot(
+            valid_timestamps,
+            full_values[selected_valid_mask],
+            linewidth=1.2,
+            label="Full reconstruction",
+            zorder=2,
+        )
 
     axis.set_title(
         f"{selected_asset} — "
@@ -292,17 +418,23 @@ def plot_tokenizer_reconstruction(
     figure.autofmt_xdate()
     figure.tight_layout()
 
+    valid_bar_indices = torch.nonzero(
+        valid_mask[session_idx],
+        as_tuple=False,
+    ).flatten()
+
     selection = {
         "session_idx": session_idx,
         "date": selected_date,
         "asset": selected_asset,
         "asset_idx": asset_idx,
         "channel": channel,
+        "reconstruction": reconstruction,
         "first_valid_bar": int(
-            torch.nonzero(
-                valid_mask[session_idx],
-                as_tuple=False,
-            )[0].item()
+            valid_bar_indices[0].item()
+        ),
+        "last_valid_bar": int(
+            valid_bar_indices[-1].item()
         ),
     }
 

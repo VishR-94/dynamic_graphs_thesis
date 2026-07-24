@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Sequence, Mapping
 from tqdm.auto import tqdm
 import numpy as np
 import torch
+import math
 
 from src.models.kronos import (
     KRONOS_INPUT_CHANNELS,
@@ -537,6 +538,277 @@ class KronosTokenizerAdapter:
 
         return decoded_ohlcv
 
+    def decode_coarse(
+        self,
+        token_batch: KronosTokenBatch,
+        *,
+        series_batch_size: int | None = None,
+    ) -> torch.Tensor:
+        """Decode coarse token IDs back to raw OHLCV space.
+
+        This follows the tokenizer's trained coarse-only reconstruction
+        branch:
+
+            s1 IDs
+            -> 10-bit bipolar coarse code
+            -> post_quant_embed_pre
+            -> shared decoder
+            -> reconstructed OHLCVA
+            -> inverse normalisation
+            -> reconstructed OHLCV
+
+        Args:
+            token_batch:
+                Tokens and normalisation statistics returned by
+                ``tokenize()``.
+
+            series_batch_size:
+                Optional number of independent asset-window series
+                decoded together.
+
+        Returns:
+            Coarse-only reconstructed OHLCV with shape [B, T, N, 5].
+        """
+        if self._tokenizer is None:
+            raise RuntimeError(
+                "Call load() before decode_coarse()."
+            )
+
+        if not isinstance(token_batch, KronosTokenBatch):
+            raise TypeError(
+                "token_batch must be a KronosTokenBatch."
+            )
+
+        token_ids = token_batch.token_ids
+        mean = token_batch.mean
+        std = token_batch.std
+
+        if token_ids.ndim != 4 or token_ids.shape[-1] != 2:
+            raise ValueError(
+                "token_ids must have shape [B, T, N, 2]. "
+                f"Received {tuple(token_ids.shape)}."
+            )
+
+        batch_size, seq_len, num_assets, _ = (
+            token_ids.shape
+        )
+
+        expected_stats_shape = (
+            batch_size,
+            num_assets,
+            6,
+        )
+
+        if tuple(mean.shape) != expected_stats_shape:
+            raise ValueError(
+                "mean must have shape [B, N, 6]. "
+                f"Received {tuple(mean.shape)}."
+            )
+
+        if tuple(std.shape) != expected_stats_shape:
+            raise ValueError(
+                "std must have shape [B, N, 6]. "
+                f"Received {tuple(std.shape)}."
+            )
+
+        if not torch.isfinite(mean).all():
+            raise ValueError(
+                "mean contains NaN or infinite values."
+            )
+
+        if not torch.isfinite(std).all():
+            raise ValueError(
+                "std contains NaN or infinite values."
+            )
+
+        effective_batch_size = (
+            self.series_batch_size
+            if series_batch_size is None
+            else int(series_batch_size)
+        )
+
+        if effective_batch_size <= 0:
+            raise ValueError(
+                "series_batch_size must be greater than zero."
+            )
+
+        # [B, T, N] -> [B*N, T]
+        coarse = (
+            token_ids[..., 0]
+            .permute(0, 2, 1)
+            .contiguous()
+            .reshape(
+                batch_size * num_assets,
+                seq_len,
+            )
+            .cpu()
+            .long()
+        )
+
+        tokenizer_parameter = next(
+            self._tokenizer.parameters()
+        )
+
+        tokenizer_device = tokenizer_parameter.device
+        tokenizer_dtype = tokenizer_parameter.dtype
+
+        s1_bits = int(
+            self._tokenizer.s1_bits
+        )
+
+        codebook_dim = int(
+            self._tokenizer.codebook_dim
+        )
+
+        bit_mask = (
+            2
+            ** torch.arange(
+                s1_bits,
+                device=tokenizer_device,
+                dtype=torch.long,
+            )
+        )
+
+        decoded_parts: list[torch.Tensor] = []
+
+        with torch.inference_mode():
+            for start in range(
+                0,
+                coarse.shape[0],
+                effective_batch_size,
+            ):
+                stop = min(
+                    start + effective_batch_size,
+                    coarse.shape[0],
+                )
+
+                coarse_batch = coarse[
+                    start:stop
+                ].to(tokenizer_device)
+
+                # Recover the 10 coarse BSQ bits using the same
+                # least-significant-bit-first ordering as the
+                # official tokenizer.
+                quantized_coarse = (
+                    (
+                        coarse_batch.unsqueeze(-1)
+                        & bit_mask
+                    )
+                    != 0
+                ).to(tokenizer_dtype)
+
+                # {0, 1} -> {-1, 1}
+                quantized_coarse = (
+                    quantized_coarse * 2.0 - 1.0
+                )
+
+                # The tokenizer scales the complete 20-bit code by
+                # 1 / sqrt(codebook_dim). The coarse branch receives
+                # the first 10 components with the same scaling.
+                quantized_coarse = (
+                    quantized_coarse
+                    / math.sqrt(codebook_dim)
+                )
+
+                decoded_normalised = (
+                    self._tokenizer
+                    .post_quant_embed_pre(
+                        quantized_coarse
+                    )
+                )
+
+                for layer in self._tokenizer.decoder:
+                    decoded_normalised = layer(
+                        decoded_normalised
+                    )
+
+                decoded_normalised = (
+                    self._tokenizer.head(
+                        decoded_normalised
+                    )
+                )
+
+                decoded_parts.append(
+                    decoded_normalised
+                    .detach()
+                    .cpu()
+                    .to(torch.float32)
+                )
+
+        decoded_normalised = torch.cat(
+            decoded_parts,
+            dim=0,
+        )
+
+        expected_decoded_shape = (
+            batch_size * num_assets,
+            seq_len,
+            6,
+        )
+
+        if tuple(decoded_normalised.shape) != (
+            expected_decoded_shape
+        ):
+            raise RuntimeError(
+                "Unexpected coarse decoded shape: "
+                f"{tuple(decoded_normalised.shape)}. "
+                f"Expected {expected_decoded_shape}."
+            )
+
+        flat_mean = (
+            mean.detach()
+            .cpu()
+            .to(torch.float32)
+            .reshape(
+                batch_size * num_assets,
+                6,
+            )
+        )
+
+        flat_std = (
+            std.detach()
+            .cpu()
+            .to(torch.float32)
+            .reshape(
+                batch_size * num_assets,
+                6,
+            )
+        )
+
+        decoded_raw = (
+            decoded_normalised
+            * (flat_std[:, None, :] + self.eps)
+            + flat_mean[:, None, :]
+        )
+
+        # [B*N, T, 6] -> [B, T, N, 6]
+        decoded_raw = (
+            decoded_raw
+            .reshape(
+                batch_size,
+                num_assets,
+                seq_len,
+                6,
+            )
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+
+        # Remove the synthetic Amount channel.
+        decoded_ohlcv = (
+            decoded_raw[..., :5]
+            .contiguous()
+        )
+
+        if not torch.isfinite(decoded_ohlcv).all():
+            raise RuntimeError(
+                "Coarse decoded OHLCV contains NaN or "
+                "infinite values."
+            )
+
+        return decoded_ohlcv
+
+
 def encode_causal_split(
     tokenizer: KronosTokenizerAdapter,
     split: Mapping[str, Any],
@@ -977,13 +1249,21 @@ def decode_causal_split(
             "Unexpected context_std shape."
         )
 
-    decoded = torch.full(
-        (
-            num_sessions,
-            num_bars,
-            num_assets,
-            len(KRONOS_INPUT_CHANNELS),
-        ),
+    decoded_shape = (
+        num_sessions,
+        num_bars,
+        num_assets,
+        len(KRONOS_INPUT_CHANNELS),
+    )
+
+    decoded_full = torch.full(
+        decoded_shape,
+        fill_value=float("nan"),
+        dtype=torch.float32,
+    )
+
+    decoded_coarse = torch.full(
+        decoded_shape,
         fill_value=float("nan"),
         dtype=torch.float32,
     )
@@ -1034,32 +1314,55 @@ def decode_causal_split(
                 ],
             )
 
-            decoded_contexts = tokenizer.decode(
+            decoded_full_contexts = tokenizer.decode(
                 token_batch,
                 series_batch_size=series_batch_size,
+            )
+
+            decoded_coarse_contexts = (
+                tokenizer.decode_coarse(
+                    token_batch,
+                    series_batch_size=series_batch_size,
+                )
             )
 
             batch_origins = origin_indices[
                 start:stop
             ]
 
-            # Retain only the final causal reconstruction.
-            decoded[
+            # Each stored bar receives only the final reconstruction
+            # from its own trailing 60-bar causal context.
+            decoded_full[
                 session_idx,
                 batch_origins,
-            ] = decoded_contexts[:, -1]
+            ] = decoded_full_contexts[:, -1]
+
+            decoded_coarse[
+                session_idx,
+                batch_origins,
+            ] = decoded_coarse_contexts[:, -1]
 
     if not torch.isfinite(
-        decoded[valid_mask]
+        decoded_full[valid_mask]
     ).all():
         raise RuntimeError(
-            "Valid decoded positions contain non-finite values."
+            "Valid full-decoded positions contain non-finite "
+            "values."
+        )
+
+    if not torch.isfinite(
+        decoded_coarse[valid_mask]
+    ).all():
+        raise RuntimeError(
+            "Valid coarse-decoded positions contain non-finite "
+            "values."
         )
 
     return {
-        "format_version": 1,
+        "format_version": 2,
         "kind": "kronos_causal_reconstruction",
-        "decoded": decoded,
+        "decoded_full": decoded_full,
+        "decoded_coarse": decoded_coarse,
         "valid_mask": valid_mask.clone(),
         "origin_indices": origin_indices.clone(),
         "dates": list(encoded_data["dates"]),
@@ -1067,6 +1370,10 @@ def decode_causal_split(
             encoded_data["asset_cols"]
         ),
         "channels": list(KRONOS_INPUT_CHANNELS),
+        "reconstruction_modes": [
+            "coarse",
+            "full",
+        ],
         "context_length": context_length,
         "num_bars": num_bars,
         "zero_amount": True,
