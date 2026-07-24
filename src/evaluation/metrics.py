@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from functools import partial
 import torch
-from torchmetrics.functional.regression import pearson_corrcoef
 from src.evaluation.prediction_transforms import (
     raw_to_cumulative_log_change,
 )
@@ -643,7 +642,34 @@ def pearson_correlation(
     y_true: torch.Tensor,
     reduce_dims: Sequence[int] = (0, 2),
 ) -> torch.Tensor:
-    validate_prediction_shapes(y_pred, y_true)
+    """
+    Compute pooled Pearson correlation in cumulative log-change space.
+
+    For each horizon and channel, observations are pooled across
+    forecast windows and assets:
+
+        [B, H, N, C] -> [B * N, H * C]
+
+    Correlation is then calculated separately for each horizon-channel
+    column.
+
+    Inputs are converted to float64 before centring and accumulation to
+    avoid incorrectly treating small but non-zero intraday return
+    variation as zero.
+
+    Output:
+        [H, C]
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    if y_pred.ndim != 4:
+        raise ValueError(
+            "Expected y_pred and y_true to have shape "
+            f"[B, H, N, C], got {tuple(y_pred.shape)}."
+        )
 
     if tuple(reduce_dims) != (0, 2):
         raise ValueError(
@@ -651,25 +677,277 @@ def pearson_correlation(
             "reduce_dims=(0, 2) only."
         )
 
-    batch_size, num_horizons, num_assets, num_channels = y_pred.shape
+    batch_size, num_horizons, num_assets, num_channels = (
+        y_pred.shape
+    )
 
-    # [B, H, N, C] -> [B*N, H*C]
+    # [B, H, N, C] -> [B * N, H * C]
     pred_flat = (
-        y_pred.permute(0, 2, 1, 3)
-        .reshape(batch_size * num_assets, -1)
+        y_pred
+        .permute(0, 2, 1, 3)
+        .reshape(
+            batch_size * num_assets,
+            num_horizons * num_channels,
+        )
+        .to(dtype=torch.float64)
     )
 
     true_flat = (
-        y_true.permute(0, 2, 1, 3)
-        .reshape(batch_size * num_assets, -1)
+        y_true
+        .permute(0, 2, 1, 3)
+        .reshape(
+            batch_size * num_assets,
+            num_horizons * num_channels,
+        )
+        .to(dtype=torch.float64)
     )
 
-    correlations = pearson_corrcoef(
-        pred_flat,
-        true_flat,
+    pred_centred = (
+        pred_flat
+        - pred_flat.mean(
+            dim=0,
+            keepdim=True,
+        )
     )
 
-    return correlations.reshape(num_horizons, num_channels)
+    true_centred = (
+        true_flat
+        - true_flat.mean(
+            dim=0,
+            keepdim=True,
+        )
+    )
+
+    covariance_sum = (
+        pred_centred
+        * true_centred
+    ).sum(dim=0)
+
+    pred_sum_squared = (
+        pred_centred
+        .square()
+        .sum(dim=0)
+    )
+
+    true_sum_squared = (
+        true_centred
+        .square()
+        .sum(dim=0)
+    )
+
+    valid_correlation = (
+        pred_sum_squared > 0
+    ) & (
+        true_sum_squared > 0
+    )
+
+    denominator = torch.sqrt(
+        pred_sum_squared
+        * true_sum_squared
+    )
+
+    safe_denominator = torch.where(
+        valid_correlation,
+        denominator,
+        torch.ones_like(
+            denominator
+        ),
+    )
+
+    correlations = (
+        covariance_sum
+        / safe_denominator
+    )
+
+    correlations = torch.where(
+        valid_correlation,
+        correlations,
+        torch.full_like(
+            correlations,
+            torch.nan,
+        ),
+    )
+
+    # Protect against tiny floating-point excursions outside [-1, 1].
+    correlations = correlations.clamp(
+        min=-1.0,
+        max=1.0,
+    )
+
+    return correlations.reshape(
+        num_horizons,
+        num_channels,
+    )
+
+def movement_magnitude_ratio(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    reduce_dims: Sequence[int] | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Compare predicted and realised movement magnitudes per asset.
+
+    For each asset, horizon and channel:
+
+        mean_t(abs(y_pred)) / mean_t(abs(y_true))
+
+    The median valid asset-level ratio is then returned.
+
+    Input:
+        y_pred, y_true: [B, H, N, C]
+
+    Output:
+        [H, C]
+
+    Values below 1 indicate under-sized predicted movements.
+    Values above 1 indicate over-sized predicted movements.
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    if y_pred.ndim != 4:
+        raise ValueError(
+            "Expected y_pred and y_true to have shape "
+            f"[B, H, N, C], got {tuple(y_pred.shape)}."
+        )
+
+    if tuple(reduce_dims) != (0, 2):
+        raise ValueError(
+            "movement_magnitude_ratio currently supports "
+            "reduce_dims=(0, 2) only."
+        )
+
+    # Mean across forecast windows while preserving assets:
+    #
+    # [B, H, N, C] -> [H, N, C]
+    predicted_magnitude = (
+        y_pred
+        .abs()
+        .mean(dim=0)
+    )
+
+    realised_magnitude = (
+        y_true
+        .abs()
+        .mean(dim=0)
+    )
+
+    asset_ratios = torch.where(
+        realised_magnitude > eps,
+        predicted_magnitude / realised_magnitude,
+        torch.full_like(
+            predicted_magnitude,
+            torch.nan,
+        ),
+    )
+
+    # [H, N, C] -> [H, C]
+    return torch.nanmedian(
+        asset_ratios,
+        dim=1,
+    ).values
+
+
+def temporal_absolute_correlation(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    reduce_dims: Sequence[int] = (0, 2),
+) -> torch.Tensor:
+    """
+    Correlate predicted and realised movement magnitudes through time.
+
+    For each asset, horizon and channel, Pearson correlation is
+    calculated across forecast windows between abs(y_pred) and
+    abs(y_true). Valid asset-level correlations are then averaged
+    across assets.
+
+    Input:
+        y_pred, y_true: [B, H, N, C]
+
+    Output:
+        [H, C]
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    if y_pred.ndim != 4:
+        raise ValueError(
+            "Expected y_pred and y_true to have shape [B, H, N, C], "
+            f"got {tuple(y_pred.shape)}."
+        )
+
+    if tuple(reduce_dims) != (0, 2):
+        raise ValueError(
+            "temporal_absolute_correlation currently supports "
+            "reduce_dims=(0, 2) only."
+        )
+
+    if y_pred.shape[0] < 2:
+        raise ValueError(
+            "Temporal absolute correlation requires at least two "
+            "forecast windows."
+        )
+
+    predicted_magnitude = y_pred.abs()
+    realised_magnitude = y_true.abs()
+
+    predicted_centred = (
+        predicted_magnitude
+        - predicted_magnitude.mean(
+            dim=0,
+            keepdim=True,
+        )
+    )
+
+    realised_centred = (
+        realised_magnitude
+        - realised_magnitude.mean(
+            dim=0,
+            keepdim=True,
+        )
+    )
+
+    covariance_sum = (
+        predicted_centred
+        * realised_centred
+    ).sum(dim=0)
+
+    predicted_sum_squared = (
+        predicted_centred
+        .square()
+        .sum(dim=0)
+    )
+
+    realised_sum_squared = (
+        realised_centred
+        .square()
+        .sum(dim=0)
+    )
+
+    denominator = torch.sqrt(
+        predicted_sum_squared
+        * realised_sum_squared
+    )
+
+    asset_correlations = torch.where(
+        denominator > 0,
+        covariance_sum / denominator,
+        torch.full_like(
+            covariance_sum,
+            torch.nan,
+        ),
+    )
+
+    # [H, N, C] -> [H, C]
+    return torch.nanmean(
+        asset_correlations,
+        dim=1,
+    )
 
 MetricFunction = Callable[..., torch.Tensor]
 
@@ -981,16 +1259,29 @@ class BootstrapMetricComponents:
         correlation:
             values contains x.
             reference_values contains y.
+
+        assetwise_correlation:
+            values contains x and reference_values contains y. Pearson
+            correlation is reconstructed across forecast windows
+            separately for each asset, then averaged across assets.
         
         window_mean:
             values contains one metric value per forecast window,
             horizon and channel, with shape [B, H, C].
+
+        assetwise_ratio:
+            values contains numerator contributions and
+            reference_values contains denominator contributions.
+            A ratio is calculated separately for each asset, followed
+            by the median across valid assets.
     """
 
     kind: Literal[
         "mean",
         "ratio",
+        "assetwise_ratio",
         "correlation",
+        "assetwise_correlation",
         "window_mean",
     ]
 
@@ -1030,12 +1321,23 @@ class BootstrapSessionStatistics:
             value_squared_sum
             reference_squared_sum
             cross_sum
+
+        assetwise_correlation:
+            The same sufficient statistics are retained with shape
+            [D, H, N, C] so correlations can be reconstructed for
+            each asset before averaging across assets.
+
+        assetwise_ratio:
+            value_sum and reference_sum retain shape [D, H, N, C]
+            so ratios can be calculated separately for each asset.
     """
 
     kind: Literal[
         "mean",
         "ratio",
+        "assetwise_ratio",
         "correlation",
+        "assetwise_correlation",
         "window_mean",
     ]
 
@@ -1250,6 +1552,44 @@ class ForecastEvaluator:
             eps=eps,
         )
     
+    def compute_cumulative_log_change_movement_magnitude_ratio(
+        self,
+        reduce_dims: Sequence[int] | None = None,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        Compute the ratio of mean predicted to realised absolute
+        cumulative log change.
+        """
+        y_pred, y_true = self.get_predictions(
+            output_space="cumulative_log_change",
+        )
+
+        return movement_magnitude_ratio(
+            y_pred=y_pred,
+            y_true=y_true,
+            reduce_dims=reduce_dims,
+            eps=eps,
+        )
+
+    def compute_cumulative_log_change_temporal_absolute_correlation(
+        self,
+        reduce_dims: Sequence[int] = (0, 2),
+    ) -> torch.Tensor:
+        """
+        Compute asset-wise temporal Pearson correlation between
+        predicted and realised absolute cumulative log changes.
+        """
+        y_pred, y_true = self.get_predictions(
+            output_space="cumulative_log_change",
+        )
+
+        return temporal_absolute_correlation(
+            y_pred=y_pred,
+            y_true=y_true,
+            reduce_dims=reduce_dims,
+        )
+
     def _build_cumulative_log_change_mae_bootstrap_components(
         self,
     ) -> BootstrapMetricComponents:
@@ -1287,6 +1627,46 @@ class ForecastEvaluator:
             reference_values=y_true,
         )
     
+    def _build_cumulative_log_change_movement_magnitude_ratio_bootstrap_components(
+        self,
+        eps: float = 1e-8,
+    ) -> BootstrapMetricComponents:
+        """
+        Return predicted and realised absolute cumulative log changes
+        for ratio aggregation.
+
+        The eps threshold is applied after each bootstrap sample has
+        been aggregated.
+        """
+        del eps
+
+        y_pred, y_true = self.get_predictions(
+            output_space="cumulative_log_change",
+        )
+
+        return BootstrapMetricComponents(
+            kind="assetwise_ratio",
+            values=y_pred.abs(),
+            reference_values=y_true.abs(),
+        )
+
+    def _build_cumulative_log_change_temporal_absolute_correlation_bootstrap_components(
+        self,
+    ) -> BootstrapMetricComponents:
+        """
+        Return absolute cumulative log changes for asset-wise temporal
+        Pearson sufficient-statistic aggregation.
+        """
+        y_pred, y_true = self.get_predictions(
+            output_space="cumulative_log_change",
+        )
+
+        return BootstrapMetricComponents(
+            kind="assetwise_correlation",
+            values=y_pred.abs(),
+            reference_values=y_true.abs(),
+        )
+
     def _build_cumulative_log_change_cross_sectional_pearson_ic_bootstrap_components(
         self,
     ) -> BootstrapMetricComponents:
@@ -1445,6 +1825,32 @@ class ForecastEvaluator:
                     bootstrap_components=(
                         self
                         ._build_cumulative_log_change_pearson_bootstrap_components
+                    ),
+                )
+            ),
+
+            "cumulative_log_change_movement_magnitude_ratio": (
+                MetricDefinition(
+                    compute=(
+                        self
+                        .compute_cumulative_log_change_movement_magnitude_ratio
+                    ),
+                    bootstrap_components=(
+                        self
+                        ._build_cumulative_log_change_movement_magnitude_ratio_bootstrap_components
+                    ),
+                )
+            ),
+
+            "cumulative_log_change_temporal_absolute_correlation": (
+                MetricDefinition(
+                    compute=(
+                        self
+                        .compute_cumulative_log_change_temporal_absolute_correlation
+                    ),
+                    bootstrap_components=(
+                        self
+                        ._build_cumulative_log_change_temporal_absolute_correlation_bootstrap_components
                     ),
                 )
             ),
@@ -1938,10 +2344,40 @@ class ForecastEvaluator:
                     )
                 )
 
+            elif statistics.kind == "assetwise_ratio":
+                ratio_eps = float(
+                    kwargs.get(
+                        "eps",
+                        1e-8,
+                    )
+                )
+
+                bootstrap_samples = (
+                    self
+                    ._compute_assetwise_ratio_bootstrap_samples(
+                        statistics=statistics,
+                        bootstrap_session_counts=(
+                            bootstrap_session_counts
+                        ),
+                        eps=ratio_eps,
+                    )
+                )
+
             elif statistics.kind == "correlation":
                 bootstrap_samples = (
                     self
                     ._compute_correlation_bootstrap_samples(
+                        statistics=statistics,
+                        bootstrap_session_counts=(
+                            bootstrap_session_counts
+                        ),
+                    )
+                )
+
+            elif statistics.kind == "assetwise_correlation":
+                bootstrap_samples = (
+                    self
+                    ._compute_assetwise_correlation_bootstrap_samples(
                         statistics=statistics,
                         bootstrap_session_counts=(
                             bootstrap_session_counts
@@ -2264,6 +2700,61 @@ class ForecastEvaluator:
 
         return session_sum
     
+    def _sum_bootstrap_values_by_session_preserve_assets(
+        self,
+        values: torch.Tensor,
+        session_inverse: torch.Tensor,
+        num_sessions: int,
+    ) -> torch.Tensor:
+        """
+        Sum bootstrap component values by session without reducing the
+        asset dimension.
+
+        Input:
+            values: [B, H, N, C]
+
+        Output:
+            [D, H, N, C]
+        """
+        if not isinstance(values, torch.Tensor):
+            raise TypeError(
+                "Bootstrap component values must be a torch.Tensor."
+            )
+
+        expected_shape = self.y_pred_raw.shape
+
+        if values.shape != expected_shape:
+            raise ValueError(
+                "Bootstrap component tensor has an incompatible shape. "
+                f"Expected {tuple(expected_shape)}, "
+                f"got {tuple(values.shape)}."
+            )
+
+        values_cpu = (
+            values
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        session_sum = torch.zeros(
+            (
+                num_sessions,
+                values_cpu.shape[1],
+                values_cpu.shape[2],
+                values_cpu.shape[3],
+            ),
+            dtype=torch.float64,
+        )
+
+        session_sum.index_add_(
+            dim=0,
+            index=session_inverse,
+            source=values_cpu,
+        )
+
+        return session_sum
+
     def _aggregate_bootstrap_components_by_session(
         self,
         components: BootstrapMetricComponents,
@@ -2361,6 +2852,127 @@ class ForecastEvaluator:
                 session_ids=session_ids,
                 observation_count=session_observation_count,
                 value_sum=session_value_sum,
+            )
+
+        if components.kind == "assetwise_ratio":
+            if components.reference_values is None:
+                raise ValueError(
+                    "assetwise_ratio bootstrap components require "
+                    "reference_values."
+                )
+
+            windows_per_session = torch.bincount(
+                session_inverse,
+                minlength=num_sessions,
+            )
+
+            value_sum = (
+                self
+                ._sum_bootstrap_values_by_session_preserve_assets(
+                    values=components.values,
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            reference_sum = (
+                self
+                ._sum_bootstrap_values_by_session_preserve_assets(
+                    values=components.reference_values,
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            return BootstrapSessionStatistics(
+                kind="assetwise_ratio",
+                session_ids=session_ids,
+                observation_count=windows_per_session,
+                value_sum=value_sum,
+                reference_sum=reference_sum,
+            )
+
+
+        if components.kind == "assetwise_correlation":
+            if components.reference_values is None:
+                raise ValueError(
+                    "assetwise_correlation bootstrap components require "
+                    "reference_values."
+                )
+
+            windows_per_session = torch.bincount(
+                session_inverse,
+                minlength=num_sessions,
+            )
+
+            values = (
+                components.values
+                .detach()
+                .cpu()
+                .to(dtype=torch.float64)
+            )
+
+            references = (
+                components.reference_values
+                .detach()
+                .cpu()
+                .to(dtype=torch.float64)
+            )
+
+            value_sum = (
+                self
+                ._sum_bootstrap_values_by_session_preserve_assets(
+                    values=values,
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            reference_sum = (
+                self
+                ._sum_bootstrap_values_by_session_preserve_assets(
+                    values=references,
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            value_squared_sum = (
+                self
+                ._sum_bootstrap_values_by_session_preserve_assets(
+                    values=values.square(),
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            reference_squared_sum = (
+                self
+                ._sum_bootstrap_values_by_session_preserve_assets(
+                    values=references.square(),
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            cross_sum = (
+                self
+                ._sum_bootstrap_values_by_session_preserve_assets(
+                    values=values * references,
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
+            return BootstrapSessionStatistics(
+                kind="assetwise_correlation",
+                session_ids=session_ids,
+                observation_count=windows_per_session,
+                value_sum=value_sum,
+                reference_sum=reference_sum,
+                value_squared_sum=value_squared_sum,
+                reference_squared_sum=reference_squared_sum,
+                cross_sum=cross_sum,
             )
 
         num_assets = int(
@@ -3071,3 +3683,323 @@ class ForecastEvaluator:
                 torch.nan,
             ),
         )
+    
+    def _compute_assetwise_ratio_bootstrap_samples(
+        self,
+        statistics: BootstrapSessionStatistics,
+        bootstrap_session_counts: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        Calculate one movement-magnitude ratio per asset for each
+        bootstrap replicate, then take the median across valid assets.
+
+        Returns:
+            Bootstrap samples with shape [R, H, C].
+        """
+        if statistics.kind != "assetwise_ratio":
+            raise ValueError(
+                "Expected statistics with kind='assetwise_ratio', "
+                f"got {statistics.kind!r}."
+            )
+
+        if statistics.reference_sum is None:
+            raise ValueError(
+                "Asset-wise ratio statistics require reference_sum."
+            )
+
+        if bootstrap_session_counts.ndim != 2:
+            raise ValueError(
+                "Expected bootstrap_session_counts to have shape "
+                f"[R, D], got {tuple(bootstrap_session_counts.shape)}."
+            )
+
+        counts = (
+            bootstrap_session_counts
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        observation_count = (
+            statistics.observation_count
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        # [R, D] x [D] -> [R]
+        bootstrap_observation_count = (
+            counts
+            @ observation_count
+        )
+
+        if torch.any(
+            bootstrap_observation_count <= 0
+        ):
+            raise ValueError(
+                "Every bootstrap replicate must contain at least "
+                "one forecast window."
+            )
+
+        value_sum = (
+            statistics.value_sum
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        reference_sum = (
+            statistics.reference_sum
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        # [R, D] x [D, H, N, C] -> [R, H, N, C]
+        bootstrap_value_sum = torch.einsum(
+            "rd,dhnc->rhnc",
+            counts,
+            value_sum,
+        )
+
+        bootstrap_reference_sum = torch.einsum(
+            "rd,dhnc->rhnc",
+            counts,
+            reference_sum,
+        )
+
+        bootstrap_reference_mean = (
+            bootstrap_reference_sum
+            / bootstrap_observation_count[
+                :,
+                None,
+                None,
+                None,
+            ]
+        )
+
+        valid_assets = (
+            bootstrap_reference_mean > eps
+        )
+
+        asset_ratios = torch.where(
+            valid_assets,
+            bootstrap_value_sum
+            / bootstrap_reference_sum,
+            torch.full_like(
+                bootstrap_value_sum,
+                torch.nan,
+            ),
+        )
+
+        # [R, H, N, C] -> [R, H, C]
+        return torch.nanmedian(
+            asset_ratios,
+            dim=2,
+        ).values
+
+    def _compute_assetwise_correlation_bootstrap_samples(
+        self,
+        statistics: BootstrapSessionStatistics,
+        bootstrap_session_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Reconstruct temporal Pearson correlations separately for each
+        asset, then average valid asset correlations.
+
+        Returns:
+            Bootstrap samples with shape [R, H, C].
+        """
+        if not isinstance(
+            statistics,
+            BootstrapSessionStatistics,
+        ):
+            raise TypeError(
+                "statistics must be a "
+                "BootstrapSessionStatistics instance."
+            )
+
+        if statistics.kind != "assetwise_correlation":
+            raise ValueError(
+                "Expected statistics with "
+                "kind='assetwise_correlation', "
+                f"got {statistics.kind!r}."
+            )
+
+        required_statistics = {
+            "reference_sum": statistics.reference_sum,
+            "value_squared_sum": statistics.value_squared_sum,
+            "reference_squared_sum": (
+                statistics.reference_squared_sum
+            ),
+            "cross_sum": statistics.cross_sum,
+        }
+
+        missing_statistics = [
+            name
+            for name, value in required_statistics.items()
+            if value is None
+        ]
+
+        if missing_statistics:
+            raise ValueError(
+                "Asset-wise correlation statistics are missing: "
+                f"{missing_statistics}."
+            )
+
+        if not isinstance(
+            bootstrap_session_counts,
+            torch.Tensor,
+        ):
+            raise TypeError(
+                "bootstrap_session_counts must be a torch.Tensor."
+            )
+
+        if bootstrap_session_counts.ndim != 2:
+            raise ValueError(
+                "Expected bootstrap_session_counts to have shape "
+                "[R, D], got "
+                f"{tuple(bootstrap_session_counts.shape)}."
+            )
+
+        num_sessions = int(
+            statistics.session_ids.numel()
+        )
+
+        if bootstrap_session_counts.shape[1] != num_sessions:
+            raise ValueError(
+                "bootstrap_session_counts is not aligned with the "
+                "session statistics. "
+                f"Expected {num_sessions} session columns, got "
+                f"{bootstrap_session_counts.shape[1]}."
+            )
+
+        counts = (
+            bootstrap_session_counts
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        if not torch.isfinite(counts).all():
+            raise ValueError(
+                "bootstrap_session_counts contains NaN or infinite "
+                "values."
+            )
+
+        if torch.any(counts < 0):
+            raise ValueError(
+                "bootstrap_session_counts cannot contain negative "
+                "values."
+            )
+
+        observation_count = (
+            statistics.observation_count
+            .detach()
+            .cpu()
+            .to(dtype=torch.float64)
+        )
+
+        bootstrap_observation_count = (
+            counts
+            @ observation_count
+        )
+
+        if torch.any(bootstrap_observation_count <= 1):
+            raise ValueError(
+                "Every asset-wise Pearson bootstrap replicate "
+                "requires at least two forecast windows."
+            )
+
+        value_sum = statistics.value_sum.to(dtype=torch.float64)
+        reference_sum = statistics.reference_sum.to(dtype=torch.float64)
+        value_squared_sum = statistics.value_squared_sum.to(
+            dtype=torch.float64
+        )
+        reference_squared_sum = statistics.reference_squared_sum.to(
+            dtype=torch.float64
+        )
+        cross_sum = statistics.cross_sum.to(dtype=torch.float64)
+
+        # [R, D] x [D, H, N, C] -> [R, H, N, C]
+        bootstrap_value_sum = torch.einsum(
+            "rd,dhnc->rhnc",
+            counts,
+            value_sum,
+        )
+
+        bootstrap_reference_sum = torch.einsum(
+            "rd,dhnc->rhnc",
+            counts,
+            reference_sum,
+        )
+
+        bootstrap_value_squared_sum = torch.einsum(
+            "rd,dhnc->rhnc",
+            counts,
+            value_squared_sum,
+        )
+
+        bootstrap_reference_squared_sum = torch.einsum(
+            "rd,dhnc->rhnc",
+            counts,
+            reference_squared_sum,
+        )
+
+        bootstrap_cross_sum = torch.einsum(
+            "rd,dhnc->rhnc",
+            counts,
+            cross_sum,
+        )
+
+        n = bootstrap_observation_count[
+            :,
+            None,
+            None,
+            None,
+        ]
+
+        numerator = (
+            n * bootstrap_cross_sum
+            - bootstrap_value_sum * bootstrap_reference_sum
+        )
+
+        value_variation = torch.clamp_min(
+            n * bootstrap_value_squared_sum
+            - bootstrap_value_sum.square(),
+            0.0,
+        )
+
+        reference_variation = torch.clamp_min(
+            n * bootstrap_reference_squared_sum
+            - bootstrap_reference_sum.square(),
+            0.0,
+        )
+
+        denominator = torch.sqrt(
+            value_variation
+            * reference_variation
+        )
+
+        valid_correlation = denominator > 0
+
+        asset_correlations = torch.where(
+            valid_correlation,
+            numerator / torch.where(
+                valid_correlation,
+                denominator,
+                torch.ones_like(denominator),
+            ),
+            torch.full_like(
+                denominator,
+                torch.nan,
+            ),
+        )
+
+        # [R, H, N, C] -> [R, H, C]
+        return torch.nanmean(
+            asset_correlations,
+            dim=2,
+        )
+

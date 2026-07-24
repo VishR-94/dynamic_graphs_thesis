@@ -10,6 +10,36 @@ MetricResultValue = (
     | Mapping[str, torch.Tensor]
 )
 
+DEFAULT_METRIC_DISPLAY_NAMES = {
+    "raw_mae": "Raw MAE",
+    "raw_rmse": "Raw RMSE",
+    "cumulative_log_change_mae": "Log MAE",
+    "cumulative_log_change_rmse": "Log RMSE",
+    "mase": "MASE",
+    "relative_mae_vs_persistence": "Rel. MAE",
+    "persistence_win_rate": "Win Rate",
+    "cumulative_log_change_pearson_correlation": "Pearson",
+    "cumulative_log_change_cross_sectional_pearson_ic": "IC",
+    "cumulative_log_change_cross_sectional_spearman_rank_ic": (
+        "Rank IC"
+    ),
+    "cumulative_log_change_movement_magnitude_ratio": "MMR",
+    "cumulative_log_change_temporal_absolute_correlation": (
+        "AbsRet Corr"
+    ),
+}
+
+
+DEFAULT_MODEL_DISPLAY_NAMES = {
+    "persistence": "Persistence",
+    "mean": "Mean",
+    "arima": "ARIMA",
+    "var": "VAR",
+    "garch": "GARCH",
+    "modern_tcn": "ModernTCN",
+    "kronos": "Kronos",
+}
+
 
 def make_evaluation_table(
     metric_results: Mapping[
@@ -298,3 +328,169 @@ def make_evaluation_table(
         rows,
         columns=columns,
     )
+
+
+def make_baseline_summary_table(
+    models_to_display: Sequence[str],
+    namespace: Mapping[str, Any],
+    channel: str = "close",
+    metric_display_names: Mapping[str, str] | None = None,
+    model_display_names: Mapping[str, str] | None = None,
+) -> pd.DataFrame:
+    """
+    Combine model evaluation tables into one horizon-by-model summary.
+
+    Each model name is resolved from namespace using the convention:
+
+        {model}_metric_table
+
+    Only the ordinary full-test-set value is included. Bootstrap
+    confidence intervals remain in the individual model tables.
+
+    Missing metrics for a model are shown as NaN.
+    """
+    table_names = [
+        f"{model}_metric_table"
+        for model in models_to_display
+    ]
+
+    missing_tables = [
+        table_name
+        for table_name in table_names
+        if table_name not in namespace
+    ]
+
+    if missing_tables:
+        raise NameError(
+            "Missing metric tables: "
+            + ", ".join(missing_tables)
+        )
+
+    frames = []
+
+    for model, table_name in zip(
+        models_to_display,
+        table_names,
+    ):
+        metric_table = namespace[table_name]
+
+        model_frame = metric_table.loc[
+            metric_table["channel"] == channel,
+            [
+                "metric",
+                "horizon",
+                "value",
+            ],
+        ].copy()
+
+        model_frame["model"] = model
+        frames.append(model_frame)
+
+    combined = pd.concat(
+        frames,
+        ignore_index=True,
+    )
+
+    observed_metrics = list(
+        pd.unique(combined["metric"])
+    )
+
+    metric_labels = dict(
+        DEFAULT_METRIC_DISPLAY_NAMES
+    )
+
+    if metric_display_names is not None:
+        metric_labels.update(
+            metric_display_names
+        )
+
+    preferred_metrics = [
+        metric_name
+        for metric_name in metric_labels
+        if metric_name in observed_metrics
+    ]
+
+    extra_metrics = [
+        metric_name
+        for metric_name in observed_metrics
+        if metric_name not in preferred_metrics
+    ]
+
+    metric_order = (
+        preferred_metrics
+        + extra_metrics
+    )
+
+    horizons = sorted(
+        combined["horizon"].unique().tolist()
+    )
+
+    full_index = pd.MultiIndex.from_product(
+        [
+            horizons,
+            list(models_to_display),
+        ],
+        names=[
+            "horizon",
+            "model",
+        ],
+    )
+
+    summary = (
+        combined
+        .pivot(
+            index=[
+                "horizon",
+                "model",
+            ],
+            columns="metric",
+            values="value",
+        )
+        .reindex(
+            index=full_index,
+            columns=metric_order,
+        )
+    )
+
+    model_labels = dict(
+        DEFAULT_MODEL_DISPLAY_NAMES
+    )
+
+    if model_display_names is not None:
+        model_labels.update(
+            model_display_names
+        )
+
+    summary.index = pd.MultiIndex.from_tuples(
+        [
+            (
+                f"{int(horizon)} min",
+                model_labels.get(
+                    model,
+                    model.replace(
+                        "_",
+                        " ",
+                    ).title(),
+                ),
+            )
+            for horizon, model in summary.index
+        ],
+        names=[
+            "Horizon",
+            "Model",
+        ],
+    )
+
+    summary = summary.rename(
+        columns={
+            metric_name: metric_labels.get(
+                metric_name,
+                metric_name,
+            )
+            for metric_name in metric_order
+        }
+    )
+
+    summary.columns.name = None
+
+    return summary
