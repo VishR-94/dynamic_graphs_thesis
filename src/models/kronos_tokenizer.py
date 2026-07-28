@@ -1137,12 +1137,22 @@ class KronosTokenizerAdapter:
                 "context_token_ids must have shape [B, C, N, 2]."
             )
 
-        if (
+        if future_token_ids.ndim == 3:
+            future_s1 = future_token_ids.long()
+            future_token_ids = torch.stack(
+                [
+                    future_s1,
+                    torch.zeros_like(future_s1),
+                ],
+                dim=-1,
+            )
+        elif (
             future_token_ids.ndim != 4
             or future_token_ids.shape[-1] != 2
         ):
             raise ValueError(
-                "future_token_ids must have shape [B, P, N, 2]."
+                "future_token_ids must have shape [B, P, N] or "
+                "[B, P, N, 2]."
             )
 
         if (
@@ -1215,6 +1225,262 @@ class KronosTokenizerAdapter:
             ]
             .contiguous()
         )
+
+    def decode_coarse_token_path(
+        self,
+        context_token_ids: torch.Tensor,
+        future_token_ids: torch.Tensor,
+        *,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        series_batch_size: int | None = None,
+        return_full_path: bool = False,
+    ) -> torch.Tensor:
+        """Decode a context-plus-future path through the coarse branch.
+
+        The forecasting model may still consume both observed s1 and s2
+        context IDs. This method changes only the raw-price reconstruction
+        path: the frozen tokenizer decoder receives the complete ordered s1
+        sequence and ignores future s2 predictions.
+
+        Args:
+            context_token_ids:
+                Observed token pairs [B, C, N, 2].
+
+            future_token_ids:
+                Future coarse IDs [B, P, N] or token pairs [B, P, N, 2].
+                Only s1 is used.
+
+            mean/std:
+                Context-only raw-space statistics [B, N, 6].
+
+            return_full_path:
+                When False, return only P decoded future bars. When True,
+                return the complete C + P coarse-decoded path.
+
+        Returns:
+            Raw OHLCV [B, P, N, 5] by default.
+        """
+        context_token_ids = torch.as_tensor(
+            context_token_ids
+        ).detach().cpu()
+
+        future_token_ids = torch.as_tensor(
+            future_token_ids
+        ).detach().cpu()
+
+        if (
+            context_token_ids.ndim != 4
+            or context_token_ids.shape[-1] != 2
+        ):
+            raise ValueError(
+                "context_token_ids must have shape [B, C, N, 2]."
+            )
+
+        if future_token_ids.ndim == 3:
+            future_s1 = future_token_ids.long()
+            future_token_ids = torch.stack(
+                [
+                    future_s1,
+                    torch.zeros_like(future_s1),
+                ],
+                dim=-1,
+            )
+        elif (
+            future_token_ids.ndim != 4
+            or future_token_ids.shape[-1] != 2
+        ):
+            raise ValueError(
+                "future_token_ids must have shape [B, P, N] or "
+                "[B, P, N, 2]."
+            )
+
+        if (
+            context_token_ids.shape[0]
+            != future_token_ids.shape[0]
+            or context_token_ids.shape[2]
+            != future_token_ids.shape[2]
+        ):
+            raise ValueError(
+                "Context and future token batch/asset dimensions "
+                "must match."
+            )
+
+        if context_token_ids.shape[1] <= 0:
+            raise ValueError(
+                "context_token_ids must contain at least one position."
+            )
+
+        if future_token_ids.shape[1] <= 0:
+            raise ValueError(
+                "future_token_ids must contain at least one position."
+            )
+
+        full_token_ids = torch.cat(
+            [
+                context_token_ids,
+                future_token_ids,
+            ],
+            dim=1,
+        ).long()
+
+        if (
+            full_token_ids.min().item() < 0
+            or full_token_ids.max().item() >= 1024
+        ):
+            raise ValueError(
+                "Token IDs lie outside [0, 1023]."
+            )
+
+        token_batch = KronosTokenBatch(
+            token_ids=full_token_ids,
+            mean=torch.as_tensor(
+                mean,
+                dtype=torch.float32,
+            ),
+            std=torch.as_tensor(
+                std,
+                dtype=torch.float32,
+            ),
+        )
+
+        decoded_full = self.decode_coarse(
+            token_batch,
+            series_batch_size=series_batch_size,
+        )
+
+        if return_full_path:
+            return decoded_full
+
+        context_length = int(
+            context_token_ids.shape[1]
+        )
+
+        return (
+            decoded_full[
+                :,
+                context_length:,
+            ]
+            .contiguous()
+        )
+
+    def decode_coarse_token_path(
+        self,
+        context_token_ids: torch.Tensor,
+        future_s1_ids: torch.Tensor,
+        *,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        series_batch_size: int | None = None,
+        return_full_path: bool = False,
+    ) -> torch.Tensor:
+        """Decode an observed context plus coarse-only future path.
+
+        The observed context may contain both official Kronos token
+        streams, but the frozen coarse reconstruction branch uses only
+        ``s1``. Future fine IDs are therefore represented by a zero
+        placeholder that is ignored by :meth:`decode_coarse`.
+
+        Args:
+            context_token_ids:
+                Observed token pairs [B, C, N, 2].
+
+            future_s1_ids:
+                Predicted coarse IDs [B, P, N].
+
+            mean/std:
+                Context-only raw-space statistics [B, N, 6].
+
+        Returns:
+            Raw OHLCV with shape [B, P, N, 5] by default.
+        """
+        context_token_ids = torch.as_tensor(
+            context_token_ids
+        ).detach().cpu()
+        future_s1_ids = torch.as_tensor(
+            future_s1_ids
+        ).detach().cpu()
+
+        if (
+            context_token_ids.ndim != 4
+            or context_token_ids.shape[-1] != 2
+        ):
+            raise ValueError(
+                "context_token_ids must have shape [B, C, N, 2]."
+            )
+
+        if future_s1_ids.ndim != 3:
+            raise ValueError(
+                "future_s1_ids must have shape [B, P, N]."
+            )
+
+        if (
+            context_token_ids.shape[0]
+            != future_s1_ids.shape[0]
+            or context_token_ids.shape[2]
+            != future_s1_ids.shape[2]
+        ):
+            raise ValueError(
+                "Context and future coarse-token batch/asset "
+                "dimensions must match."
+            )
+
+        if future_s1_ids.shape[1] <= 0:
+            raise ValueError(
+                "future_s1_ids must contain at least one position."
+            )
+
+        if (
+            future_s1_ids.min().item() < 0
+            or future_s1_ids.max().item() >= 1024
+        ):
+            raise ValueError(
+                "future_s1_ids contains IDs outside [0, 1023]."
+            )
+
+        future_pairs = torch.stack(
+            (
+                future_s1_ids.long(),
+                torch.zeros_like(
+                    future_s1_ids,
+                    dtype=torch.long,
+                ),
+            ),
+            dim=-1,
+        )
+        full_token_ids = torch.cat(
+            [
+                context_token_ids.long(),
+                future_pairs,
+            ],
+            dim=1,
+        )
+        token_batch = KronosTokenBatch(
+            token_ids=full_token_ids,
+            mean=torch.as_tensor(
+                mean,
+                dtype=torch.float32,
+            ),
+            std=torch.as_tensor(
+                std,
+                dtype=torch.float32,
+            ),
+        )
+        decoded_full = self.decode_coarse(
+            token_batch,
+            series_batch_size=series_batch_size,
+        )
+
+        if return_full_path:
+            return decoded_full
+
+        context_length = int(
+            context_token_ids.shape[1]
+        )
+        return decoded_full[
+            :,
+            context_length:,
+        ].contiguous()
 
     def decode_coarse(
         self,

@@ -36,15 +36,20 @@ from src.data.load_candle_data import (
 )
 from src.evaluation.metrics import ForecastEvaluator
 from src.models.dynamic_graph.config import (
-    PREDICTOR_SELECTION_PRESETS,
     load_dynamic_graph_config,
     validate_dynamic_graph_config,
 )
 from src.models.dynamic_graph.contracts import GraphOutput
 from src.models.dynamic_graph.future_predictor import (
-    FutureTokenLoss,
     FutureTokenPrediction,
     compute_future_token_loss,
+)
+from src.models.dynamic_graph.losses import (
+    DynamicGraphLoss,
+    GraphRegularisationConfig,
+    build_adjacent_window_pairs,
+    combine_dynamic_graph_losses,
+    compute_graph_regularisation,
 )
 from src.models.dynamic_graph.model import (
     DynamicGraphTokenForecaster,
@@ -73,15 +78,32 @@ CLOSE_CHANNEL_INDEX = OHLCV_CHANNELS.index("close")
 
 @dataclass(frozen=True)
 class TeacherForcedEpochMetrics:
+    """Epoch-averaged supervised objective and graph diagnostics."""
+
     total_loss: float
+    token_loss: float
+    graph_regularisation_loss: float
+    backcast_loss: float
+    backcast_penalty: float
+
     s1_loss: float
     s2_loss: float
     s1_accuracy: float
     s2_accuracy: float
+
+    graph_mean_row_entropy: float | None
+    graph_mean_effective_neighbours: float | None
+    graph_entropy_penalty: float
+    graph_target_entropy_penalty: float
+    graph_temporal_smooth_penalty: float
+    graph_warmup_scale: float
+    graph_valid_smoothing_pairs: int
+
     s1_loss_by_step: Tensor
     s2_loss_by_step: Tensor
     s1_accuracy_by_step: Tensor
     s2_accuracy_by_step: Tensor
+
     examples: int
     seconds: float
 
@@ -473,8 +495,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name", type=str, required=True)
     parser.add_argument(
         "--preset",
-        choices=PREDICTOR_SELECTION_PRESETS,
+        type=str,
         default=None,
+        help=(
+            "Named preset from --dynamic-config. When omitted, the "
+            "YAML default_preset is used. The selected name is "
+            "validated against the YAML presets mapping."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -831,12 +858,80 @@ def move_training_batch(
 
 
 def _future_prediction_for_loss(output: Any) -> FutureTokenPrediction:
+    selected_s2 = (
+        output.s2_logits.argmax(dim=-1)
+        if output.s2_logits is not None
+        else None
+    )
+
     return FutureTokenPrediction(
         future_hidden=output.future_hidden,
         s1_logits=output.s1_logits,
         s2_logits=output.s2_logits,
         selected_s1=output.s1_logits.argmax(dim=-1),
-        selected_s2=output.s2_logits.argmax(dim=-1),
+        selected_s2=selected_s2,
+    )
+
+
+def _batch_true_graph(
+    batch: Mapping[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor | None:
+    values = batch.get("true_graph")
+
+    if values is None:
+        return None
+
+    return torch.as_tensor(
+        values
+    ).to(
+        device=device,
+        dtype=dtype,
+        non_blocking=True,
+    )
+
+
+def _batch_adjacent_window_pairs(
+    batch: Mapping[str, Any],
+    *,
+    enabled: bool,
+    expected_origin_delta: int,
+) -> Tensor | None:
+    if not enabled:
+        return None
+
+    if "origin_idx" not in batch:
+        raise KeyError(
+            "Temporal graph smoothing requires origin_idx metadata."
+        )
+
+    if "trajectory_id" in batch:
+        return build_adjacent_window_pairs(
+            origin_idx=torch.as_tensor(
+                batch["origin_idx"]
+            ),
+            trajectory_id=torch.as_tensor(
+                batch["trajectory_id"]
+            ),
+            expected_origin_delta=expected_origin_delta,
+        )
+
+    if "sample_idx" in batch:
+        return build_adjacent_window_pairs(
+            origin_idx=torch.as_tensor(
+                batch["origin_idx"]
+            ),
+            sample_idx=torch.as_tensor(
+                batch["sample_idx"]
+            ),
+            expected_origin_delta=expected_origin_delta,
+        )
+
+    raise KeyError(
+        "Temporal graph smoothing requires sample_idx for real data "
+        "or trajectory_id for synthetic data."
     )
 
 
@@ -846,7 +941,12 @@ def compute_model_loss(
     target_s1: Tensor,
     target_s2: Tensor,
     batch: Mapping[str, Any],
-) -> FutureTokenLoss:
+    *,
+    graph_regularisation_config: GraphRegularisationConfig,
+    current_epoch: int,
+    expected_origin_delta: int,
+) -> DynamicGraphLoss:
+    """Compute the complete token, graph and optional backcast objective."""
     token_loss = compute_future_token_loss(
         _future_prediction_for_loss(output),
         target_s1,
@@ -855,6 +955,33 @@ def compute_model_loss(
         evaluation_horizons=model.config.heads.evaluation_horizons,
         s2_loss_weight=model.config.heads.s2_loss_weight,
     )
+
+    true_graph = _batch_true_graph(
+        batch,
+        device=output.s1_logits.device,
+        dtype=output.s1_logits.dtype,
+    )
+
+    adjacent_window_pairs = _batch_adjacent_window_pairs(
+        batch,
+        enabled=(
+            graph_regularisation_config
+            .graph_temporal_smooth_reg
+            > 0.0
+        ),
+        expected_origin_delta=expected_origin_delta,
+    )
+
+    graph_loss = compute_graph_regularisation(
+        output.graph,
+        config=graph_regularisation_config,
+        current_epoch=current_epoch,
+        reference_tensor=token_loss.total,
+        true_graph=true_graph,
+        adjacent_window_pairs=adjacent_window_pairs,
+    )
+
+    backcast_loss: Tensor | None = None
 
     if model.config.backcast.enabled:
         if "context_normalised_ohlcv" not in batch:
@@ -865,36 +992,40 @@ def compute_model_loss(
             )
 
         if output.backcast is None:
-            raise RuntimeError("Backcasting is enabled but the model returned None.")
+            raise RuntimeError(
+                "Backcasting is enabled but the model returned None."
+            )
 
-        target = torch.as_tensor(batch["context_normalised_ohlcv"]).to(
+        target = torch.as_tensor(
+            batch["context_normalised_ohlcv"]
+        ).to(
             device=output.backcast.device,
             dtype=output.backcast.dtype,
             non_blocking=True,
         )
 
-        if tuple(target.shape) != tuple(output.backcast.shape):
+        if tuple(target.shape) != tuple(
+            output.backcast.shape
+        ):
             raise ValueError(
                 "Backcast target and output shapes differ: "
-                f"{tuple(target.shape)} versus {tuple(output.backcast.shape)}."
+                f"{tuple(target.shape)} versus "
+                f"{tuple(output.backcast.shape)}."
             )
 
-        backcast_loss = torch.nn.functional.mse_loss(output.backcast, target)
-        total = token_loss.total + (
-            float(model.config.backcast.loss_weight) * backcast_loss
+        backcast_loss = torch.nn.functional.mse_loss(
+            output.backcast,
+            target,
         )
 
-        return FutureTokenLoss(
-            total=total,
-            s1=token_loss.s1,
-            s2=token_loss.s2,
-            s1_by_step=token_loss.s1_by_step,
-            s2_by_step=token_loss.s2_by_step,
-            weights=token_loss.weights,
-        )
-
-    return token_loss
-
+    return combine_dynamic_graph_losses(
+        token_loss,
+        graph_loss,
+        backcast_loss=backcast_loss,
+        backcast_loss_weight=(
+            model.config.backcast.loss_weight
+        ),
+    )
 
 def _autocast_context(device: torch.device, enabled: bool):
     if enabled:
@@ -930,6 +1061,9 @@ def run_teacher_forced_epoch(
     use_amp: bool,
     gradient_clip_norm: float,
     description: str,
+    graph_regularisation_config: GraphRegularisationConfig,
+    current_epoch: int,
+    expected_origin_delta: int,
 ) -> TeacherForcedEpochMetrics:
     training = optimizer is not None
     model.train(training)
@@ -937,16 +1071,49 @@ def run_teacher_forced_epoch(
     synchronise_device(device)
     start = perf_counter()
     example_count = 0
+
     total_loss_sum = 0.0
+    token_loss_sum = 0.0
+    graph_regularisation_loss_sum = 0.0
+    backcast_loss_sum = 0.0
+    backcast_penalty_sum = 0.0
+
     s1_loss_sum = 0.0
     s2_loss_sum = 0.0
 
+    graph_entropy_penalty_sum = 0.0
+    graph_target_entropy_penalty_sum = 0.0
+    graph_temporal_smooth_penalty_sum = 0.0
+    graph_warmup_scale_sum = 0.0
+    graph_valid_smoothing_pairs = 0
+
+    graph_entropy_sum = 0.0
+    graph_effective_neighbours_sum = 0.0
+    graph_diagnostic_examples = 0
+
     prediction_length = model.config.prediction_length
-    s1_loss_by_step_sum = torch.zeros(prediction_length, dtype=torch.float64)
-    s2_loss_by_step_sum = torch.zeros(prediction_length, dtype=torch.float64)
-    s1_correct_by_step = torch.zeros(prediction_length, dtype=torch.float64)
-    s2_correct_by_step = torch.zeros(prediction_length, dtype=torch.float64)
-    token_count_by_step = torch.zeros(prediction_length, dtype=torch.float64)
+    predict_s2 = model.config.heads.predicts_s2
+
+    s1_loss_by_step_sum = torch.zeros(
+        prediction_length,
+        dtype=torch.float64,
+    )
+    s2_loss_by_step_sum = torch.zeros(
+        prediction_length,
+        dtype=torch.float64,
+    )
+    s1_correct_by_step = torch.zeros(
+        prediction_length,
+        dtype=torch.float64,
+    )
+    s2_correct_by_step = torch.zeros(
+        prediction_length,
+        dtype=torch.float64,
+    )
+    token_count_by_step = torch.zeros(
+        prediction_length,
+        dtype=torch.float64,
+    )
 
     progress = tqdm(
         loader,
@@ -956,115 +1123,418 @@ def run_teacher_forced_epoch(
     )
 
     for batch in progress:
-        context_tokens, target_s1, target_s2 = move_training_batch(
+        (
+            context_tokens,
+            target_s1,
+            target_s2,
+        ) = move_training_batch(
             batch,
             device=device,
         )
 
-        batch_size = int(context_tokens.shape[0])
-        num_nodes = int(context_tokens.shape[2])
+        batch_size = int(
+            context_tokens.shape[0]
+        )
+        num_nodes = int(
+            context_tokens.shape[2]
+        )
 
         if training:
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(
+                set_to_none=True
+            )
 
-        grad_context = torch.enable_grad() if training else torch.inference_mode()
+        grad_context = (
+            torch.enable_grad()
+            if training
+            else torch.inference_mode()
+        )
 
         with grad_context:
-            with _autocast_context(device, use_amp):
+            with _autocast_context(
+                device,
+                use_amp,
+            ):
                 output = model(
                     context_tokens,
                     target_s1=target_s1,
                     target_s2=target_s2,
                 )
+
                 loss = compute_model_loss(
                     model,
                     output,
                     target_s1,
                     target_s2,
                     batch,
+                    graph_regularisation_config=(
+                        graph_regularisation_config
+                    ),
+                    current_epoch=current_epoch,
+                    expected_origin_delta=(
+                        expected_origin_delta
+                    ),
                 )
 
             if training:
                 if use_amp:
-                    scaler.scale(loss.total).backward()
-                    scaler.unscale_(optimizer)
+                    scaler.scale(
+                        loss.total
+                    ).backward()
+                    scaler.unscale_(
+                        optimizer
+                    )
                     torch.nn.utils.clip_grad_norm_(
                         model.parameters(),
-                        max_norm=gradient_clip_norm,
+                        max_norm=(
+                            gradient_clip_norm
+                        ),
                     )
-                    scaler.step(optimizer)
+                    scaler.step(
+                        optimizer
+                    )
                     scaler.update()
                 else:
                     loss.total.backward()
                     torch.nn.utils.clip_grad_norm_(
                         model.parameters(),
-                        max_norm=gradient_clip_norm,
+                        max_norm=(
+                            gradient_clip_norm
+                        ),
                     )
                     optimizer.step()
 
         example_count += batch_size
-        total_loss_sum += float(loss.total.detach().item()) * batch_size
-        s1_loss_sum += float(loss.s1.detach().item()) * batch_size
-        s2_loss_sum += float(loss.s2.detach().item()) * batch_size
+
+        total_loss_sum += (
+            float(
+                loss.total.detach().item()
+            )
+            * batch_size
+        )
+        token_loss_sum += (
+            float(
+                loss.token.total.detach().item()
+            )
+            * batch_size
+        )
+        graph_regularisation_loss_sum += (
+            float(
+                loss.graph.total.detach().item()
+            )
+            * batch_size
+        )
+        backcast_loss_sum += (
+            float(
+                loss.backcast_loss.detach().item()
+            )
+            * batch_size
+        )
+        backcast_penalty_sum += (
+            float(
+                loss.backcast_penalty
+                .detach()
+                .item()
+            )
+            * batch_size
+        )
+
+        s1_loss_sum += (
+            float(
+                loss.s1.detach().item()
+            )
+            * batch_size
+        )
+        s2_loss_sum += (
+            float(
+                loss.s2.detach().item()
+            )
+            * batch_size
+        )
+
+        graph_entropy_penalty_sum += (
+            float(
+                loss.graph.entropy_penalty
+                .detach()
+                .item()
+            )
+            * batch_size
+        )
+        graph_target_entropy_penalty_sum += (
+            float(
+                loss.graph.target_entropy_penalty
+                .detach()
+                .item()
+            )
+            * batch_size
+        )
+        graph_temporal_smooth_penalty_sum += (
+            float(
+                loss.graph.temporal_smooth_penalty
+                .detach()
+                .item()
+            )
+            * batch_size
+        )
+        graph_warmup_scale_sum += (
+            float(
+                loss.graph.warmup_scale
+                .detach()
+                .item()
+            )
+            * batch_size
+        )
+        graph_valid_smoothing_pairs += int(
+            loss.graph.valid_smoothing_pairs
+        )
+
+        if (
+            loss.graph.mean_row_entropy
+            is not None
+        ):
+            if (
+                loss.graph
+                .mean_effective_neighbours
+                is None
+            ):
+                raise RuntimeError(
+                    "Graph entropy was returned without "
+                    "effective-neighbour diagnostics."
+                )
+
+            graph_entropy_sum += (
+                float(
+                    loss.graph.mean_row_entropy
+                    .detach()
+                    .item()
+                )
+                * batch_size
+            )
+            graph_effective_neighbours_sum += (
+                float(
+                    loss.graph
+                    .mean_effective_neighbours
+                    .detach()
+                    .item()
+                )
+                * batch_size
+            )
+            graph_diagnostic_examples += (
+                batch_size
+            )
+
         s1_loss_by_step_sum += (
-            loss.s1_by_step.detach().cpu().to(torch.float64) * batch_size
+            loss.s1_by_step
+            .detach()
+            .cpu()
+            .to(
+                torch.float64
+            )
+            * batch_size
         )
         s2_loss_by_step_sum += (
-            loss.s2_by_step.detach().cpu().to(torch.float64) * batch_size
+            loss.s2_by_step
+            .detach()
+            .cpu()
+            .to(
+                torch.float64
+            )
+            * batch_size
         )
 
-        s1_predictions = output.s1_logits.detach().argmax(dim=-1)
-        s2_predictions = output.s2_logits.detach().argmax(dim=-1)
-
+        s1_predictions = (
+            output.s1_logits
+            .detach()
+            .argmax(
+                dim=-1
+            )
+        )
         s1_correct_by_step += (
-            (s1_predictions == target_s1)
-            .sum(dim=(0, 2))
+            (
+                s1_predictions
+                == target_s1
+            )
+            .sum(
+                dim=(
+                    0,
+                    2,
+                )
+            )
             .detach()
             .cpu()
-            .to(torch.float64)
+            .to(
+                torch.float64
+            )
         )
-        s2_correct_by_step += (
-            (s2_predictions == target_s2)
-            .sum(dim=(0, 2))
-            .detach()
-            .cpu()
-            .to(torch.float64)
+
+        if predict_s2:
+            if output.s2_logits is None:
+                raise RuntimeError(
+                    "Full-token mode returned no s2 logits."
+                )
+
+            s2_predictions = (
+                output.s2_logits
+                .detach()
+                .argmax(dim=-1)
+            )
+            s2_correct_by_step += (
+                (s2_predictions == target_s2)
+                .sum(dim=(0, 2))
+                .detach()
+                .cpu()
+                .to(torch.float64)
+            )
+
+        token_count_by_step += float(
+            batch_size
+            * num_nodes
         )
-        token_count_by_step += float(batch_size * num_nodes)
 
         progress.set_postfix(
-            loss=f"{float(loss.total.detach().item()):.4f}",
+            objective=(
+                f"{float(loss.total.detach().item()):.4f}"
+            ),
+            token=(
+                f"{float(loss.token.total.detach().item()):.4f}"
+            ),
             refresh=False,
         )
 
-    synchronise_device(device)
-
-    if example_count == 0:
-        raise RuntimeError("The DataLoader yielded no examples.")
-
-    s1_accuracy_by_step = s1_correct_by_step / token_count_by_step.clamp_min(1)
-    s2_accuracy_by_step = s2_correct_by_step / token_count_by_step.clamp_min(1)
-
-    return TeacherForcedEpochMetrics(
-        total_loss=total_loss_sum / example_count,
-        s1_loss=s1_loss_sum / example_count,
-        s2_loss=s2_loss_sum / example_count,
-        s1_accuracy=float(
-            s1_correct_by_step.sum().item()
-            / token_count_by_step.sum().clamp_min(1).item()
-        ),
-        s2_accuracy=float(
-            s2_correct_by_step.sum().item()
-            / token_count_by_step.sum().clamp_min(1).item()
-        ),
-        s1_loss_by_step=s1_loss_by_step_sum / example_count,
-        s2_loss_by_step=s2_loss_by_step_sum / example_count,
-        s1_accuracy_by_step=s1_accuracy_by_step,
-        s2_accuracy_by_step=s2_accuracy_by_step,
-        examples=example_count,
-        seconds=perf_counter() - start,
+    synchronise_device(
+        device
     )
 
+    if example_count == 0:
+        raise RuntimeError(
+            "The DataLoader yielded no examples."
+        )
+
+    s1_accuracy_by_step = (
+        s1_correct_by_step
+        / token_count_by_step.clamp_min(
+            1
+        )
+    )
+    if predict_s2:
+        s2_accuracy_by_step = (
+            s2_correct_by_step
+            / token_count_by_step.clamp_min(1)
+        )
+        s2_accuracy = float(
+            s2_correct_by_step.sum().item()
+            / token_count_by_step
+            .sum()
+            .clamp_min(1)
+            .item()
+        )
+    else:
+        s2_accuracy_by_step = torch.full(
+            (prediction_length,),
+            float("nan"),
+            dtype=torch.float64,
+        )
+        s2_accuracy = float("nan")
+
+    if graph_diagnostic_examples > 0:
+        mean_graph_entropy: (
+            float | None
+        ) = (
+            graph_entropy_sum
+            / graph_diagnostic_examples
+        )
+        mean_effective_neighbours: (
+            float | None
+        ) = (
+            graph_effective_neighbours_sum
+            / graph_diagnostic_examples
+        )
+    else:
+        mean_graph_entropy = None
+        mean_effective_neighbours = None
+
+    return TeacherForcedEpochMetrics(
+        total_loss=(
+            total_loss_sum
+            / example_count
+        ),
+        token_loss=(
+            token_loss_sum
+            / example_count
+        ),
+        graph_regularisation_loss=(
+            graph_regularisation_loss_sum
+            / example_count
+        ),
+        backcast_loss=(
+            backcast_loss_sum
+            / example_count
+        ),
+        backcast_penalty=(
+            backcast_penalty_sum
+            / example_count
+        ),
+        s1_loss=(
+            s1_loss_sum
+            / example_count
+        ),
+        s2_loss=(
+            s2_loss_sum
+            / example_count
+        ),
+        s1_accuracy=float(
+            s1_correct_by_step.sum().item()
+            / token_count_by_step
+            .sum()
+            .clamp_min(1)
+            .item()
+        ),
+        s2_accuracy=s2_accuracy,
+        graph_mean_row_entropy=(
+            mean_graph_entropy
+        ),
+        graph_mean_effective_neighbours=(
+            mean_effective_neighbours
+        ),
+        graph_entropy_penalty=(
+            graph_entropy_penalty_sum
+            / example_count
+        ),
+        graph_target_entropy_penalty=(
+            graph_target_entropy_penalty_sum
+            / example_count
+        ),
+        graph_temporal_smooth_penalty=(
+            graph_temporal_smooth_penalty_sum
+            / example_count
+        ),
+        graph_warmup_scale=(
+            graph_warmup_scale_sum
+            / example_count
+        ),
+        graph_valid_smoothing_pairs=(
+            graph_valid_smoothing_pairs
+        ),
+        s1_loss_by_step=(
+            s1_loss_by_step_sum
+            / example_count
+        ),
+        s2_loss_by_step=(
+            s2_loss_by_step_sum
+            / example_count
+        ),
+        s1_accuracy_by_step=(
+            s1_accuracy_by_step
+        ),
+        s2_accuracy_by_step=(
+            s2_accuracy_by_step
+        ),
+        examples=example_count,
+        seconds=(
+            perf_counter()
+            - start
+        ),
+    )
 
 def _invalid_candle_mask(decoded_ohlcv: Tensor) -> Tensor:
     if decoded_ohlcv.ndim != 4 or int(decoded_ohlcv.shape[-1]) != 5:
@@ -1110,6 +1580,7 @@ def generate_validation_artifacts(
     start = perf_counter()
 
     prediction_length = model.config.prediction_length
+    predict_s2 = model.config.heads.predicts_s2
     s1_correct_by_step = torch.zeros(prediction_length, dtype=torch.float64)
     s2_correct_by_step = torch.zeros(prediction_length, dtype=torch.float64)
     token_count_by_step = torch.zeros(prediction_length, dtype=torch.float64)
@@ -1177,11 +1648,12 @@ def generate_validation_artifacts(
                 .sum(dim=(0, 2))
                 .to(torch.float64)
             )
-            s2_correct_by_step += (
-                (generated_tokens[..., 1] == target_s2.detach().cpu())
-                .sum(dim=(0, 2))
-                .to(torch.float64)
-            )
+            if predict_s2:
+                s2_correct_by_step += (
+                    (generated_tokens[..., 1] == target_s2.detach().cpu())
+                    .sum(dim=(0, 2))
+                    .to(torch.float64)
+                )
             token_count_by_step += float(batch_size * num_nodes)
             example_count += batch_size
 
@@ -1200,14 +1672,26 @@ def generate_validation_artifacts(
                     "raw training split."
                 )
 
-            decoded_future = tokenizer.decode_token_path(
-                context_tokens.detach().cpu(),
-                generated_tokens,
-                mean=torch.as_tensor(batch["context_mean"]),
-                std=torch.as_tensor(batch["context_std"]),
-                series_batch_size=decode_series_batch_size,
-                return_full_path=False,
-            ).to(torch.float32)
+            if predict_s2:
+                decoded_future = tokenizer.decode_token_path(
+                    context_tokens.detach().cpu(),
+                    generated_tokens,
+                    mean=torch.as_tensor(batch["context_mean"]),
+                    std=torch.as_tensor(batch["context_std"]),
+                    series_batch_size=decode_series_batch_size,
+                    return_full_path=False,
+                )
+            else:
+                decoded_future = tokenizer.decode_coarse_token_path(
+                    context_tokens.detach().cpu(),
+                    generated_tokens[..., 0],
+                    mean=torch.as_tensor(batch["context_mean"]),
+                    std=torch.as_tensor(batch["context_std"]),
+                    series_batch_size=decode_series_batch_size,
+                    return_full_path=False,
+                )
+
+            decoded_future = decoded_future.to(torch.float32)
 
             invalid_dense = _invalid_candle_mask(decoded_future)
             invalid_dense_count += int(invalid_dense.sum().item())
@@ -1265,17 +1749,29 @@ def generate_validation_artifacts(
         raise RuntimeError("Validation DataLoader yielded no examples.")
 
     s1_accuracy_by_step = s1_correct_by_step / token_count_by_step.clamp_min(1)
-    s2_accuracy_by_step = s2_correct_by_step / token_count_by_step.clamp_min(1)
+    if predict_s2:
+        s2_accuracy_by_step = (
+            s2_correct_by_step
+            / token_count_by_step.clamp_min(1)
+        )
+        generated_s2_accuracy = float(
+            s2_correct_by_step.sum().item()
+            / token_count_by_step.sum().clamp_min(1).item()
+        )
+    else:
+        s2_accuracy_by_step = torch.full(
+            (prediction_length,),
+            float("nan"),
+            dtype=torch.float64,
+        )
+        generated_s2_accuracy = float("nan")
 
     generation_metrics = GenerationMetrics(
         s1_accuracy=float(
             s1_correct_by_step.sum().item()
             / token_count_by_step.sum().clamp_min(1).item()
         ),
-        s2_accuracy=float(
-            s2_correct_by_step.sum().item()
-            / token_count_by_step.sum().clamp_min(1).item()
-        ),
+        s2_accuracy=generated_s2_accuracy,
         s1_accuracy_by_step=s1_accuracy_by_step,
         s2_accuracy_by_step=s2_accuracy_by_step,
         examples=example_count,
@@ -1285,6 +1781,8 @@ def generate_validation_artifacts(
     graph_artifacts = graph_accumulator.finalise()
 
     diagnostics: dict[str, Any] = {
+        "future_token_mode": model.config.heads.future_token_mode,
+        "s2_loss_weight": float(model.config.heads.s2_loss_weight),
         "generated_s1_accuracy": generation_metrics.s1_accuracy,
         "generated_s2_accuracy": generation_metrics.s2_accuracy,
         "generation_seconds": generation_metrics.seconds,
@@ -1560,6 +2058,21 @@ def _save_best_validation_artifacts(
     diagnostics = dict(bundle.diagnostics)
     diagnostics["epoch"] = int(epoch)
     diagnostics["graph_summary"] = graph_summary(bundle.graph_artifacts)
+    diagnostics["validation_objective_loss"] = (
+        teacher_forced.total_loss
+    )
+    diagnostics["validation_token_loss"] = (
+        teacher_forced.token_loss
+    )
+    diagnostics["validation_graph_regularisation_loss"] = (
+        teacher_forced.graph_regularisation_loss
+    )
+    diagnostics["validation_graph_mean_row_entropy"] = (
+        teacher_forced.graph_mean_row_entropy
+    )
+    diagnostics["validation_graph_mean_effective_neighbours"] = (
+        teacher_forced.graph_mean_effective_neighbours
+    )
     atomic_json_save(
         diagnostics,
         run_dir / "best_validation_diagnostics.json",
@@ -1713,6 +2226,20 @@ def main() -> None:
     decoding_config = resolved_config["decoding"]
     data_mode = str(resolved_config["data"]["mode"])
 
+    model_values = resolved_config[
+        "models"
+    ][
+        "dynamic_graph"
+    ]
+
+    graph_regularisation_config = (
+        GraphRegularisationConfig.from_mapping(
+            model_values.get(
+                "graph_regularisation"
+            )
+        )
+    )
+
     if data_mode not in {"real", "synthetic"}:
         raise ValueError("data.mode must be 'real' or 'synthetic'.")
 
@@ -1774,6 +2301,30 @@ def main() -> None:
     validation_dataset_full = loaders.validation_dataset
 
     model = DynamicGraphTokenForecaster.from_config(resolved_config).to(device)
+
+    if (
+        graph_regularisation_config
+        .graph_temporal_smooth_reg
+        > 0.0
+        and model.config.graph.type
+        not in {
+            "dynamic",
+            "dynamic_base",
+        }
+    ):
+        raise ValueError(
+            "graph_temporal_smooth_reg is only meaningful for "
+            "graph.type='dynamic' or 'dynamic_base'."
+        )
+
+    expected_origin_delta = int(
+        resolved_config[
+            "forecasting"
+        ][
+            "stride"
+        ]
+    )
+
     _validate_cache_against_model(
         dataset=train_dataset_full,
         model=model,
@@ -1900,8 +2451,31 @@ def main() -> None:
         "selection_metric": (
             "mean_validation_cumulative_log_change_mae"
             if data_mode == "real"
-            else "validation_teacher_forced_token_loss"
+            else "validation_supervised_token_loss"
         ),
+        "graph_regularisation": {
+            "graph_reg_layer": (
+                graph_regularisation_config.graph_reg_layer
+            ),
+            "graph_reg_warmup_epochs": (
+                graph_regularisation_config
+                .graph_reg_warmup_epochs
+            ),
+            "graph_entropy_reg": (
+                graph_regularisation_config.graph_entropy_reg
+            ),
+            "graph_target_entropy": (
+                graph_regularisation_config.graph_target_entropy
+            ),
+            "graph_target_entropy_reg": (
+                graph_regularisation_config
+                .graph_target_entropy_reg
+            ),
+            "graph_temporal_smooth_reg": (
+                graph_regularisation_config
+                .graph_temporal_smooth_reg
+            ),
+        },
     }
 
     signature_values = {
@@ -1997,7 +2571,17 @@ def main() -> None:
                 scaler=scaler,
                 use_amp=use_amp,
                 gradient_clip_norm=gradient_clip_norm,
-                description="validation teacher-forced",
+                description="validation supervised token loss",
+                graph_regularisation_config=(
+                    graph_regularisation_config
+                ),
+                current_epoch=max(
+                    0,
+                    epoch - 1,
+                ),
+                expected_origin_delta=(
+                    expected_origin_delta
+                ),
             )
             bundle = generate_validation_artifacts(
                 model=model,
@@ -2049,6 +2633,13 @@ def main() -> None:
                 use_amp=use_amp,
                 gradient_clip_norm=gradient_clip_norm,
                 description=f"epoch {epoch} training",
+                graph_regularisation_config=(
+                    graph_regularisation_config
+                ),
+                current_epoch=epoch - 1,
+                expected_origin_delta=(
+                    expected_origin_delta
+                ),
             )
             validation_teacher = run_teacher_forced_epoch(
                 model=model,
@@ -2058,7 +2649,16 @@ def main() -> None:
                 scaler=scaler,
                 use_amp=use_amp,
                 gradient_clip_norm=gradient_clip_norm,
-                description=f"epoch {epoch} validation teacher-forced",
+                description=(
+                    f"epoch {epoch} validation supervised token loss"
+                ),
+                graph_regularisation_config=(
+                    graph_regularisation_config
+                ),
+                current_epoch=epoch - 1,
+                expected_origin_delta=(
+                    expected_origin_delta
+                ),
             )
 
             should_decode = (
@@ -2087,7 +2687,7 @@ def main() -> None:
                 primary_score = (
                     float(bundle.primary_score)
                     if data_mode == "real"
-                    else float(validation_teacher.total_loss)
+                    else float(validation_teacher.token_loss)
                 )
 
                 improved = primary_score < (best_score - args.min_delta)
@@ -2127,15 +2727,73 @@ def main() -> None:
                 "epoch": epoch,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "train_total_loss": train_metrics.total_loss,
+                "train_token_loss": train_metrics.token_loss,
+                "train_graph_regularisation_loss": (
+                    train_metrics.graph_regularisation_loss
+                ),
+                "train_backcast_loss": train_metrics.backcast_loss,
+                "train_backcast_penalty": train_metrics.backcast_penalty,
                 "train_s1_loss": train_metrics.s1_loss,
                 "train_s2_loss": train_metrics.s2_loss,
                 "train_s1_accuracy": train_metrics.s1_accuracy,
                 "train_s2_accuracy": train_metrics.s2_accuracy,
+                "train_graph_mean_row_entropy": (
+                    train_metrics.graph_mean_row_entropy
+                ),
+                "train_graph_mean_effective_neighbours": (
+                    train_metrics.graph_mean_effective_neighbours
+                ),
+                "train_graph_entropy_penalty": (
+                    train_metrics.graph_entropy_penalty
+                ),
+                "train_graph_target_entropy_penalty": (
+                    train_metrics.graph_target_entropy_penalty
+                ),
+                "train_graph_temporal_smooth_penalty": (
+                    train_metrics.graph_temporal_smooth_penalty
+                ),
+                "train_graph_warmup_scale": (
+                    train_metrics.graph_warmup_scale
+                ),
+                "train_graph_valid_smoothing_pairs": (
+                    train_metrics.graph_valid_smoothing_pairs
+                ),
                 "validation_total_loss": validation_teacher.total_loss,
+                "validation_token_loss": validation_teacher.token_loss,
+                "validation_graph_regularisation_loss": (
+                    validation_teacher.graph_regularisation_loss
+                ),
+                "validation_backcast_loss": (
+                    validation_teacher.backcast_loss
+                ),
+                "validation_backcast_penalty": (
+                    validation_teacher.backcast_penalty
+                ),
                 "validation_s1_loss": validation_teacher.s1_loss,
                 "validation_s2_loss": validation_teacher.s2_loss,
                 "validation_s1_accuracy": validation_teacher.s1_accuracy,
                 "validation_s2_accuracy": validation_teacher.s2_accuracy,
+                "validation_graph_mean_row_entropy": (
+                    validation_teacher.graph_mean_row_entropy
+                ),
+                "validation_graph_mean_effective_neighbours": (
+                    validation_teacher.graph_mean_effective_neighbours
+                ),
+                "validation_graph_entropy_penalty": (
+                    validation_teacher.graph_entropy_penalty
+                ),
+                "validation_graph_target_entropy_penalty": (
+                    validation_teacher.graph_target_entropy_penalty
+                ),
+                "validation_graph_temporal_smooth_penalty": (
+                    validation_teacher.graph_temporal_smooth_penalty
+                ),
+                "validation_graph_warmup_scale": (
+                    validation_teacher.graph_warmup_scale
+                ),
+                "validation_graph_valid_smoothing_pairs": (
+                    validation_teacher.graph_valid_smoothing_pairs
+                ),
                 "decoded_validation": should_decode,
                 "primary_score": primary_score,
                 "best_score": best_score,
@@ -2206,8 +2864,9 @@ def main() -> None:
             )
             print(
                 f"epoch {epoch:>3}/{max_epochs} | "
-                f"train={train_metrics.total_loss:.6f} | "
-                f"val_token={validation_teacher.total_loss:.6f} | "
+                f"train_objective={train_metrics.total_loss:.6f} | "
+                f"train_token={train_metrics.token_loss:.6f} | "
+                f"val_token={validation_teacher.token_loss:.6f} | "
                 f"primary={score_text} | "
                 f"best_epoch={best_epoch} | "
                 f"seconds={epoch_record['epoch_seconds']:.1f}"
@@ -2280,3 +2939,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

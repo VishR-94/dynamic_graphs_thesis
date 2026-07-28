@@ -1321,6 +1321,7 @@ def compute_codebook_usage_metrics(
     encoded_data: Mapping[str, Any],
     *,
     vocabulary_size: int = 1024,
+    k: int = 10
 ) -> pd.DataFrame:
     """Summarise utilisation and concentration of both token streams.
 
@@ -1457,7 +1458,7 @@ def compute_codebook_usage_metrics(
         )
 
         top_k = min(
-            10,
+            k,
             vocabulary_size,
         )
 
@@ -1493,7 +1494,7 @@ def compute_codebook_usage_metrics(
                     .mul(100.0)
                     .item()
                 ),
-                "Top-10 Token Share (%)": float(
+                f"Top-{k} Token Share (%)": float(
                     largest_counts.sum()
                     .div(total)
                     .mul(100.0)

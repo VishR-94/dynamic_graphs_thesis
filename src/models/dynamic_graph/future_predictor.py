@@ -650,13 +650,18 @@ class HierarchicalTokenHeads(nn.Module):
 
 @dataclass
 class FutureTokenPrediction:
-    """Output shared by teacher-forced and generated paths."""
+    """Output shared by supervised and generated future paths.
+
+    In ``coarse_only`` mode, ``s2_logits`` and ``selected_s2`` are
+    intentionally ``None``. The observed context still contains both
+    frozen Kronos token streams.
+    """
 
     future_hidden: Tensor
     s1_logits: Tensor
-    s2_logits: Tensor
+    s2_logits: Tensor | None
     selected_s1: Tensor
-    selected_s2: Tensor
+    selected_s2: Tensor | None
 
     def validate(
         self,
@@ -667,6 +672,7 @@ class FutureTokenPrediction:
         d_model: int,
         s1_vocabulary_size: int,
         s2_vocabulary_size: int,
+        predict_s2: bool,
     ) -> None:
         expected_hidden = (
             batch_size,
@@ -674,30 +680,25 @@ class FutureTokenPrediction:
             num_nodes,
             d_model,
         )
-
         expected_s1 = (
             batch_size,
             prediction_length,
             num_nodes,
             s1_vocabulary_size,
         )
-
         expected_s2 = (
             batch_size,
             prediction_length,
             num_nodes,
             s2_vocabulary_size,
         )
-
         expected_ids = (
             batch_size,
             prediction_length,
             num_nodes,
         )
 
-        if tuple(self.future_hidden.shape) != (
-            expected_hidden
-        ):
+        if tuple(self.future_hidden.shape) != expected_hidden:
             raise ValueError(
                 "future_hidden has an unexpected shape."
             )
@@ -707,30 +708,47 @@ class FutureTokenPrediction:
                 "s1_logits has an unexpected shape."
             )
 
-        if tuple(self.s2_logits.shape) != expected_s2:
-            raise ValueError(
-                "s2_logits has an unexpected shape."
-            )
-
         if tuple(self.selected_s1.shape) != expected_ids:
             raise ValueError(
                 "selected_s1 has an unexpected shape."
             )
 
-        if tuple(self.selected_s2.shape) != expected_ids:
+        if predict_s2:
+            if self.s2_logits is None or self.selected_s2 is None:
+                raise ValueError(
+                    "Full-token mode requires s2 logits and IDs."
+                )
+
+            if tuple(self.s2_logits.shape) != expected_s2:
+                raise ValueError(
+                    "s2_logits has an unexpected shape."
+                )
+
+            if tuple(self.selected_s2.shape) != expected_ids:
+                raise ValueError(
+                    "selected_s2 has an unexpected shape."
+                )
+        elif self.s2_logits is not None or self.selected_s2 is not None:
             raise ValueError(
-                "selected_s2 has an unexpected shape."
+                "Coarse-only mode must not return s2 logits or IDs."
             )
 
         for name, values in (
             ("future_hidden", self.future_hidden),
             ("s1_logits", self.s1_logits),
-            ("s2_logits", self.s2_logits),
         ):
             if not torch.isfinite(values).all():
                 raise ValueError(
                     f"{name} contains non-finite values."
                 )
+
+        if (
+            self.s2_logits is not None
+            and not torch.isfinite(self.s2_logits).all()
+        ):
+            raise ValueError(
+                "s2_logits contains non-finite values."
+            )
 
         if (
             self.selected_s1.min().item() < 0
@@ -741,7 +759,7 @@ class FutureTokenPrediction:
                 "selected_s1 lies outside its vocabulary."
             )
 
-        if (
+        if self.selected_s2 is not None and (
             self.selected_s2.min().item() < 0
             or self.selected_s2.max().item()
             >= s2_vocabulary_size
@@ -782,6 +800,12 @@ class FutureTokenPredictorBase(
         )
         self.s2_vocabulary_size = int(
             config.heads.s2_vocabulary_size
+        )
+        self.s2_conditioning = (
+            config.heads.resolved_s2_conditioning
+        )
+        self.predict_s2 = bool(
+            config.heads.predicts_s2
         )
 
         predictor_config = (
@@ -919,16 +943,25 @@ class FutureTokenPredictorBase(
         future_hidden: Tensor,
         *,
         s1_embedding: nn.Embedding,
-        conditioning_s1: Tensor | None,
+        target_s1: Tensor | None,
         token_selection: TokenSelection,
         temperature: float,
         top_k: int,
         top_p: float,
     ) -> FutureTokenPrediction:
+        """Classify one complete future hidden path.
+
+        The coarse stream is always predicted. In full-token mode, the
+        fine stream is conditioned according to ``heads.s2_conditioning``.
+        In coarse-only mode, the fine classifier is not evaluated.
+        """
+        batch_size, prediction_length, num_nodes, _ = (
+            future_hidden.shape
+        )
+
         s1_logits = self.token_heads.s1_logits(
             future_hidden
         )
-
         selected_s1 = select_token_ids(
             s1_logits,
             mode=token_selection,
@@ -937,18 +970,43 @@ class FutureTokenPredictorBase(
             top_p=top_p,
         )
 
-        s1_for_fine = (
-            selected_s1
-            if conditioning_s1 is None
-            else conditioning_s1.long()
-        )
+        if not self.predict_s2:
+            return FutureTokenPrediction(
+                future_hidden=future_hidden,
+                s1_logits=s1_logits,
+                s2_logits=None,
+                selected_s1=selected_s1,
+                selected_s2=None,
+            )
+
+        if (
+            self.s2_conditioning == "true_s1"
+            and target_s1 is not None
+        ):
+            s1_for_fine = _validate_target_tokens(
+                target_s1,
+                name="target_s1",
+                batch_size=int(batch_size),
+                prediction_length=int(prediction_length),
+                num_nodes=int(num_nodes),
+                vocabulary_size=self.s1_vocabulary_size,
+            )
+        elif self.s2_conditioning in {
+            "true_s1",
+            "predicted_s1",
+        }:
+            s1_for_fine = selected_s1.detach()
+        else:
+            raise RuntimeError(
+                "Unexpected s2 conditioning policy "
+                f"{self.s2_conditioning!r}."
+            )
 
         s2_logits = self.token_heads.s2_logits(
             future_hidden,
             s1_for_fine,
             s1_embedding=s1_embedding,
         )
-
         selected_s2 = select_token_ids(
             s2_logits,
             mode=token_selection,
@@ -1090,26 +1148,10 @@ class StructuredParallelFuturePredictor(
             s2_embedding=s2_embedding,
         )
 
-        conditioning_s1 = None
-
-        if target_s1 is not None:
-            conditioning_s1 = _validate_target_tokens(
-                target_s1,
-                name="target_s1",
-                batch_size=batch_size,
-                prediction_length=(
-                    self.prediction_length
-                ),
-                num_nodes=self.num_nodes,
-                vocabulary_size=(
-                    self.s1_vocabulary_size
-                ),
-            )
-
         prediction = self._classify(
             future_hidden,
             s1_embedding=s1_embedding,
-            conditioning_s1=conditioning_s1,
+            target_s1=target_s1,
             token_selection=token_selection,
             temperature=temperature,
             top_k=top_k,
@@ -1129,6 +1171,7 @@ class StructuredParallelFuturePredictor(
             s2_vocabulary_size=(
                 self.s2_vocabulary_size
             ),
+            predict_s2=self.predict_s2,
         )
 
         return prediction
@@ -1198,7 +1241,7 @@ class AutoregressiveFuturePredictor(
         *,
         batch_size: int,
         target_s1: Tensor,
-        target_s2: Tensor,
+        target_s2: Tensor | None,
         context_summary: Tensor,
         s1_embedding: nn.Embedding,
         s2_embedding: nn.Embedding,
@@ -1208,44 +1251,34 @@ class AutoregressiveFuturePredictor(
             target_s1,
             name="target_s1",
             batch_size=batch_size,
-            prediction_length=(
-                self.prediction_length
-            ),
+            prediction_length=self.prediction_length,
             num_nodes=self.num_nodes,
-            vocabulary_size=(
-                self.s1_vocabulary_size
-            ),
+            vocabulary_size=self.s1_vocabulary_size,
         )
 
-        target_s2 = _validate_target_tokens(
-            target_s2,
-            name="target_s2",
-            batch_size=batch_size,
-            prediction_length=(
-                self.prediction_length
-            ),
-            num_nodes=self.num_nodes,
-            vocabulary_size=(
-                self.s2_vocabulary_size
-            ),
+        previous_embedding = s1_embedding(
+            target_s1[:, :-1, :]
         )
 
-        previous_pair = (
-            s1_embedding(
-                target_s1[
-                    :,
-                    :-1,
-                    :,
-                ]
+        if self.predict_s2:
+            if target_s2 is None:
+                raise ValueError(
+                    "Full-token autoregressive training requires "
+                    "target_s2."
+                )
+
+            target_s2 = _validate_target_tokens(
+                target_s2,
+                name="target_s2",
+                batch_size=batch_size,
+                prediction_length=self.prediction_length,
+                num_nodes=self.num_nodes,
+                vocabulary_size=self.s2_vocabulary_size,
             )
-            + s2_embedding(
-                target_s2[
-                    :,
-                    :-1,
-                    :,
-                ]
+            previous_embedding = (
+                previous_embedding
+                + s2_embedding(target_s2[:, :-1, :])
             )
-        )
 
         shifted = torch.empty(
             (
@@ -1257,53 +1290,32 @@ class AutoregressiveFuturePredictor(
             dtype=context_summary.dtype,
             device=device,
         )
-
-        shifted[
-            :,
-            0,
-            :,
-            :,
-        ] = self.start_embedding.view(
+        shifted[:, 0, :, :] = self.start_embedding.view(
             1,
             1,
             self.d_model,
         )
-
-        shifted[
-            :,
-            1:,
-            :,
-            :,
-        ] = previous_pair
+        shifted[:, 1:, :, :] = previous_embedding
 
         position_ids = torch.arange(
             self.prediction_length,
             device=device,
         )
-
-        position_embedding = (
-            self.future_position_embedding(
-                position_ids
-            )
-            .view(
-                1,
-                self.prediction_length,
-                1,
-                self.d_model,
-            )
+        position_embedding = self.future_position_embedding(
+            position_ids
+        ).view(
+            1,
+            self.prediction_length,
+            1,
+            self.d_model,
         )
-
         summary = context_summary.reshape(
             batch_size,
             self.num_nodes,
             self.d_model,
         ).unsqueeze(1)
 
-        return (
-            shifted
-            + position_embedding
-            + summary
-        )
+        return shifted + position_embedding + summary
 
     def forward(
         self,
@@ -1318,11 +1330,16 @@ class AutoregressiveFuturePredictor(
         top_k: int = 0,
         top_p: float = 1.0,
     ) -> FutureTokenPrediction:
-        if target_s1 is None or target_s2 is None:
+        if target_s1 is None:
             raise ValueError(
-                "Autoregressive teacher-forced forward requires "
-                "target_s1 and target_s2. Use generate() for "
-                "free-running inference."
+                "Autoregressive supervised forward requires target_s1. "
+                "Use generate() for free-running inference."
+            )
+
+        if self.predict_s2 and target_s2 is None:
+            raise ValueError(
+                "Full-token autoregressive supervised forward requires "
+                "target_s2."
             )
 
         (
@@ -1361,25 +1378,10 @@ class AutoregressiveFuturePredictor(
             num_nodes=self.num_nodes,
         )
 
-        validated_target_s1 = _validate_target_tokens(
-            target_s1,
-            name="target_s1",
-            batch_size=batch_size,
-            prediction_length=(
-                self.prediction_length
-            ),
-            num_nodes=self.num_nodes,
-            vocabulary_size=(
-                self.s1_vocabulary_size
-            ),
-        )
-
         prediction = self._classify(
             future_hidden,
             s1_embedding=s1_embedding,
-            conditioning_s1=(
-                validated_target_s1
-            ),
+            target_s1=target_s1,
             token_selection=token_selection,
             temperature=temperature,
             top_k=top_k,
@@ -1399,6 +1401,7 @@ class AutoregressiveFuturePredictor(
             s2_vocabulary_size=(
                 self.s2_vocabulary_size
             ),
+            predict_s2=self.predict_s2,
         )
 
         return prediction
@@ -1463,24 +1466,26 @@ class AutoregressiveFuturePredictor(
                     dim=1,
                 )
 
-                previous_s2 = torch.stack(
-                    selected_s2_steps,
-                    dim=1,
+                previous_embedding = s1_embedding(
+                    previous_s1
                 )
+
+                if self.predict_s2:
+                    previous_s2 = torch.stack(
+                        selected_s2_steps,
+                        dim=1,
+                    )
+                    previous_embedding = (
+                        previous_embedding
+                        + s2_embedding(previous_s2)
+                    )
 
                 prefix_inputs[
                     :,
                     1:,
                     :,
                     :,
-                ] = (
-                    s1_embedding(
-                        previous_s1
-                    )
-                    + s2_embedding(
-                        previous_s2
-                    )
-                )
+                ] = previous_embedding
 
             position_ids = torch.arange(
                 prefix_length,
@@ -1541,37 +1546,35 @@ class AutoregressiveFuturePredictor(
                 top_p=top_p,
             )
 
-            current_s2_logits = (
-                self.token_heads.s2_logits(
-                    current_hidden,
-                    current_s1,
-                    s1_embedding=s1_embedding,
-                )
-            )
-
-            current_s2 = select_token_ids(
-                current_s2_logits,
-                mode=token_selection,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            )
-
             hidden_steps.append(
                 current_hidden
             )
             s1_logit_steps.append(
                 current_s1_logits
             )
-            s2_logit_steps.append(
-                current_s2_logits
-            )
             selected_s1_steps.append(
                 current_s1
             )
-            selected_s2_steps.append(
-                current_s2
-            )
+
+            if self.predict_s2:
+                current_s2_logits = self.token_heads.s2_logits(
+                    current_hidden,
+                    current_s1,
+                    s1_embedding=s1_embedding,
+                )
+                current_s2 = select_token_ids(
+                    current_s2_logits,
+                    mode=token_selection,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+                s2_logit_steps.append(
+                    current_s2_logits
+                )
+                selected_s2_steps.append(
+                    current_s2
+                )
 
         prediction = FutureTokenPrediction(
             future_hidden=torch.stack(
@@ -1582,17 +1585,25 @@ class AutoregressiveFuturePredictor(
                 s1_logit_steps,
                 dim=1,
             ),
-            s2_logits=torch.stack(
-                s2_logit_steps,
-                dim=1,
+            s2_logits=(
+                torch.stack(
+                    s2_logit_steps,
+                    dim=1,
+                )
+                if self.predict_s2
+                else None
             ),
             selected_s1=torch.stack(
                 selected_s1_steps,
                 dim=1,
             ),
-            selected_s2=torch.stack(
-                selected_s2_steps,
-                dim=1,
+            selected_s2=(
+                torch.stack(
+                    selected_s2_steps,
+                    dim=1,
+                )
+                if self.predict_s2
+                else None
             ),
         )
 
@@ -1609,6 +1620,7 @@ class AutoregressiveFuturePredictor(
             s2_vocabulary_size=(
                 self.s2_vocabulary_size
             ),
+            predict_s2=self.predict_s2,
         )
 
         return prediction
@@ -1812,7 +1824,11 @@ def compute_future_token_loss(
     evaluation_horizons: tuple[int, ...],
     s2_loss_weight: float,
 ) -> FutureTokenLoss:
-    """Compute weighted cross-entropy over the complete future path."""
+    """Compute weighted coarse/full-token cross-entropy.
+
+    When ``s2_loss_weight`` is zero, the prediction must be coarse-only
+    and the fine-token cross-entropy is not evaluated.
+    """
     if s2_loss_weight < 0:
         raise ValueError(
             "s2_loss_weight cannot be negative."
@@ -1821,11 +1837,6 @@ def compute_future_token_loss(
     batch_size, prediction_length, num_nodes, s1_vocab = (
         prediction.s1_logits.shape
     )
-
-    _, _, _, s2_vocab = (
-        prediction.s2_logits.shape
-    )
-
     target_s1 = _validate_target_tokens(
         target_s1,
         name="target_s1",
@@ -1835,20 +1846,8 @@ def compute_future_token_loss(
         vocabulary_size=s1_vocab,
     )
 
-    target_s2 = _validate_target_tokens(
-        target_s2,
-        name="target_s2",
-        batch_size=batch_size,
-        prediction_length=prediction_length,
-        num_nodes=num_nodes,
-        vocabulary_size=s2_vocab,
-    )
-
     s1_elementwise = F.cross_entropy(
-        prediction.s1_logits.reshape(
-            -1,
-            s1_vocab,
-        ),
+        prediction.s1_logits.reshape(-1, s1_vocab),
         target_s1.reshape(-1),
         reduction="none",
     ).reshape(
@@ -1856,27 +1855,39 @@ def compute_future_token_loss(
         prediction_length,
         num_nodes,
     )
+    s1_by_step = s1_elementwise.mean(dim=(0, 2))
 
-    s2_elementwise = F.cross_entropy(
-        prediction.s2_logits.reshape(
-            -1,
-            s2_vocab,
-        ),
-        target_s2.reshape(-1),
-        reduction="none",
-    ).reshape(
-        batch_size,
-        prediction_length,
-        num_nodes,
-    )
-
-    s1_by_step = s1_elementwise.mean(
-        dim=(0, 2)
-    )
-
-    s2_by_step = s2_elementwise.mean(
-        dim=(0, 2)
-    )
+    if s2_loss_weight == 0.0:
+        if prediction.s2_logits is not None:
+            raise ValueError(
+                "s2_loss_weight=0 requires a coarse-only prediction."
+            )
+        s2_by_step = torch.zeros_like(s1_by_step)
+        s2_loss = prediction.s1_logits.new_zeros(())
+    else:
+        if prediction.s2_logits is None:
+            raise ValueError(
+                "A positive s2_loss_weight requires s2_logits."
+            )
+        s2_vocab = int(prediction.s2_logits.shape[-1])
+        target_s2 = _validate_target_tokens(
+            target_s2,
+            name="target_s2",
+            batch_size=batch_size,
+            prediction_length=prediction_length,
+            num_nodes=num_nodes,
+            vocabulary_size=s2_vocab,
+        )
+        s2_elementwise = F.cross_entropy(
+            prediction.s2_logits.reshape(-1, s2_vocab),
+            target_s2.reshape(-1),
+            reduction="none",
+        ).reshape(
+            batch_size,
+            prediction_length,
+            num_nodes,
+        )
+        s2_by_step = s2_elementwise.mean(dim=(0, 2))
 
     weights = build_future_position_weights(
         loss_config,
@@ -1885,24 +1896,13 @@ def compute_future_token_loss(
         device=prediction.s1_logits.device,
         dtype=prediction.s1_logits.dtype,
     )
-
     denominator = weights.sum()
+    s1_loss = (s1_by_step * weights).sum() / denominator
 
-    s1_loss = (
-        s1_by_step
-        * weights
-    ).sum() / denominator
+    if s2_loss_weight != 0.0:
+        s2_loss = (s2_by_step * weights).sum() / denominator
 
-    s2_loss = (
-        s2_by_step
-        * weights
-    ).sum() / denominator
-
-    total = (
-        s1_loss
-        + float(s2_loss_weight)
-        * s2_loss
-    )
+    total = s1_loss + float(s2_loss_weight) * s2_loss
 
     return FutureTokenLoss(
         total=total,
@@ -2081,6 +2081,104 @@ def _cpu_smoke_test() -> None:
             "Structured-parallel s1 logits depend on targets."
         )
 
+    if torch.equal(
+        parallel_prediction.s2_logits,
+        alternative_parallel.s2_logits,
+    ):
+        raise AssertionError(
+            "true_s1 conditioning did not make the fine head respond "
+            "to the same-position coarse target."
+        )
+
+    predicted_s1_config = replace(
+        base_config,
+        heads=replace(
+            base_config.heads,
+            s2_conditioning="predicted_s1",
+            condition_s2_on_s1=None,
+        ),
+    )
+
+    predicted_s1_parallel = (
+        build_future_token_predictor(
+            predicted_s1_config
+        )
+    )
+    predicted_s1_parallel.eval()
+
+    predicted_conditioning_a = (
+        predicted_s1_parallel(
+            context_memory,
+            s1_embedding=s1_embedding,
+            s2_embedding=s2_embedding,
+            target_s1=target_s1,
+            target_s2=target_s2,
+        )
+    )
+
+    predicted_conditioning_b = (
+        predicted_s1_parallel(
+            context_memory,
+            s1_embedding=s1_embedding,
+            s2_embedding=s2_embedding,
+            target_s1=alternative_s1,
+            target_s2=alternative_s2,
+        )
+    )
+
+    predicted_conditioning_generated = (
+        predicted_s1_parallel.generate(
+            context_memory,
+            s1_embedding=s1_embedding,
+            s2_embedding=s2_embedding,
+        )
+    )
+
+    for name, first, second in (
+        (
+            "future_hidden",
+            predicted_conditioning_a.future_hidden,
+            predicted_conditioning_b.future_hidden,
+        ),
+        (
+            "s1_logits",
+            predicted_conditioning_a.s1_logits,
+            predicted_conditioning_b.s1_logits,
+        ),
+        (
+            "s2_logits",
+            predicted_conditioning_a.s2_logits,
+            predicted_conditioning_b.s2_logits,
+        ),
+        (
+            "selected_s1",
+            predicted_conditioning_a.selected_s1,
+            predicted_conditioning_b.selected_s1,
+        ),
+        (
+            "selected_s2",
+            predicted_conditioning_a.selected_s2,
+            predicted_conditioning_b.selected_s2,
+        ),
+    ):
+        if not torch.equal(
+            first,
+            second,
+        ):
+            raise AssertionError(
+                "predicted_s1 conditioning still depends on future "
+                f"target tokens through {name}."
+            )
+
+    if not torch.equal(
+        predicted_conditioning_a.s2_logits,
+        predicted_conditioning_generated.s2_logits,
+    ):
+        raise AssertionError(
+            "Structured-parallel predicted_s1 supervised and generated "
+            "fine logits differ under deterministic selection."
+        )
+
     # --------------------------------------------------------
     # Autoregressive predictor.
     # --------------------------------------------------------
@@ -2203,6 +2301,57 @@ def _cpu_smoke_test() -> None:
         raise AssertionError(
             "Autoregressive first-step teacher-forced and "
             "generated s1 logits differ."
+        )
+
+    autoregressive_predicted_config = replace(
+        autoregressive_config,
+        heads=replace(
+            autoregressive_config.heads,
+            s2_conditioning="predicted_s1",
+            condition_s2_on_s1=None,
+        ),
+    )
+
+    autoregressive_predicted = (
+        build_future_token_predictor(
+            autoregressive_predicted_config
+        )
+    )
+    autoregressive_predicted.eval()
+
+    autoregressive_predicted_forward = (
+        autoregressive_predicted(
+            context_memory,
+            s1_embedding=s1_embedding,
+            s2_embedding=s2_embedding,
+            target_s1=target_s1,
+            target_s2=target_s2,
+        )
+    )
+
+    autoregressive_predicted_generated = (
+        autoregressive_predicted.generate(
+            context_memory,
+            s1_embedding=s1_embedding,
+            s2_embedding=s2_embedding,
+        )
+    )
+
+    if not torch.allclose(
+        autoregressive_predicted_forward.s2_logits[
+            :,
+            0,
+        ],
+        autoregressive_predicted_generated.s2_logits[
+            :,
+            0,
+        ],
+        atol=1.0e-6,
+        rtol=0.0,
+    ):
+        raise AssertionError(
+            "Autoregressive predicted_s1 first-step supervised and "
+            "generated fine logits differ."
         )
 
     # --------------------------------------------------------
@@ -2389,6 +2538,107 @@ def _cpu_smoke_test() -> None:
         )
 
     # --------------------------------------------------------
+    # Coarse-only prediction and loss.
+    # --------------------------------------------------------
+
+    coarse_only_config = replace(
+        base_config,
+        heads=replace(
+            base_config.heads,
+            future_token_mode="coarse_only",
+            s2_loss_weight=0.0,
+        ),
+    )
+
+    coarse_only = build_future_token_predictor(
+        coarse_only_config
+    )
+    coarse_only.train()
+
+    coarse_prediction = coarse_only(
+        context_memory,
+        s1_embedding=s1_embedding,
+        s2_embedding=s2_embedding,
+        target_s1=target_s1,
+        target_s2=target_s2,
+    )
+    coarse_generated = coarse_only.generate(
+        context_memory,
+        s1_embedding=s1_embedding,
+        s2_embedding=s2_embedding,
+    )
+
+    for name, prediction in (
+        ("supervised", coarse_prediction),
+        ("generated", coarse_generated),
+    ):
+        if prediction.s2_logits is not None:
+            raise AssertionError(
+                f"Coarse-only {name} path returned s2 logits."
+            )
+        if prediction.selected_s2 is not None:
+            raise AssertionError(
+                f"Coarse-only {name} path returned s2 IDs."
+            )
+
+    coarse_loss = compute_future_token_loss(
+        coarse_prediction,
+        target_s1,
+        target_s2,
+        loss_config=coarse_only_config.loss,
+        evaluation_horizons=(
+            coarse_only_config
+            .heads
+            .evaluation_horizons
+        ),
+        s2_loss_weight=0.0,
+    )
+
+    if not torch.equal(
+        coarse_loss.total,
+        coarse_loss.s1,
+    ):
+        raise AssertionError(
+            "Coarse-only total loss does not equal s1 loss."
+        )
+
+    if coarse_loss.s2.item() != 0.0:
+        raise AssertionError(
+            "Coarse-only loss returned a non-zero s2 term."
+        )
+
+    coarse_only.zero_grad(set_to_none=True)
+    coarse_loss.total.backward()
+
+    coarse_s1_gradient = (
+        coarse_only
+        .token_heads
+        .s1_classifier
+        .weight
+        .grad
+    )
+    coarse_s2_gradient = (
+        coarse_only
+        .token_heads
+        .s2_classifier
+        .weight
+        .grad
+    )
+
+    if (
+        coarse_s1_gradient is None
+        or coarse_s1_gradient.norm().item() <= 0.0
+    ):
+        raise AssertionError(
+            "Coarse-only loss did not reach the s1 classifier."
+        )
+
+    if coarse_s2_gradient is not None:
+        raise AssertionError(
+            "Coarse-only loss unexpectedly reached the s2 classifier."
+        )
+
+    # --------------------------------------------------------
     # Node-independence check inside the future predictor.
     # --------------------------------------------------------
 
@@ -2530,4 +2780,8 @@ def _cpu_smoke_test() -> None:
 
 if __name__ == "__main__":
     _cpu_smoke_test()
+
+
+
+
 

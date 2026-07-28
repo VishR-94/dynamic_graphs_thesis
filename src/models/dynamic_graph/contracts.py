@@ -54,6 +54,16 @@ FuturePredictorType = Literal[
     "autoregressive",
 ]
 
+S2Conditioning = Literal[
+    "true_s1",
+    "predicted_s1",
+]
+
+FutureTokenMode = Literal[
+    "full",
+    "coarse_only",
+]
+
 HorizonWeighting = Literal[
     "uniform",
     "gaussian_mixture",
@@ -353,7 +363,24 @@ class ForecastHeadConfig:
     s1_vocabulary_size: int = 1024
     s2_vocabulary_size: int = 1024
     s2_loss_weight: float = 1.0
-    condition_s2_on_s1: bool = True
+
+    # ``full`` predicts and decodes both Kronos subtokens.
+    # ``coarse_only`` optimises only s1 and uses the frozen tokenizer
+    # coarse reconstruction branch for raw-price validation. Historical
+    # context still contains both observed s1 and s2 IDs.
+    future_token_mode: FutureTokenMode = "full"
+
+    # Primary configuration used by new runs. During supervised training,
+    # ``true_s1`` conditions the fine head on the same-position target
+    # coarse token. ``predicted_s1`` uses the model-selected coarse token,
+    # matching free-running generation.
+    s2_conditioning: S2Conditioning = "true_s1"
+
+    # Backwards-compatible field for older saved configs and smoke tests.
+    # When provided, it takes precedence over ``s2_conditioning``:
+    # True -> true_s1; False -> predicted_s1. New YAML files should use
+    # ``s2_conditioning`` and omit this legacy field.
+    condition_s2_on_s1: bool | None = None
 
     def validate(self) -> None:
         _validate_positive_integer(
@@ -409,6 +436,71 @@ class ForecastHeadConfig:
             raise ValueError(
                 "heads.s2_loss_weight cannot be negative."
             )
+
+        if self.future_token_mode not in {
+            "full",
+            "coarse_only",
+        }:
+            raise ValueError(
+                "heads.future_token_mode must be 'full' or "
+                "'coarse_only'."
+            )
+
+        if (
+            self.future_token_mode == "coarse_only"
+            and self.s2_loss_weight != 0.0
+        ):
+            raise ValueError(
+                "heads.s2_loss_weight must be 0.0 when "
+                "heads.future_token_mode='coarse_only'."
+            )
+
+        if self.s2_conditioning not in {
+            "true_s1",
+            "predicted_s1",
+        }:
+            raise ValueError(
+                "heads.s2_conditioning must be 'true_s1' or "
+                "'predicted_s1'."
+            )
+
+        if (
+            self.condition_s2_on_s1 is not None
+            and not isinstance(
+                self.condition_s2_on_s1,
+                bool,
+            )
+        ):
+            raise TypeError(
+                "heads.condition_s2_on_s1 must be boolean or None."
+            )
+
+    @property
+    def predicts_s2(self) -> bool:
+        """Whether the future predictor should evaluate the fine head."""
+        return self.future_token_mode == "full"
+
+    @property
+    def uses_fine_token_path(self) -> bool:
+        """Whether future s2 is optimised and used for raw decoding."""
+        return self.predicts_s2
+
+    @property
+    def resolved_s2_conditioning(self) -> S2Conditioning:
+        """Return the active fine-head conditioning policy.
+
+        ``condition_s2_on_s1`` is retained only so historical configs and
+        checkpoints can still be reconstructed. New experiments should
+        record the explicit ``s2_conditioning`` string.
+        """
+        if self.condition_s2_on_s1 is not None:
+            return (
+                "true_s1"
+                if self.condition_s2_on_s1
+                else "predicted_s1"
+            )
+
+        return self.s2_conditioning
 
     @property
     def evaluation_indices(self) -> tuple[int, ...]:
@@ -778,7 +870,7 @@ class TokenForecastOutput:
     """Typed output of the direct sparse-horizon forecaster."""
 
     s1_logits: Tensor
-    s2_logits: Tensor
+    s2_logits: Tensor | None
     graph: GraphOutput
     context_hidden: Tensor
     temporal_hidden: Tensor
@@ -814,11 +906,21 @@ class TokenForecastOutput:
                 f"expected {expected_s1}."
             )
 
-        if tuple(self.s2_logits.shape) != expected_s2:
+        if config.heads.predicts_s2:
+            if self.s2_logits is None:
+                raise ValueError(
+                    "Full-token mode requires s2_logits."
+                )
+
+            if tuple(self.s2_logits.shape) != expected_s2:
+                raise ValueError(
+                    "s2_logits has shape "
+                    f"{tuple(self.s2_logits.shape)}; "
+                    f"expected {expected_s2}."
+                )
+        elif self.s2_logits is not None:
             raise ValueError(
-                "s2_logits has shape "
-                f"{tuple(self.s2_logits.shape)}; "
-                f"expected {expected_s2}."
+                "Coarse-only mode must not return s2_logits."
             )
 
         expected_context_hidden = (
@@ -908,9 +1010,12 @@ class TokenForecastOutput:
                 "s1_logits contains non-finite values."
             )
 
-        if not torch.isfinite(
-            self.s2_logits
-        ).all():
+        if (
+            self.s2_logits is not None
+            and not torch.isfinite(
+                self.s2_logits
+            ).all()
+        ):
             raise ValueError(
                 "s2_logits contains non-finite values."
             )
@@ -1160,6 +1265,31 @@ def _cpu_smoke_test() -> None:
 
     config.validate()
 
+    coarse_heads = ForecastHeadConfig(
+        prediction_length=60,
+        evaluation_horizons=(1, 5, 15, 30, 60),
+        s2_loss_weight=0.0,
+        future_token_mode="coarse_only",
+    )
+    coarse_heads.validate()
+
+    if coarse_heads.predicts_s2:
+        raise AssertionError(
+            "Coarse-only head configuration still predicts s2."
+        )
+
+    try:
+        ForecastHeadConfig(
+            s2_loss_weight=1.0,
+            future_token_mode="coarse_only",
+        ).validate()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "Coarse-only configuration accepted a non-zero s2 weight."
+        )
+
     batch_size = 3
 
     batch = {
@@ -1315,4 +1445,8 @@ def _cpu_smoke_test() -> None:
 
 if __name__ == "__main__":
     _cpu_smoke_test()
+
+
+
+
 

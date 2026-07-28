@@ -19,12 +19,6 @@ from .contracts import (
 
 ConfigDict = dict[str, Any]
 
-PREDICTOR_SELECTION_PRESETS = (
-    "structured_parallel_uniform",
-    "structured_parallel_weighted",
-    "autoregressive_uniform",
-)
-
 
 def _deep_merge(
     base: Mapping[str, Any],
@@ -378,12 +372,54 @@ def _cpu_smoke_test() -> None:
         "configs/dynamic_graph.yaml"
     )
 
+    raw = load_yaml(
+        config_path
+    )
+
+    presets = raw.get(
+        "presets"
+    )
+
+    if not isinstance(
+        presets,
+        Mapping,
+    ):
+        raise ValueError(
+            "The dynamic-graph YAML must contain a presets mapping."
+        )
+
+    preset_names = tuple(
+        str(name)
+        for name in presets
+    )
+
+    required_presets = {
+        "structured_parallel_uniform",
+        "structured_parallel_weighted",
+        "autoregressive_uniform",
+        "structured_parallel_coarse_only",
+        "free_static_full_true_s1",
+        "free_static_coarse_only",
+        "free_static_full_predicted_s1",
+    }
+
+    missing_presets = (
+        required_presets
+        - set(preset_names)
+    )
+
+    if missing_presets:
+        raise AssertionError(
+            "Required dynamic-graph presets are missing: "
+            f"{sorted(missing_presets)}."
+        )
+
     resolved = {
         preset: load_dynamic_graph_config(
             config_path,
             preset=preset,
         )
-        for preset in PREDICTOR_SELECTION_PRESETS
+        for preset in preset_names
     }
 
     typed = {
@@ -402,6 +438,18 @@ def _cpu_smoke_test() -> None:
     autoregressive = typed[
         "autoregressive_uniform"
     ]
+    legacy_coarse_only = typed[
+        "structured_parallel_coarse_only"
+    ]
+    free_static_reference = typed[
+        "free_static_full_true_s1"
+    ]
+    free_static_coarse = typed[
+        "free_static_coarse_only"
+    ]
+    free_static_predicted_s1 = typed[
+        "free_static_full_predicted_s1"
+    ]
 
     assert (
         parallel_uniform
@@ -409,7 +457,6 @@ def _cpu_smoke_test() -> None:
         .type
         == "structured_parallel"
     )
-
     assert (
         parallel_uniform
         .loss
@@ -423,7 +470,6 @@ def _cpu_smoke_test() -> None:
         .type
         == "structured_parallel"
     )
-
     assert (
         parallel_weighted
         .loss
@@ -437,7 +483,6 @@ def _cpu_smoke_test() -> None:
         .type
         == "autoregressive"
     )
-
     assert (
         autoregressive
         .loss
@@ -445,11 +490,91 @@ def _cpu_smoke_test() -> None:
         == "uniform"
     )
 
+    assert (
+        legacy_coarse_only
+        .heads
+        .future_token_mode
+        == "coarse_only"
+    )
+    assert not legacy_coarse_only.heads.predicts_s2
+    assert (
+        legacy_coarse_only
+        .heads
+        .s2_loss_weight
+        == 0.0
+    )
+
+    assert (
+        free_static_reference
+        .graph
+        .type
+        == "free_static"
+    )
+    assert (
+        free_static_reference
+        .heads
+        .future_token_mode
+        == "full"
+    )
+    assert (
+        free_static_reference
+        .heads
+        .s2_conditioning
+        == "true_s1"
+    )
+    assert (
+        free_static_reference
+        .heads
+        .s2_loss_weight
+        == 1.0
+    )
+
+    assert (
+        free_static_coarse
+        .graph
+        .type
+        == "free_static"
+    )
+    assert (
+        free_static_coarse
+        .heads
+        .future_token_mode
+        == "coarse_only"
+    )
+    assert not free_static_coarse.heads.predicts_s2
+    assert (
+        free_static_coarse
+        .heads
+        .s2_loss_weight
+        == 0.0
+    )
+
+    assert (
+        free_static_predicted_s1
+        .graph
+        .type
+        == "free_static"
+    )
+    assert (
+        free_static_predicted_s1
+        .heads
+        .future_token_mode
+        == "full"
+    )
+    assert (
+        free_static_predicted_s1
+        .heads
+        .s2_conditioning
+        == "predicted_s1"
+    )
+    assert (
+        free_static_predicted_s1
+        .heads
+        .s2_loss_weight
+        == 1.0
+    )
+
     for model in typed.values():
-        assert (
-            model.graph.type
-            == "mtgnn_static"
-        )
         assert (
             model.prediction_length
             == 60
@@ -462,6 +587,54 @@ def _cpu_smoke_test() -> None:
             59,
         )
 
+    for preset_name in (
+        "free_static_full_true_s1",
+        "free_static_coarse_only",
+        "free_static_full_predicted_s1",
+    ):
+        graph_regularisation = resolved[
+            preset_name
+        ][
+            "models"
+        ][
+            "dynamic_graph"
+        ][
+            "graph_regularisation"
+        ]
+
+        assert (
+            float(
+                graph_regularisation[
+                    "graph_entropy_reg"
+                ]
+            )
+            == 0.0
+        )
+        assert (
+            float(
+                graph_regularisation[
+                    "graph_target_entropy"
+                ]
+            )
+            == 2.2
+        )
+        assert (
+            float(
+                graph_regularisation[
+                    "graph_target_entropy_reg"
+                ]
+            )
+            == 0.01
+        )
+        assert (
+            float(
+                graph_regularisation[
+                    "graph_temporal_smooth_reg"
+                ]
+            )
+            == 0.0
+        )
+
     print(
         "Dynamic-graph configuration smoke test passed."
     )
@@ -471,9 +644,12 @@ def _cpu_smoke_test() -> None:
             f"  {preset}: "
             f"predictor={model.future_predictor.type}, "
             f"loss={model.loss.horizon_weighting}, "
+            f"token_mode={model.heads.future_token_mode}, "
+            f"s2_conditioning={model.heads.s2_conditioning}, "
             f"graph={model.graph.type}"
         )
 
 
 if __name__ == "__main__":
     _cpu_smoke_test()
+

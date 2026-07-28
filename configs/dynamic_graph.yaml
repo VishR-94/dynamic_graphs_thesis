@@ -1,34 +1,29 @@
 default_preset: structured_parallel_uniform
-
 data:
   mode: real
   amount_mode: zero
-
 forecasting:
   context_length: 60
   prediction_length: 60
   evaluation_horizons:
-    - 1
-    - 5
-    - 15
-    - 30
-    - 60
+  - 1
+  - 5
+  - 15
+  - 30
+  - 60
   stride: 15
-
   input_channels:
-    - open
-    - high
-    - low
-    - close
-    - volume
-
+  - open
+  - high
+  - low
+  - close
+  - volume
   target_channels:
-    - open
-    - high
-    - low
-    - close
-    - volume
-
+  - open
+  - high
+  - low
+  - close
+  - volume
 normalisation:
   method: kronos_context
   stats_from: context
@@ -36,8 +31,7 @@ normalisation:
   clip: true
   clip_min: -5.0
   clip_max: 5.0
-  eps: 1.0e-5
-
+  eps: 1.0e-05
 models:
   dynamic_graph:
     num_nodes: 93
@@ -45,7 +39,6 @@ models:
     d_model: 64
     num_st_blocks: 1
     use_node_embedding: true
-
     temporal:
       type: transformer
       num_layers: 1
@@ -54,60 +47,57 @@ models:
       dropout: 0.0
       kernel_size: 3
       dilations:
-        - 1
-        - 2
-        - 4
-
+      - 1
+      - 2
+      - 4
     graph:
-      # All three initial real-data predictor comparisons use the
-      # same learned static graph. Only predictor type and loss
-      # weighting differ between presets.
       type: mtgnn_static
       num_heads: 2
       hidden_dim: 32
       activation: softmax
       add_self_loops: false
-
       mtgnn_embedding_dim: 16
       mtgnn_top_k: 8
       mtgnn_alpha: 3.0
-
       base_graph_type: mtgnn_static
       gate_type: learned_scalar
       initial_alpha: 0.5
-
     heads:
       prediction_length: 60
       evaluation_horizons:
-        - 1
-        - 5
-        - 15
-        - 30
-        - 60
+      - 1
+      - 5
+      - 15
+      - 30
+      - 60
       s1_vocabulary_size: 1024
       s2_vocabulary_size: 1024
       s2_loss_weight: 1.0
-      condition_s2_on_s1: true
-
+      future_token_mode: full
+      s2_conditioning: true_s1
     future_predictor:
       type: structured_parallel
       num_layers: 1
       num_heads: 4
       feedforward_multiplier: 2
       dropout: 0.0
-
     loss:
       horizon_weighting: uniform
       gaussian_sigma: 2.0
       gaussian_peak_mass: 0.75
-
+    graph_regularisation:
+      graph_reg_layer: -1
+      graph_reg_warmup_epochs: 0
+      graph_entropy_reg: 0.0
+      graph_target_entropy: null
+      graph_target_entropy_reg: 0.0
+      graph_temporal_smooth_reg: 0.0
     backcast:
       enabled: false
       loss_weight: 0.0
       num_channels: 5
-
 training:
-  learning_rate: 1.0e-4
+  learning_rate: 0.0001
   weight_decay: 0.0
   batch_size: 2
   num_workers: 0
@@ -116,14 +106,12 @@ training:
   seed: 42
   gradient_clip_norm: 1.0
   mixed_precision: true
-
 decoding:
   token_selection: argmax
   temperature: 1.0
   top_k: 0
   top_p: 1.0
   sample_count: 1
-
 presets:
   structured_parallel_uniform:
     models:
@@ -132,7 +120,6 @@ presets:
           type: structured_parallel
         loss:
           horizon_weighting: uniform
-
   structured_parallel_weighted:
     models:
       dynamic_graph:
@@ -140,7 +127,6 @@ presets:
           type: structured_parallel
         loss:
           horizon_weighting: gaussian_mixture
-
   autoregressive_uniform:
     models:
       dynamic_graph:
@@ -148,3 +134,91 @@ presets:
           type: autoregressive
         loss:
           horizon_weighting: uniform
+  structured_parallel_coarse_only:
+    models:
+      dynamic_graph:
+        heads:
+          future_token_mode: coarse_only
+          s2_loss_weight: 0.0
+        future_predictor:
+          type: structured_parallel
+        loss:
+          horizon_weighting: uniform
+  free_static_full_true_s1:
+    models:
+      dynamic_graph:
+        graph:
+          type: free_static
+          base_graph_type: free_static
+
+        graph_regularisation:
+          graph_reg_layer: -1
+          graph_reg_warmup_epochs: 0
+          graph_entropy_reg: 0.0
+          graph_target_entropy: 2.2
+          graph_target_entropy_reg: 0.01
+          graph_temporal_smooth_reg: 0.0
+
+        heads:
+          future_token_mode: full
+          s2_loss_weight: 1.0
+          s2_conditioning: true_s1
+
+        future_predictor:
+          type: structured_parallel
+
+        loss:
+          horizon_weighting: uniform
+
+  free_static_coarse_only:
+    models:
+      dynamic_graph:
+        graph:
+          type: free_static
+          base_graph_type: free_static
+
+        graph_regularisation:
+          graph_reg_layer: -1
+          graph_reg_warmup_epochs: 0
+          graph_entropy_reg: 0.0
+          graph_target_entropy: 2.2
+          graph_target_entropy_reg: 0.01
+          graph_temporal_smooth_reg: 0.0
+
+        heads:
+          future_token_mode: coarse_only
+          s2_loss_weight: 0.0
+          s2_conditioning: true_s1
+
+        future_predictor:
+          type: structured_parallel
+
+        loss:
+          horizon_weighting: uniform
+
+  free_static_full_predicted_s1:
+    models:
+      dynamic_graph:
+        graph:
+          type: free_static
+          base_graph_type: free_static
+
+        graph_regularisation:
+          graph_reg_layer: -1
+          graph_reg_warmup_epochs: 0
+          graph_entropy_reg: 0.0
+          graph_target_entropy: 2.2
+          graph_target_entropy_reg: 0.01
+          graph_temporal_smooth_reg: 0.0
+
+        heads:
+          future_token_mode: full
+          s2_loss_weight: 1.0
+          s2_conditioning: predicted_s1
+
+        future_predictor:
+          type: structured_parallel
+
+        loss:
+          horizon_weighting: uniform
+
