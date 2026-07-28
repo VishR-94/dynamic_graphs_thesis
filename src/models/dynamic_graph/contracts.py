@@ -1,0 +1,1318 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Literal, Mapping, Sequence
+
+import torch
+from torch import Tensor
+
+
+DEFAULT_PREDICTION_LENGTH = 60
+DEFAULT_EVALUATION_HORIZONS = (1, 5, 15, 30, 60)
+# Backwards-compatible alias used only by older notebook/config code.
+DEFAULT_HORIZONS = DEFAULT_EVALUATION_HORIZONS
+GRAPH_ORIENTATION = "row=target,column=source"
+
+TemporalType = Literal[
+    "identity",
+    "transformer",
+    "tcn",
+]
+
+GraphType = Literal[
+    "none",
+    "fixed",
+    "free_static",
+    "mtgnn_static",
+    "dynamic",
+    "dynamic_base",
+    "oracle",
+]
+
+GraphActivation = Literal[
+    "softmax",
+    "sparsemax",
+    "entmax15",
+    "gated",
+]
+
+StaticGraphType = Literal[
+    "free_static",
+    "mtgnn_static",
+]
+
+GateType = Literal[
+    "none",
+    "fixed",
+    "learned_scalar",
+    "learned_per_head",
+]
+
+
+FuturePredictorType = Literal[
+    "structured_parallel",
+    "autoregressive",
+]
+
+HorizonWeighting = Literal[
+    "uniform",
+    "gaussian_mixture",
+]
+
+
+def _validate_probability(
+    value: float,
+    *,
+    name: str,
+    inclusive_upper: bool = True,
+) -> None:
+    value = float(value)
+
+    upper_ok = (
+        value <= 1.0
+        if inclusive_upper
+        else value < 1.0
+    )
+
+    if not 0.0 <= value or not upper_ok:
+        upper_symbol = "]" if inclusive_upper else ")"
+        raise ValueError(
+            f"{name} must lie in [0, 1{upper_symbol}. "
+            f"Received {value}."
+        )
+
+
+def _validate_positive_integer(
+    value: int,
+    *,
+    name: str,
+) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+    ):
+        raise ValueError(
+            f"{name} must be a positive integer. "
+            f"Received {value!r}."
+        )
+
+
+@dataclass(frozen=True)
+class TemporalConfig:
+    """Configuration shared by all node-wise temporal encoders.
+
+    The temporal encoder must process each node independently:
+
+        input:  [B, T, N, D]
+        output: [B, T, N, D]
+
+    Cross-node information is forbidden inside this module and first
+    enters through the explicit graph/spatial stage.
+    """
+
+    type: TemporalType = "transformer"
+    num_layers: int = 1
+    num_heads: int = 4
+    feedforward_multiplier: int = 2
+    dropout: float = 0.0
+
+    # TCN-only options.
+    kernel_size: int = 3
+    dilations: tuple[int, ...] = (1, 2, 4)
+
+    def validate(
+        self,
+        *,
+        d_model: int,
+    ) -> None:
+        if self.type not in {
+            "identity",
+            "transformer",
+            "tcn",
+        }:
+            raise ValueError(
+                f"Unsupported temporal type {self.type!r}."
+            )
+
+        _validate_positive_integer(
+            self.num_layers,
+            name="temporal.num_layers",
+        )
+
+        _validate_positive_integer(
+            self.num_heads,
+            name="temporal.num_heads",
+        )
+
+        _validate_positive_integer(
+            self.feedforward_multiplier,
+            name="temporal.feedforward_multiplier",
+        )
+
+        _validate_probability(
+            self.dropout,
+            name="temporal.dropout",
+            inclusive_upper=False,
+        )
+
+        if (
+            self.type == "transformer"
+            and d_model % self.num_heads != 0
+        ):
+            raise ValueError(
+                "d_model must be divisible by the number of "
+                "Transformer heads."
+            )
+
+        if self.type == "tcn":
+            _validate_positive_integer(
+                self.kernel_size,
+                name="temporal.kernel_size",
+            )
+
+            if self.kernel_size < 2:
+                raise ValueError(
+                    "temporal.kernel_size must be at least 2 "
+                    "for a causal TCN."
+                )
+
+            if not self.dilations:
+                raise ValueError(
+                    "temporal.dilations must not be empty."
+                )
+
+            for dilation in self.dilations:
+                _validate_positive_integer(
+                    dilation,
+                    name="temporal dilation",
+                )
+
+    @property
+    def tcn_receptive_field(self) -> int:
+        """Return the receptive field of one convolution per dilation."""
+        if self.type != "tcn":
+            return 1
+
+        return 1 + (
+            self.kernel_size - 1
+        ) * sum(self.dilations)
+
+
+@dataclass(frozen=True)
+class GraphConfig:
+    """Configuration for one context-window graph learner.
+
+    All learned or supplied adjacencies follow:
+
+        A[target, source]
+
+    The public graph tensor is always:
+
+        [B, graph_heads, N, N]
+
+    even when the internal graph is global/static.
+    """
+
+    type: GraphType = "mtgnn_static"
+    num_heads: int = 2
+    hidden_dim: int = 32
+    activation: GraphActivation = "softmax"
+    add_self_loops: bool = False
+
+    # MTGNN static graph options.
+    mtgnn_embedding_dim: int = 16
+    mtgnn_top_k: int = 4
+    mtgnn_alpha: float = 3.0
+
+    # Dynamic-base options.
+    base_graph_type: StaticGraphType = "mtgnn_static"
+    gate_type: GateType = "learned_scalar"
+    initial_alpha: float = 0.5
+
+    def validate(
+        self,
+        *,
+        num_nodes: int,
+        d_model: int,
+    ) -> None:
+        valid_graph_types = {
+            "none",
+            "fixed",
+            "free_static",
+            "mtgnn_static",
+            "dynamic",
+            "dynamic_base",
+            "oracle",
+        }
+
+        if self.type not in valid_graph_types:
+            raise ValueError(
+                f"Unsupported graph type {self.type!r}."
+            )
+
+        _validate_positive_integer(
+            self.num_heads,
+            name="graph.num_heads",
+        )
+
+        _validate_positive_integer(
+            self.hidden_dim,
+            name="graph.hidden_dim",
+        )
+
+        if self.activation not in {
+            "softmax",
+            "sparsemax",
+            "entmax15",
+            "gated",
+        }:
+            raise ValueError(
+                f"Unsupported graph activation "
+                f"{self.activation!r}."
+            )
+
+        if (
+            self.type in {
+                "dynamic",
+                "dynamic_base",
+            }
+            and d_model <= 0
+        ):
+            raise ValueError(
+                "Dynamic graph learning requires a positive "
+                "d_model."
+            )
+
+        _validate_positive_integer(
+            self.mtgnn_embedding_dim,
+            name="graph.mtgnn_embedding_dim",
+        )
+
+        _validate_positive_integer(
+            self.mtgnn_top_k,
+            name="graph.mtgnn_top_k",
+        )
+
+        maximum_neighbours = (
+            num_nodes
+            if self.add_self_loops
+            else num_nodes - 1
+        )
+
+        if self.mtgnn_top_k > maximum_neighbours:
+            raise ValueError(
+                "graph.mtgnn_top_k exceeds the number of "
+                "eligible source nodes."
+            )
+
+        if self.mtgnn_alpha <= 0:
+            raise ValueError(
+                "graph.mtgnn_alpha must be positive."
+            )
+
+        if self.base_graph_type not in {
+            "free_static",
+            "mtgnn_static",
+        }:
+            raise ValueError(
+                "graph.base_graph_type must be 'free_static' "
+                "or 'mtgnn_static'."
+            )
+
+        if self.gate_type not in {
+            "none",
+            "fixed",
+            "learned_scalar",
+            "learned_per_head",
+        }:
+            raise ValueError(
+                f"Unsupported graph gate type "
+                f"{self.gate_type!r}."
+            )
+
+        _validate_probability(
+            self.initial_alpha,
+            name="graph.initial_alpha",
+        )
+
+
+@dataclass(frozen=True)
+class ForecastHeadConfig:
+    """Configuration for the complete 60-step future token path.
+
+    The model predicts every future minute required by the frozen
+    contextual Kronos decoder. Final financial evaluation still uses
+    only ``evaluation_horizons``.
+    """
+
+    prediction_length: int = DEFAULT_PREDICTION_LENGTH
+    evaluation_horizons: tuple[int, ...] = (
+        DEFAULT_EVALUATION_HORIZONS
+    )
+    s1_vocabulary_size: int = 1024
+    s2_vocabulary_size: int = 1024
+    s2_loss_weight: float = 1.0
+    condition_s2_on_s1: bool = True
+
+    def validate(self) -> None:
+        _validate_positive_integer(
+            self.prediction_length,
+            name="heads.prediction_length",
+        )
+
+        if not self.evaluation_horizons:
+            raise ValueError(
+                "At least one evaluation horizon is required."
+            )
+
+        resolved = tuple(
+            int(horizon)
+            for horizon in self.evaluation_horizons
+        )
+
+        if any(
+            horizon <= 0
+            for horizon in resolved
+        ):
+            raise ValueError(
+                "Every evaluation horizon must be positive."
+            )
+
+        if len(set(resolved)) != len(resolved):
+            raise ValueError(
+                "Evaluation horizons must be unique."
+            )
+
+        if tuple(sorted(resolved)) != resolved:
+            raise ValueError(
+                "Evaluation horizons must be strictly increasing."
+            )
+
+        if max(resolved) > self.prediction_length:
+            raise ValueError(
+                "Evaluation horizons cannot exceed "
+                "prediction_length."
+            )
+
+        _validate_positive_integer(
+            self.s1_vocabulary_size,
+            name="heads.s1_vocabulary_size",
+        )
+
+        _validate_positive_integer(
+            self.s2_vocabulary_size,
+            name="heads.s2_vocabulary_size",
+        )
+
+        if self.s2_loss_weight < 0:
+            raise ValueError(
+                "heads.s2_loss_weight cannot be negative."
+            )
+
+    @property
+    def evaluation_indices(self) -> tuple[int, ...]:
+        """Zero-based indices into the dense future path."""
+        return tuple(
+            horizon - 1
+            for horizon in self.evaluation_horizons
+        )
+
+
+@dataclass(frozen=True)
+class FuturePredictorConfig:
+    """Configuration shared by both future-token predictor variants.
+
+    ``structured_parallel`` uses learned ordered future queries with
+    bidirectional future-query self-attention.
+
+    ``autoregressive`` uses shifted future token-pair embeddings with
+    causal self-attention. Training is teacher-forced; inference is
+    sequential.
+    """
+
+    type: FuturePredictorType = "structured_parallel"
+    num_layers: int = 2
+    num_heads: int = 4
+    feedforward_multiplier: int = 2
+    dropout: float = 0.0
+
+    def validate(
+        self,
+        *,
+        d_model: int,
+    ) -> None:
+        if self.type not in {
+            "structured_parallel",
+            "autoregressive",
+        }:
+            raise ValueError(
+                f"Unsupported future predictor type {self.type!r}."
+            )
+
+        _validate_positive_integer(
+            self.num_layers,
+            name="future_predictor.num_layers",
+        )
+
+        _validate_positive_integer(
+            self.num_heads,
+            name="future_predictor.num_heads",
+        )
+
+        _validate_positive_integer(
+            self.feedforward_multiplier,
+            name="future_predictor.feedforward_multiplier",
+        )
+
+        _validate_probability(
+            self.dropout,
+            name="future_predictor.dropout",
+            inclusive_upper=False,
+        )
+
+        if d_model % self.num_heads != 0:
+            raise ValueError(
+                "d_model must be divisible by the number of "
+                "future-predictor attention heads."
+            )
+
+
+@dataclass(frozen=True)
+class TokenLossConfig:
+    """Weighting of the 60 supervised future token positions.
+
+    The Gaussian-mixture option places smooth peaks around the five
+    financial evaluation horizons while retaining a uniform floor, so
+    every intermediate decoder-support token remains supervised.
+    """
+
+    horizon_weighting: HorizonWeighting = "uniform"
+    gaussian_sigma: float = 2.0
+    gaussian_peak_mass: float = 0.75
+
+    def validate(self) -> None:
+        if self.horizon_weighting not in {
+            "uniform",
+            "gaussian_mixture",
+        }:
+            raise ValueError(
+                "loss.horizon_weighting must be 'uniform' or "
+                "'gaussian_mixture'."
+            )
+
+        if self.gaussian_sigma <= 0:
+            raise ValueError(
+                "loss.gaussian_sigma must be positive."
+            )
+
+        _validate_probability(
+            self.gaussian_peak_mass,
+            name="loss.gaussian_peak_mass",
+        )
+
+
+@dataclass(frozen=True)
+class BackcastConfig:
+    """Optional real-data-only continuous reconstruction objective."""
+
+    enabled: bool = False
+    loss_weight: float = 0.0
+    num_channels: int = 5
+
+    def validate(self) -> None:
+        if self.loss_weight < 0:
+            raise ValueError(
+                "backcast.loss_weight cannot be negative."
+            )
+
+        _validate_positive_integer(
+            self.num_channels,
+            name="backcast.num_channels",
+        )
+
+        if not self.enabled and self.loss_weight != 0.0:
+            raise ValueError(
+                "Disabled backcasting must have loss_weight=0."
+            )
+
+
+@dataclass(frozen=True)
+class DynamicGraphModelConfig:
+    """Canonical configuration for synthetic and real token models."""
+
+    num_nodes: int
+    context_length: int = 60
+    d_model: int = 64
+    num_st_blocks: int = 1
+    use_node_embedding: bool = True
+
+    temporal: TemporalConfig = field(
+        default_factory=TemporalConfig
+    )
+    graph: GraphConfig = field(
+        default_factory=GraphConfig
+    )
+    heads: ForecastHeadConfig = field(
+        default_factory=ForecastHeadConfig
+    )
+    future_predictor: FuturePredictorConfig = field(
+        default_factory=FuturePredictorConfig
+    )
+    loss: TokenLossConfig = field(
+        default_factory=TokenLossConfig
+    )
+    backcast: BackcastConfig = field(
+        default_factory=BackcastConfig
+    )
+
+    def validate(self) -> None:
+        _validate_positive_integer(
+            self.num_nodes,
+            name="num_nodes",
+        )
+
+        _validate_positive_integer(
+            self.context_length,
+            name="context_length",
+        )
+
+        _validate_positive_integer(
+            self.d_model,
+            name="d_model",
+        )
+
+        _validate_positive_integer(
+            self.num_st_blocks,
+            name="num_st_blocks",
+        )
+
+        self.temporal.validate(
+            d_model=self.d_model,
+        )
+
+        self.graph.validate(
+            num_nodes=self.num_nodes,
+            d_model=self.d_model,
+        )
+
+        self.heads.validate()
+
+        self.future_predictor.validate(
+            d_model=self.d_model,
+        )
+
+        self.loss.validate()
+        self.backcast.validate()
+
+        if (
+            self.context_length
+            + self.heads.prediction_length
+            > 512
+        ):
+            raise ValueError(
+                "Context plus future path exceeds the current "
+                "Kronos sequence limit of 512 positions."
+            )
+
+    @property
+    def prediction_length(self) -> int:
+        return int(self.heads.prediction_length)
+
+    @property
+    def num_evaluation_horizons(self) -> int:
+        return len(self.heads.evaluation_horizons)
+
+    @property
+    def evaluation_indices(self) -> tuple[int, ...]:
+        return self.heads.evaluation_indices
+
+    @property
+    def num_horizons(self) -> int:
+        """Compatibility alias for dense future positions.
+
+        New code should use ``prediction_length``.
+        """
+        return self.prediction_length
+
+
+@dataclass
+class GraphOutput:
+    """Graphs and graph components exposed by the model.
+
+    Shapes:
+        selected:
+            [B, G, N, N] or None.
+
+        per_layer:
+            Tuple containing one graph per interlaced block. Each
+            non-null graph has shape [B, G, N, N].
+
+        base:
+            [B, G, N, N], [1, G, N, N], or None.
+
+        dynamic:
+            [B, G, N, N] or None.
+
+        alpha:
+            Scalar, [G], [B, G], or None.
+
+        logits:
+            Unnormalised selected graph logits with shape
+            [B, G, N, N] or None.
+    """
+
+    selected: Tensor | None
+    per_layer: tuple[Tensor | None, ...] = ()
+    base: Tensor | None = None
+    dynamic: Tensor | None = None
+    alpha: Tensor | None = None
+    logits: Tensor | None = None
+
+    def validate(
+        self,
+        *,
+        batch_size: int,
+        num_heads: int,
+        num_nodes: int,
+        require_row_stochastic: bool = True,
+        atol: float = 1.0e-5,
+    ) -> None:
+        expected = (
+            batch_size,
+            num_heads,
+            num_nodes,
+            num_nodes,
+        )
+
+        def validate_graph(
+            graph: Tensor | None,
+            *,
+            name: str,
+            allow_singleton_batch: bool = False,
+        ) -> None:
+            if graph is None:
+                return
+
+            valid_shapes = {expected}
+
+            if allow_singleton_batch:
+                valid_shapes.add(
+                    (
+                        1,
+                        num_heads,
+                        num_nodes,
+                        num_nodes,
+                    )
+                )
+
+            if tuple(graph.shape) not in valid_shapes:
+                raise ValueError(
+                    f"{name} has shape {tuple(graph.shape)}; "
+                    f"expected one of {sorted(valid_shapes)}."
+                )
+
+            if not torch.isfinite(graph).all():
+                raise ValueError(
+                    f"{name} contains non-finite values."
+                )
+
+            if torch.any(graph < 0):
+                raise ValueError(
+                    f"{name} contains negative graph weights."
+                )
+
+            if require_row_stochastic:
+                row_sums = graph.sum(dim=-1)
+
+                if not torch.allclose(
+                    row_sums,
+                    torch.ones_like(row_sums),
+                    atol=atol,
+                    rtol=0.0,
+                ):
+                    raise ValueError(
+                        f"{name} is not row-stochastic."
+                    )
+
+        validate_graph(
+            self.selected,
+            name="graph.selected",
+        )
+
+        validate_graph(
+            self.base,
+            name="graph.base",
+            allow_singleton_batch=True,
+        )
+
+        validate_graph(
+            self.dynamic,
+            name="graph.dynamic",
+        )
+
+        for layer_idx, graph in enumerate(
+            self.per_layer
+        ):
+            validate_graph(
+                graph,
+                name=f"graph.per_layer[{layer_idx}]",
+            )
+
+        if self.logits is not None:
+            if tuple(self.logits.shape) != expected:
+                raise ValueError(
+                    "graph.logits has an unexpected shape."
+                )
+
+            if not torch.isfinite(
+                self.logits
+            ).all():
+                raise ValueError(
+                    "graph.logits contains non-finite values."
+                )
+
+
+@dataclass
+class TokenForecastOutput:
+    """Typed output of the direct sparse-horizon forecaster."""
+
+    s1_logits: Tensor
+    s2_logits: Tensor
+    graph: GraphOutput
+    context_hidden: Tensor
+    temporal_hidden: Tensor
+    future_hidden: Tensor
+    backcast: Tensor | None = None
+
+    def validate(
+        self,
+        config: DynamicGraphModelConfig,
+        *,
+        batch_size: int,
+    ) -> None:
+        config.validate()
+
+        expected_s1 = (
+            batch_size,
+            config.prediction_length,
+            config.num_nodes,
+            config.heads.s1_vocabulary_size,
+        )
+
+        expected_s2 = (
+            batch_size,
+            config.prediction_length,
+            config.num_nodes,
+            config.heads.s2_vocabulary_size,
+        )
+
+        if tuple(self.s1_logits.shape) != expected_s1:
+            raise ValueError(
+                "s1_logits has shape "
+                f"{tuple(self.s1_logits.shape)}; "
+                f"expected {expected_s1}."
+            )
+
+        if tuple(self.s2_logits.shape) != expected_s2:
+            raise ValueError(
+                "s2_logits has shape "
+                f"{tuple(self.s2_logits.shape)}; "
+                f"expected {expected_s2}."
+            )
+
+        expected_context_hidden = (
+            batch_size,
+            config.num_nodes,
+            config.d_model,
+        )
+
+        if tuple(self.context_hidden.shape) != (
+            expected_context_hidden
+        ):
+            raise ValueError(
+                "context_hidden has shape "
+                f"{tuple(self.context_hidden.shape)}; "
+                f"expected {expected_context_hidden}."
+            )
+
+        expected_temporal_hidden = (
+            batch_size,
+            config.context_length,
+            config.num_nodes,
+            config.d_model,
+        )
+
+        if tuple(self.temporal_hidden.shape) != (
+            expected_temporal_hidden
+        ):
+            raise ValueError(
+                "temporal_hidden has shape "
+                f"{tuple(self.temporal_hidden.shape)}; "
+                f"expected {expected_temporal_hidden}."
+            )
+
+        expected_future_hidden = (
+            batch_size,
+            config.prediction_length,
+            config.num_nodes,
+            config.d_model,
+        )
+
+        if tuple(self.future_hidden.shape) != (
+            expected_future_hidden
+        ):
+            raise ValueError(
+                "future_hidden has shape "
+                f"{tuple(self.future_hidden.shape)}; "
+                f"expected {expected_future_hidden}."
+            )
+
+        if not torch.isfinite(
+            self.future_hidden
+        ).all():
+            raise ValueError(
+                "future_hidden contains non-finite values."
+            )
+
+        if config.backcast.enabled:
+            expected_backcast = (
+                batch_size,
+                config.context_length,
+                config.num_nodes,
+                config.backcast.num_channels,
+            )
+
+            if self.backcast is None:
+                raise ValueError(
+                    "Backcasting is enabled but no backcast "
+                    "tensor was returned."
+                )
+
+            if tuple(self.backcast.shape) != expected_backcast:
+                raise ValueError(
+                    "backcast has shape "
+                    f"{tuple(self.backcast.shape)}; "
+                    f"expected {expected_backcast}."
+                )
+        elif self.backcast is not None:
+            raise ValueError(
+                "A backcast tensor was returned while "
+                "backcasting is disabled."
+            )
+
+        if not torch.isfinite(
+            self.s1_logits
+        ).all():
+            raise ValueError(
+                "s1_logits contains non-finite values."
+            )
+
+        if not torch.isfinite(
+            self.s2_logits
+        ).all():
+            raise ValueError(
+                "s2_logits contains non-finite values."
+            )
+
+        self.graph.validate(
+            batch_size=batch_size,
+            num_heads=config.graph.num_heads,
+            num_nodes=config.num_nodes,
+        )
+
+
+def validate_token_batch(
+    batch: Mapping[str, Tensor],
+    config: DynamicGraphModelConfig,
+    *,
+    require_true_graph: bool = False,
+) -> None:
+    """Validate the common synthetic/real model-facing batch contract.
+
+    Required shapes:
+        tokens:
+            [B, T, N, 2]
+
+        target_s1:
+            [B, prediction_length, N]
+
+        target_s2:
+            [B, prediction_length, N]
+
+    Synthetic graph-recovery batches additionally contain:
+        true_graph:
+            [B, N, N]
+
+        regime_id:
+            [B]
+    """
+    config.validate()
+
+    required = {
+        "tokens",
+        "target_s1",
+        "target_s2",
+    }
+
+    missing = required - set(batch)
+
+    if missing:
+        raise KeyError(
+            f"Batch is missing required keys: "
+            f"{sorted(missing)}."
+        )
+
+    tokens = torch.as_tensor(
+        batch["tokens"]
+    )
+
+    target_s1 = torch.as_tensor(
+        batch["target_s1"]
+    )
+
+    target_s2 = torch.as_tensor(
+        batch["target_s2"]
+    )
+
+    if tokens.ndim != 4:
+        raise ValueError(
+            "tokens must have shape [B, T, N, 2]."
+        )
+
+    batch_size = int(tokens.shape[0])
+
+    expected_tokens = (
+        batch_size,
+        config.context_length,
+        config.num_nodes,
+        2,
+    )
+
+    if tuple(tokens.shape) != expected_tokens:
+        raise ValueError(
+            f"tokens has shape {tuple(tokens.shape)}; "
+            f"expected {expected_tokens}."
+        )
+
+    expected_targets = (
+        batch_size,
+        config.prediction_length,
+        config.num_nodes,
+    )
+
+    if tuple(target_s1.shape) != expected_targets:
+        raise ValueError(
+            "target_s1 has shape "
+            f"{tuple(target_s1.shape)}; "
+            f"expected {expected_targets}."
+        )
+
+    if tuple(target_s2.shape) != expected_targets:
+        raise ValueError(
+            "target_s2 has shape "
+            f"{tuple(target_s2.shape)}; "
+            f"expected {expected_targets}."
+        )
+
+    if (
+        tokens[..., 0].min().item() < 0
+        or tokens[..., 0].max().item()
+        >= config.heads.s1_vocabulary_size
+    ):
+        raise ValueError(
+            "Input s1 token IDs lie outside the configured "
+            "vocabulary."
+        )
+
+    if (
+        tokens[..., 1].min().item() < 0
+        or tokens[..., 1].max().item()
+        >= config.heads.s2_vocabulary_size
+    ):
+        raise ValueError(
+            "Input s2 token IDs lie outside the configured "
+            "vocabulary."
+        )
+
+    if (
+        target_s1.min().item() < 0
+        or target_s1.max().item()
+        >= config.heads.s1_vocabulary_size
+    ):
+        raise ValueError(
+            "target_s1 IDs lie outside the configured "
+            "vocabulary."
+        )
+
+    if (
+        target_s2.min().item() < 0
+        or target_s2.max().item()
+        >= config.heads.s2_vocabulary_size
+    ):
+        raise ValueError(
+            "target_s2 IDs lie outside the configured "
+            "vocabulary."
+        )
+
+    if require_true_graph:
+        if "true_graph" not in batch:
+            raise KeyError(
+                "Synthetic graph-recovery batch is missing "
+                "'true_graph'."
+            )
+
+        true_graph = torch.as_tensor(
+            batch["true_graph"]
+        )
+
+        expected_graph = (
+            batch_size,
+            config.num_nodes,
+            config.num_nodes,
+        )
+
+        if tuple(true_graph.shape) != expected_graph:
+            raise ValueError(
+                "true_graph has shape "
+                f"{tuple(true_graph.shape)}; "
+                f"expected {expected_graph}."
+            )
+
+        if torch.any(true_graph < 0):
+            raise ValueError(
+                "true_graph contains negative weights."
+            )
+
+        if not torch.allclose(
+            true_graph.sum(dim=-1),
+            torch.ones_like(
+                true_graph.sum(dim=-1)
+            ),
+            atol=1.0e-5,
+            rtol=0.0,
+        ):
+            raise ValueError(
+                "true_graph is not row-stochastic."
+            )
+
+        if "regime_id" not in batch:
+            raise KeyError(
+                "Synthetic graph-recovery batch is missing "
+                "'regime_id'."
+            )
+
+        regime_id = torch.as_tensor(
+            batch["regime_id"]
+        )
+
+        if tuple(regime_id.shape) != (
+            batch_size,
+        ):
+            raise ValueError(
+                "regime_id must have shape [B]."
+            )
+
+
+def _cpu_smoke_test() -> None:
+    config = DynamicGraphModelConfig(
+        num_nodes=16,
+        context_length=60,
+        d_model=32,
+        num_st_blocks=2,
+        temporal=TemporalConfig(
+            type="transformer",
+            num_layers=1,
+            num_heads=4,
+        ),
+        graph=GraphConfig(
+            type="dynamic_base",
+            num_heads=2,
+            hidden_dim=16,
+            base_graph_type="mtgnn_static",
+            mtgnn_top_k=4,
+            gate_type="learned_scalar",
+            initial_alpha=0.5,
+        ),
+        heads=ForecastHeadConfig(
+            prediction_length=60,
+            evaluation_horizons=(
+                1,
+                5,
+                15,
+                30,
+                60,
+            ),
+        ),
+        future_predictor=FuturePredictorConfig(
+            type="structured_parallel",
+            num_layers=2,
+            num_heads=4,
+        ),
+        loss=TokenLossConfig(
+            horizon_weighting="uniform",
+        ),
+        backcast=BackcastConfig(
+            enabled=False,
+            loss_weight=0.0,
+        ),
+    )
+
+    config.validate()
+
+    batch_size = 3
+
+    batch = {
+        "tokens": torch.randint(
+            0,
+            1024,
+            (
+                batch_size,
+                config.context_length,
+                config.num_nodes,
+                2,
+            ),
+        ),
+        "target_s1": torch.randint(
+            0,
+            1024,
+            (
+                batch_size,
+                config.prediction_length,
+                config.num_nodes,
+            ),
+        ),
+        "target_s2": torch.randint(
+            0,
+            1024,
+            (
+                batch_size,
+                config.prediction_length,
+                config.num_nodes,
+            ),
+        ),
+        "true_graph": torch.softmax(
+            torch.randn(
+                batch_size,
+                config.num_nodes,
+                config.num_nodes,
+            ),
+            dim=-1,
+        ),
+        "regime_id": torch.randint(
+            0,
+            3,
+            (batch_size,),
+        ),
+    }
+
+    validate_token_batch(
+        batch,
+        config,
+        require_true_graph=True,
+    )
+
+    selected_graph = torch.softmax(
+        torch.randn(
+            batch_size,
+            config.graph.num_heads,
+            config.num_nodes,
+            config.num_nodes,
+        ),
+        dim=-1,
+    )
+
+    output = TokenForecastOutput(
+        s1_logits=torch.randn(
+            batch_size,
+            config.prediction_length,
+            config.num_nodes,
+            config.heads.s1_vocabulary_size,
+        ),
+        s2_logits=torch.randn(
+            batch_size,
+            config.prediction_length,
+            config.num_nodes,
+            config.heads.s2_vocabulary_size,
+        ),
+        graph=GraphOutput(
+            selected=selected_graph,
+            per_layer=(
+                selected_graph,
+                selected_graph.clone(),
+            ),
+            base=selected_graph[:1],
+            dynamic=selected_graph,
+            alpha=torch.tensor(0.5),
+            logits=torch.randn_like(
+                selected_graph
+            ),
+        ),
+        context_hidden=torch.randn(
+            batch_size,
+            config.num_nodes,
+            config.d_model,
+        ),
+        temporal_hidden=torch.randn(
+            batch_size,
+            config.context_length,
+            config.num_nodes,
+            config.d_model,
+        ),
+        future_hidden=torch.randn(
+            batch_size,
+            config.prediction_length,
+            config.num_nodes,
+            config.d_model,
+        ),
+        backcast=None,
+    )
+
+    output.validate(
+        config,
+        batch_size=batch_size,
+    )
+
+    print(
+        "Dynamic-graph architecture contract CPU smoke "
+        "test passed."
+    )
+    print(
+        "Graph orientation:",
+        GRAPH_ORIENTATION,
+    )
+    print(
+        "Input tokens:",
+        tuple(batch["tokens"].shape),
+    )
+    print(
+        "Target s1/s2:",
+        tuple(batch["target_s1"].shape),
+    )
+    print(
+        "Evaluation indices:",
+        config.evaluation_indices,
+    )
+    print(
+        "Output s1 logits:",
+        tuple(output.s1_logits.shape),
+    )
+    print(
+        "Output s2 logits:",
+        tuple(output.s2_logits.shape),
+    )
+    print(
+        "Selected graph:",
+        tuple(output.graph.selected.shape),
+    )
+    print(
+        "TCN reference receptive field:",
+        TemporalConfig(
+            type="tcn"
+        ).tcn_receptive_field,
+    )
+
+
+if __name__ == "__main__":
+    _cpu_smoke_test()
+

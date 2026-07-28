@@ -4,3 +4,6 @@
 [submodule "external/Kronos"]
 	path = external/Kronos
 	url = https://github.com/shiyu-coder/Kronos.git
+[submodule "external/BaseDyGraph"]
+	path = external/BaseDyGraph
+	url = https://github.com/AFLabs-public/BaseDyGraph.git

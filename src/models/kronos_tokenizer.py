@@ -42,6 +42,64 @@ class KronosTokenBatch:
         return self.token_ids[..., 1]
 
 
+@dataclass(frozen=True)
+class KronosNormalisedPathBatch:
+    """Origin-aligned context and future path in Kronos input space.
+
+    Shapes:
+        normalised:
+            [B, context_length + prediction_length, N, 6]
+
+        mean:
+            [B, N, 6]
+
+        std:
+            [B, N, 6]
+
+        clipping_mask:
+            Boolean tensor with the same shape as ``normalised``.
+            True marks a value that lay outside [-clip, clip] before
+            clipping.
+
+    Statistics are estimated only from the observed context. The same
+    statistics are then applied to both the context and future path.
+    """
+
+    normalised: torch.Tensor
+    mean: torch.Tensor
+    std: torch.Tensor
+    clipping_mask: torch.Tensor
+    context_length: int
+    prediction_length: int
+
+    @property
+    def context(self) -> torch.Tensor:
+        return self.normalised[
+            :,
+            :self.context_length,
+        ]
+
+    @property
+    def future(self) -> torch.Tensor:
+        return self.normalised[
+            :,
+            self.context_length:,
+        ]
+
+    @property
+    def context_clipping_mask(self) -> torch.Tensor:
+        return self.clipping_mask[
+            :,
+            :self.context_length,
+        ]
+
+    @property
+    def future_clipping_mask(self) -> torch.Tensor:
+        return self.clipping_mask[
+            :,
+            self.context_length:,
+        ]
+
 class KronosTokenizerAdapter:
     """CPU adapter for the frozen official Kronos tokenizer.
 
@@ -537,6 +595,626 @@ class KronosTokenizerAdapter:
             )
 
         return decoded_ohlcv
+
+    def prepare_forecast_path(
+        self,
+        context: torch.Tensor,
+        future: torch.Tensor,
+        *,
+        channels: Sequence[str] = KRONOS_INPUT_CHANNELS,
+    ) -> KronosNormalisedPathBatch:
+        """Normalise one context-plus-future path without leakage.
+
+        Args:
+            context:
+                Observed raw OHLCV with shape [B, C, N, 5].
+
+            future:
+                Future raw OHLCV labels with shape [B, P, N, 5].
+
+            channels:
+                Required public OHLCV order.
+
+        Returns:
+            A complete [B, C + P, N, 6] normalised path. Mean and
+            population standard deviation are calculated only over the
+            C observed context positions, separately for every asset
+            and channel. Amount is appended as an all-zero channel.
+        """
+        if tuple(channels) != KRONOS_INPUT_CHANNELS:
+            raise ValueError(
+                "Expected channel order "
+                f"{KRONOS_INPUT_CHANNELS}, received "
+                f"{tuple(channels)}."
+            )
+
+        if not isinstance(
+            context,
+            torch.Tensor,
+        ):
+            raise TypeError(
+                "context must be a torch.Tensor."
+            )
+
+        if not isinstance(
+            future,
+            torch.Tensor,
+        ):
+            raise TypeError(
+                "future must be a torch.Tensor."
+            )
+
+        if (
+            context.ndim != 4
+            or context.shape[-1] != 5
+        ):
+            raise ValueError(
+                "context must have shape [B, C, N, 5]. "
+                f"Received {tuple(context.shape)}."
+            )
+
+        if (
+            future.ndim != 4
+            or future.shape[-1] != 5
+        ):
+            raise ValueError(
+                "future must have shape [B, P, N, 5]. "
+                f"Received {tuple(future.shape)}."
+            )
+
+        if (
+            context.shape[0] != future.shape[0]
+            or context.shape[2] != future.shape[2]
+        ):
+            raise ValueError(
+                "context and future batch/asset dimensions "
+                "must match."
+            )
+
+        if context.shape[1] <= 0:
+            raise ValueError(
+                "context must contain at least one timestep."
+            )
+
+        if future.shape[1] <= 0:
+            raise ValueError(
+                "future must contain at least one timestep."
+            )
+
+        context = (
+            context
+            .detach()
+            .cpu()
+            .to(torch.float32)
+            .contiguous()
+        )
+
+        future = (
+            future
+            .detach()
+            .cpu()
+            .to(torch.float32)
+            .contiguous()
+        )
+
+        if not torch.isfinite(
+            context
+        ).all():
+            raise ValueError(
+                "context contains NaN or infinite values."
+            )
+
+        if not torch.isfinite(
+            future
+        ).all():
+            raise ValueError(
+                "future contains NaN or infinite values."
+            )
+
+        context_amount = torch.zeros_like(
+            context[..., 4:5]
+        )
+
+        future_amount = torch.zeros_like(
+            future[..., 4:5]
+        )
+
+        context_ohlcva = torch.cat(
+            [
+                context,
+                context_amount,
+            ],
+            dim=-1,
+        )
+
+        future_ohlcva = torch.cat(
+            [
+                future,
+                future_amount,
+            ],
+            dim=-1,
+        )
+
+        # Statistics use the observed context only.
+        #
+        # Shape:
+        #     mean/std [B, N, 6]
+        mean = context_ohlcva.mean(
+            dim=1
+        )
+
+        std = context_ohlcva.std(
+            dim=1,
+            unbiased=False,
+        )
+
+        full_path = torch.cat(
+            [
+                context_ohlcva,
+                future_ohlcva,
+            ],
+            dim=1,
+        )
+
+        unclipped = (
+            full_path
+            - mean[:, None, :, :]
+        ) / (
+            std[:, None, :, :]
+            + self.eps
+        )
+
+        clipping_mask = (
+            (unclipped < -self.clip)
+            | (unclipped > self.clip)
+        )
+
+        normalised = unclipped.clamp(
+            min=-self.clip,
+            max=self.clip,
+        )
+
+        if not torch.isfinite(
+            normalised
+        ).all():
+            raise RuntimeError(
+                "Origin-aligned normalisation produced "
+                "non-finite values."
+            )
+
+        return KronosNormalisedPathBatch(
+            normalised=normalised.contiguous(),
+            mean=mean.contiguous(),
+            std=std.contiguous(),
+            clipping_mask=(
+                clipping_mask.contiguous()
+            ),
+            context_length=int(
+                context.shape[1]
+            ),
+            prediction_length=int(
+                future.shape[1]
+            ),
+        )
+
+    def encode_normalised(
+        self,
+        x_normalised: torch.Tensor,
+        *,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        series_batch_size: int | None = None,
+    ) -> KronosTokenBatch:
+        """Encode an already-normalised OHLCVA sequence.
+
+        This method deliberately performs no normalisation. It exists
+        so a 120-position context-plus-future path can use statistics
+        estimated only from the observed 60-position context.
+
+        Args:
+            x_normalised:
+                Clipped Kronos-space OHLCVA values with shape
+                [B, T, N, 6].
+
+            mean:
+                Context-only raw-space mean with shape [B, N, 6].
+
+            std:
+                Context-only population standard deviation with shape
+                [B, N, 6].
+
+            series_batch_size:
+                Number of independent asset-window series encoded per
+                tokenizer call.
+
+        Returns:
+            KronosTokenBatch with token IDs [B, T, N, 2] and the
+            supplied context statistics.
+        """
+        if self._tokenizer is None:
+            raise RuntimeError(
+                "Call load() before encode_normalised()."
+            )
+
+        if not isinstance(
+            x_normalised,
+            torch.Tensor,
+        ):
+            raise TypeError(
+                "x_normalised must be a torch.Tensor."
+            )
+
+        if (
+            x_normalised.ndim != 4
+            or x_normalised.shape[-1] != 6
+        ):
+            raise ValueError(
+                "x_normalised must have shape [B, T, N, 6]. "
+                f"Received {tuple(x_normalised.shape)}."
+            )
+
+        batch_size, seq_len, num_assets, _ = (
+            x_normalised.shape
+        )
+
+        expected_stats_shape = (
+            batch_size,
+            num_assets,
+            6,
+        )
+
+        mean = (
+            torch.as_tensor(
+                mean,
+                dtype=torch.float32,
+            )
+            .detach()
+            .cpu()
+            .contiguous()
+        )
+
+        std = (
+            torch.as_tensor(
+                std,
+                dtype=torch.float32,
+            )
+            .detach()
+            .cpu()
+            .contiguous()
+        )
+
+        if tuple(mean.shape) != (
+            expected_stats_shape
+        ):
+            raise ValueError(
+                "mean must have shape [B, N, 6]. "
+                f"Received {tuple(mean.shape)}."
+            )
+
+        if tuple(std.shape) != (
+            expected_stats_shape
+        ):
+            raise ValueError(
+                "std must have shape [B, N, 6]. "
+                f"Received {tuple(std.shape)}."
+            )
+
+        if not torch.isfinite(mean).all():
+            raise ValueError(
+                "mean contains non-finite values."
+            )
+
+        if not torch.isfinite(std).all():
+            raise ValueError(
+                "std contains non-finite values."
+            )
+
+        if torch.any(std < 0):
+            raise ValueError(
+                "std cannot contain negative values."
+            )
+
+        x_normalised = (
+            x_normalised
+            .detach()
+            .cpu()
+            .to(torch.float32)
+            .contiguous()
+        )
+
+        if not torch.isfinite(
+            x_normalised
+        ).all():
+            raise ValueError(
+                "x_normalised contains NaN or infinite values."
+            )
+
+        tolerance = 1.0e-5
+
+        if (
+            x_normalised.min().item()
+            < -self.clip - tolerance
+            or x_normalised.max().item()
+            > self.clip + tolerance
+        ):
+            raise ValueError(
+                "x_normalised lies outside the configured "
+                f"[-{self.clip}, {self.clip}] range."
+            )
+
+        effective_batch_size = (
+            self.series_batch_size
+            if series_batch_size is None
+            else int(series_batch_size)
+        )
+
+        if effective_batch_size <= 0:
+            raise ValueError(
+                "series_batch_size must be greater than zero."
+            )
+
+        # [B, T, N, 6] -> [B*N, T, 6], preserving asset order.
+        flat = (
+            x_normalised
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(
+                batch_size * num_assets,
+                seq_len,
+                6,
+            )
+        )
+
+        coarse_parts: list[torch.Tensor] = []
+        fine_parts: list[torch.Tensor] = []
+
+        with torch.inference_mode():
+            for start in range(
+                0,
+                flat.shape[0],
+                effective_batch_size,
+            ):
+                stop = min(
+                    start + effective_batch_size,
+                    flat.shape[0],
+                )
+
+                indices = self._tokenizer.encode(
+                    flat[start:stop],
+                    half=True,
+                )
+
+                if (
+                    not isinstance(
+                        indices,
+                        (tuple, list),
+                    )
+                    or len(indices) != 2
+                ):
+                    raise RuntimeError(
+                        "Official tokenizer.encode(..., half=True) "
+                        "did not return coarse and fine IDs."
+                    )
+
+                coarse_parts.append(
+                    indices[0]
+                    .detach()
+                    .cpu()
+                    .long()
+                )
+
+                fine_parts.append(
+                    indices[1]
+                    .detach()
+                    .cpu()
+                    .long()
+                )
+
+        coarse_flat = torch.cat(
+            coarse_parts,
+            dim=0,
+        )
+
+        fine_flat = torch.cat(
+            fine_parts,
+            dim=0,
+        )
+
+        expected_flat_shape = (
+            batch_size * num_assets,
+            seq_len,
+        )
+
+        if tuple(coarse_flat.shape) != (
+            expected_flat_shape
+        ):
+            raise RuntimeError(
+                "Unexpected coarse token shape: "
+                f"{tuple(coarse_flat.shape)}. "
+                f"Expected {expected_flat_shape}."
+            )
+
+        if tuple(fine_flat.shape) != (
+            expected_flat_shape
+        ):
+            raise RuntimeError(
+                "Unexpected fine token shape: "
+                f"{tuple(fine_flat.shape)}. "
+                f"Expected {expected_flat_shape}."
+            )
+
+        def restore_asset_axis(
+            values: torch.Tensor,
+        ) -> torch.Tensor:
+            return (
+                values
+                .reshape(
+                    batch_size,
+                    num_assets,
+                    seq_len,
+                )
+                .permute(0, 2, 1)
+                .contiguous()
+            )
+
+        coarse = restore_asset_axis(
+            coarse_flat
+        )
+
+        fine = restore_asset_axis(
+            fine_flat
+        )
+
+        token_ids = torch.stack(
+            [
+                coarse,
+                fine,
+            ],
+            dim=-1,
+        )
+
+        if (
+            token_ids.min().item() < 0
+            or token_ids.max().item() >= 1024
+        ):
+            raise RuntimeError(
+                "Encoded token IDs lie outside [0, 1023]."
+            )
+
+        return KronosTokenBatch(
+            token_ids=token_ids,
+            mean=mean,
+            std=std,
+        )
+
+    def decode_token_path(
+        self,
+        context_token_ids: torch.Tensor,
+        future_token_ids: torch.Tensor,
+        *,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        series_batch_size: int | None = None,
+        return_full_path: bool = False,
+    ) -> torch.Tensor:
+        """Decode an observed context plus complete predicted path.
+
+        Args:
+            context_token_ids:
+                Observed token pairs [B, C, N, 2].
+
+            future_token_ids:
+                Complete future token path [B, P, N, 2].
+
+            mean/std:
+                Context-only raw-space statistics [B, N, 6].
+
+            return_full_path:
+                When False, return only the P decoded future bars.
+                When True, return all C + P decoded bars.
+
+        Returns:
+            Raw OHLCV with shape [B, P, N, 5] by default.
+        """
+        if self._tokenizer is None:
+            raise RuntimeError(
+                "Call load() before decode_token_path()."
+            )
+
+        context_token_ids = torch.as_tensor(
+            context_token_ids
+        ).detach().cpu()
+
+        future_token_ids = torch.as_tensor(
+            future_token_ids
+        ).detach().cpu()
+
+        if (
+            context_token_ids.ndim != 4
+            or context_token_ids.shape[-1] != 2
+        ):
+            raise ValueError(
+                "context_token_ids must have shape [B, C, N, 2]."
+            )
+
+        if (
+            future_token_ids.ndim != 4
+            or future_token_ids.shape[-1] != 2
+        ):
+            raise ValueError(
+                "future_token_ids must have shape [B, P, N, 2]."
+            )
+
+        if (
+            context_token_ids.shape[0]
+            != future_token_ids.shape[0]
+            or context_token_ids.shape[2]
+            != future_token_ids.shape[2]
+        ):
+            raise ValueError(
+                "Context and future token batch/asset dimensions "
+                "must match."
+            )
+
+        if context_token_ids.shape[1] <= 0:
+            raise ValueError(
+                "context_token_ids must contain at least one "
+                "position."
+            )
+
+        if future_token_ids.shape[1] <= 0:
+            raise ValueError(
+                "future_token_ids must contain at least one "
+                "position."
+            )
+
+        full_token_ids = torch.cat(
+            [
+                context_token_ids,
+                future_token_ids,
+            ],
+            dim=1,
+        ).long()
+
+        if (
+            full_token_ids.min().item() < 0
+            or full_token_ids.max().item() >= 1024
+        ):
+            raise ValueError(
+                "Token IDs lie outside [0, 1023]."
+            )
+
+        token_batch = KronosTokenBatch(
+            token_ids=full_token_ids,
+            mean=torch.as_tensor(
+                mean,
+                dtype=torch.float32,
+            ),
+            std=torch.as_tensor(
+                std,
+                dtype=torch.float32,
+            ),
+        )
+
+        decoded_full = self.decode(
+            token_batch,
+            series_batch_size=series_batch_size,
+        )
+
+        if return_full_path:
+            return decoded_full
+
+        context_length = int(
+            context_token_ids.shape[1]
+        )
+
+        return (
+            decoded_full[
+                :,
+                context_length:,
+            ]
+            .contiguous()
+        )
 
     def decode_coarse(
         self,
