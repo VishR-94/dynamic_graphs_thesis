@@ -83,8 +83,8 @@ models:
       dropout: 0.0
     loss:
       horizon_weighting: uniform
-      gaussian_sigma: 2.0
-      gaussian_peak_mass: 0.75
+      exponential_half_life: 5.0
+      exponential_floor_weight: 0.25
     graph_regularisation:
       graph_reg_layer: -1
       graph_reg_warmup_epochs: 0
@@ -144,7 +144,7 @@ presets:
         future_predictor:
           type: structured_parallel
         loss:
-          horizon_weighting: gaussian_mixture
+          horizon_weighting: exponential_decay
   autoregressive_uniform:
     models:
       dynamic_graph:

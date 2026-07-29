@@ -66,7 +66,7 @@ FutureTokenMode = Literal[
 
 HorizonWeighting = Literal[
     "uniform",
-    "gaussian_mixture",
+    "exponential_decay",
 ]
 
 
@@ -572,35 +572,38 @@ class FuturePredictorConfig:
 
 @dataclass(frozen=True)
 class TokenLossConfig:
-    """Weighting of the 60 supervised future token positions.
+    """Weighting of the supervised future token positions.
 
-    The Gaussian-mixture option places smooth peaks around the five
-    financial evaluation horizons while retaining a uniform floor, so
-    every intermediate decoder-support token remains supervised.
+    ``exponential_decay`` places the largest weight on minute 1, then
+    halves the decaying component every ``exponential_half_life``
+    positions. ``exponential_floor_weight`` retains a non-zero uniform
+    contribution so the complete future token path remains supervised.
+    The final weights always have mean one.
     """
 
     horizon_weighting: HorizonWeighting = "uniform"
-    gaussian_sigma: float = 2.0
-    gaussian_peak_mass: float = 0.75
+    exponential_half_life: float = 5.0
+    exponential_floor_weight: float = 0.25
 
     def validate(self) -> None:
         if self.horizon_weighting not in {
             "uniform",
-            "gaussian_mixture",
+            "exponential_decay",
         }:
             raise ValueError(
                 "loss.horizon_weighting must be 'uniform' or "
-                "'gaussian_mixture'."
+                "'exponential_decay'."
             )
 
-        if self.gaussian_sigma <= 0:
+        if self.exponential_half_life <= 0:
             raise ValueError(
-                "loss.gaussian_sigma must be positive."
+                "loss.exponential_half_life must be positive."
             )
 
         _validate_probability(
-            self.gaussian_peak_mass,
-            name="loss.gaussian_peak_mass",
+            self.exponential_floor_weight,
+            name="loss.exponential_floor_weight",
+            inclusive_upper=False,
         )
 
 

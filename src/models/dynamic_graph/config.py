@@ -158,6 +158,14 @@ def build_model_config(
         ]
     )
 
+    loss_values = dict(model["loss"])
+
+    # Old run artefacts may contain the unused Gaussian-envelope
+    # parameters. Drop them so historical uniform-loss checkpoints and
+    # diagnostics remain loadable after the weighted loss was replaced.
+    loss_values.pop("gaussian_sigma", None)
+    loss_values.pop("gaussian_peak_mass", None)
+
     config = DynamicGraphModelConfig(
         num_nodes=int(
             model["num_nodes"]
@@ -193,7 +201,7 @@ def build_model_config(
             )
         ),
         loss=TokenLossConfig(
-            **dict(model["loss"])
+            **loss_values
         ),
         backcast=BackcastConfig(
             **dict(model["backcast"])
@@ -474,7 +482,7 @@ def _cpu_smoke_test() -> None:
         parallel_weighted
         .loss
         .horizon_weighting
-        == "gaussian_mixture"
+        == "exponential_decay"
     )
 
     assert (

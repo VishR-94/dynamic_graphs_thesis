@@ -1666,20 +1666,17 @@ def build_future_position_weights(
 
     ``uniform`` returns one at every future position.
 
-    ``gaussian_mixture`` uses a Gaussian *envelope* centred on the
-    evaluation horizons. For each future position, the largest Gaussian
-    response across the evaluation horizons is retained. This ensures:
+    ``exponential_decay`` places the largest weight on the first future
+    minute and then decays monotonically. The decaying component halves
+    every ``exponential_half_life`` positions. A uniform floor keeps all
+    60 decoder-support positions supervised:
 
-        - every evaluation horizon has exactly the same maximum weight;
-        - an intermediate position cannot exceed a true evaluation
-          horizon merely because two Gaussian components overlap;
-        - every position remains positively weighted through a uniform
-          floor.
+        decay_t = 2 ** (-(t - 1) / half_life)
+        weights_t = floor + (1 - floor) * decay_t / mean(decay)
 
-    ``gaussian_peak_mass`` is the fraction of total weighting mass
-    assigned to the Gaussian envelope; the remaining mass is uniform.
-    The final vector is rescaled to have mean one, keeping the overall
-    loss scale comparable with uniform weighting.
+    Because the normalised decay has mean one, the final vector also has
+    mean one. This keeps the overall token-loss scale comparable with
+    uniform weighting.
     """
     loss_config.validate()
 
@@ -1721,72 +1718,41 @@ def build_future_position_weights(
         )
 
     positions = torch.arange(
-        1,
-        prediction_length + 1,
+        prediction_length,
         device=device,
         dtype=dtype,
     )
 
-    horizon_positions = torch.tensor(
-        resolved_horizons,
-        device=device,
-        dtype=dtype,
-    )
-
-    sigma = torch.tensor(
-        float(loss_config.gaussian_sigma),
-        device=device,
-        dtype=dtype,
-    )
-
-    # [P, H]: one Gaussian response for each future position and
-    # evaluation horizon. Each component reaches exactly one at its
-    # own evaluation horizon.
-    gaussian_responses = torch.exp(
-        -0.5
-        * (
-            (
-                positions[:, None]
-                - horizon_positions[None, :]
-            )
-            / sigma
-        ).square()
-    )
-
-    # Max rather than sum/mean: overlap between nearby peaks cannot
-    # make a non-evaluation minute more important than the peaks.
-    envelope = gaussian_responses.amax(
-        dim=1
-    )
-
-    envelope_mass = (
-        envelope
-        / envelope.sum()
-    )
-
-    uniform_mass = torch.full(
-        (prediction_length,),
-        fill_value=(
-            1.0
-            / float(prediction_length)
+    half_life = torch.tensor(
+        float(
+            loss_config.exponential_half_life
         ),
         device=device,
         dtype=dtype,
     )
 
-    peak_mass = float(
-        loss_config.gaussian_peak_mass
+    decay = torch.exp(
+        -torch.log(
+            torch.tensor(
+                2.0,
+                device=device,
+                dtype=dtype,
+            )
+        )
+        * positions
+        / half_life
     )
 
-    probability_mass = (
-        peak_mass * envelope_mass
-        + (1.0 - peak_mass)
-        * uniform_mass
+    normalised_decay = decay / decay.mean()
+
+    floor_weight = float(
+        loss_config.exponential_floor_weight
     )
 
     weights = (
-        probability_mass
-        * float(prediction_length)
+        floor_weight
+        + (1.0 - floor_weight)
+        * normalised_decay
     )
 
     # Numerical safety. Analytically this already has mean one.
@@ -1981,8 +1947,8 @@ def _cpu_smoke_test() -> None:
         ),
         loss=TokenLossConfig(
             horizon_weighting="uniform",
-            gaussian_sigma=1.5,
-            gaussian_peak_mass=0.75,
+            exponential_half_life=5.0,
+            exponential_floor_weight=0.25,
         ),
     )
 
@@ -2386,17 +2352,17 @@ def _cpu_smoke_test() -> None:
         60,
     )
 
-    gaussian_config = TokenLossConfig(
+    exponential_config = TokenLossConfig(
         horizon_weighting=(
-            "gaussian_mixture"
+            "exponential_decay"
         ),
-        gaussian_sigma=2.0,
-        gaussian_peak_mass=0.75,
+        exponential_half_life=5.0,
+        exponential_floor_weight=0.25,
     )
 
-    gaussian_weights = (
+    exponential_weights = (
         build_future_position_weights(
-            gaussian_config,
+            exponential_config,
             prediction_length=(
                 real_prediction_length
             ),
@@ -2417,77 +2383,66 @@ def _cpu_smoke_test() -> None:
         )
 
     if not torch.all(
-        gaussian_weights > 0
+        exponential_weights > 0
     ):
         raise AssertionError(
-            "Gaussian-envelope weights must be positive."
+            "Exponential weights must be positive."
         )
 
     if not torch.allclose(
-        gaussian_weights.mean(),
+        exponential_weights.mean(),
         torch.tensor(
             1.0,
-            dtype=gaussian_weights.dtype,
+            dtype=exponential_weights.dtype,
         ),
         atol=1.0e-6,
         rtol=0.0,
     ):
         raise AssertionError(
-            "Gaussian-envelope weights do not average to one."
+            "Exponential weights do not average to one."
         )
 
-    horizon_indices = torch.tensor(
-        [
-            horizon - 1
-            for horizon in (
-                real_evaluation_horizons
-            )
-        ],
-        dtype=torch.long,
+    if not torch.all(
+        exponential_weights[:-1]
+        > exponential_weights[1:]
+    ):
+        raise AssertionError(
+            "Exponential weights must decrease strictly with horizon."
+        )
+
+    floor_weight = torch.tensor(
+        exponential_config.exponential_floor_weight,
+        dtype=exponential_weights.dtype,
     )
 
-    horizon_weights = (
-        gaussian_weights.index_select(
-            dim=0,
-            index=horizon_indices,
+    if not torch.all(
+        exponential_weights >= floor_weight
+    ):
+        raise AssertionError(
+            "Exponential weights fell below the configured floor."
         )
+
+    # With a five-position half-life, the component above the floor at
+    # minute 6 must be half its minute-1 value.
+    excess_at_minute_1 = (
+        exponential_weights[0]
+        - floor_weight
+    )
+    excess_at_minute_6 = (
+        exponential_weights[5]
+        - floor_weight
     )
 
     if not torch.allclose(
-        horizon_weights,
-        torch.full_like(
-            horizon_weights,
-            horizon_weights[0],
-        ),
+        excess_at_minute_6,
+        0.5 * excess_at_minute_1,
         atol=1.0e-6,
-        rtol=0.0,
+        rtol=1.0e-5,
     ):
         raise AssertionError(
-            "Evaluation horizons do not receive equal peak weights."
+            "Exponential half-life is not implemented correctly."
         )
 
-    non_horizon_mask = torch.ones(
-        real_prediction_length,
-        dtype=torch.bool,
-    )
-    non_horizon_mask[
-        horizon_indices
-    ] = False
-
-    maximum_non_horizon_weight = (
-        gaussian_weights[
-            non_horizon_mask
-        ].max()
-    )
-
-    if not (
-        maximum_non_horizon_weight
-        < horizon_weights[0]
-    ):
-        raise AssertionError(
-            "A non-evaluation minute exceeds an evaluation-horizon "
-            "peak weight."
-        )
 
     parallel.train()
     parallel.zero_grad(
@@ -2730,11 +2685,11 @@ def _cpu_smoke_test() -> None:
     )
 
     print(
-        "Gaussian-envelope horizon weights:",
+        "Exponential horizon weights:",
         {
             horizon: round(
                 float(
-                    gaussian_weights[
+                    exponential_weights[
                         horizon - 1
                     ]
                 ),
@@ -2747,7 +2702,7 @@ def _cpu_smoke_test() -> None:
     )
 
     print(
-        "Gaussian-envelope weights (minute:weight):"
+        "Exponential weights (minute:weight):"
     )
 
     for start in range(
@@ -2764,7 +2719,7 @@ def _cpu_smoke_test() -> None:
             "  "
             + "  ".join(
                 f"{minute + 1}:"
-                f"{float(gaussian_weights[minute]):.4f}"
+                f"{float(exponential_weights[minute]):.4f}"
                 for minute in range(
                     start,
                     stop,
