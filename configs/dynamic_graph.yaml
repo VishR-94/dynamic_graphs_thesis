@@ -106,6 +106,24 @@ training:
   seed: 42
   gradient_clip_norm: 1.0
   mixed_precision: true
+    # Controls the checkpoint used for patience and best_checkpoint.pt.
+  #
+  # Supported values:
+  #   decoded_cumulative_log_change_mae
+  #   validation_token_loss
+  early_stopping_metric: decoded_cumulative_log_change_mae
+
+  # Used only when early_stopping_metric is
+  # decoded_cumulative_log_change_mae.
+  #
+  # Keep the base configuration equivalent to the historical runs.
+  # The new short-horizon run will override this to [1, 5].
+  early_stopping_horizons:
+    - 1
+    - 5
+    - 15
+    - 30
+    - 60
 decoding:
   token_selection: argmax
   temperature: 1.0

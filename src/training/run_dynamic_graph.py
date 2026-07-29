@@ -121,6 +121,7 @@ class GenerationMetrics:
 @dataclass
 class ValidationBundle:
     generation_metrics: GenerationMetrics
+    token_artifacts: dict[str, Any]
     graph_artifacts: dict[str, Any]
     prediction_result: PredictionResult | None
     metric_results: dict[str, Tensor] | None
@@ -753,6 +754,102 @@ def _validate_positive_int(value: int, *, name: str) -> int:
         raise ValueError(f"{name} must be positive.")
     return value
 
+def _mean_cumulative_log_change_mae_at_horizons(
+    *,
+    metric_results: Mapping[str, Tensor],
+    available_horizons: Sequence[int],
+    selected_horizons: Sequence[int],
+) -> float:
+    """Average decoded CLG-MAE over explicitly selected horizons."""
+
+    available = tuple(
+        int(horizon)
+        for horizon in available_horizons
+    )
+    selected = tuple(
+        int(horizon)
+        for horizon in selected_horizons
+    )
+
+    if not selected:
+        raise ValueError(
+            "selected_horizons must contain at least one horizon."
+        )
+
+    if len(set(selected)) != len(selected):
+        raise ValueError(
+            "selected_horizons must not contain duplicates."
+        )
+
+    horizon_to_index = {
+        horizon: index
+        for index, horizon in enumerate(available)
+    }
+
+    missing = [
+        horizon
+        for horizon in selected
+        if horizon not in horizon_to_index
+    ]
+
+    if missing:
+        raise ValueError(
+            "Selected early-stopping horizons are not present in the "
+            f"evaluation horizons. Missing={missing}, "
+            f"available={list(available)}."
+        )
+
+    metric_name = "cumulative_log_change_mae"
+
+    if metric_name not in metric_results:
+        raise KeyError(
+            f"Validation metrics do not contain {metric_name!r}."
+        )
+
+    values = (
+        torch.as_tensor(
+            metric_results[metric_name]
+        )
+        .detach()
+        .to(torch.float64)
+    )
+
+    if values.ndim < 1:
+        raise ValueError(
+            "cumulative_log_change_mae must have a horizon dimension."
+        )
+
+    if int(values.shape[0]) != len(available):
+        raise ValueError(
+            "The cumulative-log-change MAE horizon dimension does not "
+            "match the configured evaluation horizons. "
+            f"Observed shape={tuple(values.shape)}, "
+            f"horizons={list(available)}."
+        )
+
+    indices = torch.tensor(
+        [
+            horizon_to_index[horizon]
+            for horizon in selected
+        ],
+        dtype=torch.long,
+        device=values.device,
+    )
+
+    selected_values = values.index_select(
+        dim=0,
+        index=indices,
+    )
+
+    if not torch.isfinite(selected_values).all():
+        raise ValueError(
+            "The selected cumulative-log-change MAE values contain "
+            "non-finite entries."
+        )
+
+    return float(
+        selected_values.mean().item()
+    )
 
 def _validate_optional_window_limit(
     value: int | None,
@@ -1574,6 +1671,7 @@ def generate_validation_artifacts(
     tokenizer: KronosTokenizerAdapter | None,
     raw_train_split: Mapping[str, Any] | None,
     decode_series_batch_size: int,
+    early_stopping_horizons: Sequence[int],
 ) -> ValidationBundle:
     model.eval()
     synchronise_device(device)
@@ -1599,6 +1697,10 @@ def generate_validation_artifacts(
     sample_idx_parts: list[Tensor] = []
     origin_idx_parts: list[Tensor] = []
     target_indices_parts: list[Tensor] = []
+    generated_s1_parts: list[Tensor] = []
+    generated_s2_parts: list[Tensor] = []
+    target_s1_parts: list[Tensor] = []
+    target_s2_parts: list[Tensor] = []
 
     invalid_dense_count = 0
     invalid_dense_total = 0
@@ -1641,16 +1743,60 @@ def generate_validation_artifacts(
 
             batch_size = int(context_tokens.shape[0])
             num_nodes = int(context_tokens.shape[2])
-            generated_tokens = generated.token_ids.detach().cpu().to(torch.long)
+            generated_tokens = (
+                generated.token_ids
+                .detach()
+                .cpu()
+                .to(torch.long)
+            )
+
+            target_s1_cpu = (
+                target_s1
+                .detach()
+                .cpu()
+                .to(torch.long)
+            )
+            target_s2_cpu = (
+                target_s2
+                .detach()
+                .cpu()
+                .to(torch.long)
+            )
+
+            # Kronos token IDs are in [0, 1023], so int16 preserves
+            # them exactly while keeping the saved artefacts compact.
+            generated_s1_parts.append(
+                generated_tokens[..., 0]
+                .to(torch.int16)
+                .contiguous()
+            )
+            target_s1_parts.append(
+                target_s1_cpu
+                .to(torch.int16)
+                .contiguous()
+            )
+            target_s2_parts.append(
+                target_s2_cpu
+                .to(torch.int16)
+                .contiguous()
+            )
+
+            if predict_s2:
+                generated_s2_parts.append(
+                    generated_tokens[..., 1]
+                    .to(torch.int16)
+                    .contiguous()
+                )
 
             s1_correct_by_step += (
-                (generated_tokens[..., 0] == target_s1.detach().cpu())
+                (generated_tokens[..., 0] == target_s1_cpu)
                 .sum(dim=(0, 2))
                 .to(torch.float64)
             )
+
             if predict_s2:
                 s2_correct_by_step += (
-                    (generated_tokens[..., 1] == target_s2.detach().cpu())
+                    (generated_tokens[..., 1] == target_s2_cpu)
                     .sum(dim=(0, 2))
                     .to(torch.float64)
                 )
@@ -1780,6 +1926,81 @@ def generate_validation_artifacts(
 
     graph_artifacts = graph_accumulator.finalise()
 
+    generated_s1 = torch.cat(
+        generated_s1_parts,
+        dim=0,
+    ).contiguous()
+
+    target_s1_all = torch.cat(
+        target_s1_parts,
+        dim=0,
+    ).contiguous()
+
+    target_s2_all = torch.cat(
+        target_s2_parts,
+        dim=0,
+    ).contiguous()
+
+    generated_s2 = (
+        torch.cat(
+            generated_s2_parts,
+            dim=0,
+        ).contiguous()
+        if predict_s2
+        else None
+    )
+
+    expected_token_shape = (
+        example_count,
+        prediction_length,
+        len(dataset.asset_cols),
+    )
+
+    for name, values in {
+        "generated_s1": generated_s1,
+        "target_s1": target_s1_all,
+        "target_s2": target_s2_all,
+    }.items():
+        if tuple(values.shape) != expected_token_shape:
+            raise ValueError(
+                f"{name} has shape {tuple(values.shape)}, "
+                f"expected {expected_token_shape}."
+            )
+
+    if (
+        generated_s2 is not None
+        and tuple(generated_s2.shape) != expected_token_shape
+    ):
+        raise ValueError(
+            "generated_s2 has shape "
+            f"{tuple(generated_s2.shape)}, "
+            f"expected {expected_token_shape}."
+        )
+
+    token_artifacts: dict[str, Any] = {
+        "generated_s1": generated_s1,
+        "generated_s2": generated_s2,
+        "target_s1": target_s1_all,
+        "target_s2": target_s2_all,
+        "sample_idx": graph_artifacts.get("sample_idx"),
+        "origin_idx": graph_artifacts.get("origin_idx"),
+        "target_indices": graph_artifacts.get("target_indices"),
+        "window_idx": graph_artifacts.get("window_idx"),
+        "trajectory_id": graph_artifacts.get("trajectory_id"),
+        "regime_id": graph_artifacts.get("regime_id"),
+        "dates": graph_artifacts.get("dates"),
+        "asset_cols": list(dataset.asset_cols),
+        "prediction_length": int(prediction_length),
+        "future_token_mode": (
+            model.config.heads.future_token_mode
+        ),
+        "s2_conditioning": (
+            model.config.heads.resolved_s2_conditioning
+        ),
+        "token_dtype": "int16",
+    }
+
+    
     diagnostics: dict[str, Any] = {
         "future_token_mode": model.config.heads.future_token_mode,
         "s2_loss_weight": float(model.config.heads.s2_loss_weight),
@@ -1792,6 +2013,7 @@ def generate_validation_artifacts(
     if dataset.data_mode != "real":
         return ValidationBundle(
             generation_metrics=generation_metrics,
+            token_artifacts=token_artifacts,
             graph_artifacts=graph_artifacts,
             prediction_result=None,
             metric_results=None,
@@ -1828,12 +2050,21 @@ def generate_validation_artifacts(
         channels=evaluator.channels,
     )
 
-    primary_values = metric_results["cumulative_log_change_mae"]
-    primary_score = float(primary_values.mean().item())
+    primary_score = _mean_cumulative_log_change_mae_at_horizons(
+        metric_results=metric_results,
+        available_horizons=evaluator.horizons,
+        selected_horizons=early_stopping_horizons,
+    )
 
     diagnostics.update(
         {
-            "primary_metric": "mean_validation_cumulative_log_change_mae",
+            "primary_metric": (
+                "mean_validation_cumulative_log_change_mae"
+            ),
+            "primary_horizons": [
+                int(horizon)
+                for horizon in early_stopping_horizons
+            ],
             "primary_score": primary_score,
             "invalid_dense_candle_rate_percent": (
                 100.0 * invalid_dense_count / max(invalid_dense_total, 1)
@@ -1849,6 +2080,7 @@ def generate_validation_artifacts(
 
     return ValidationBundle(
         generation_metrics=generation_metrics,
+        token_artifacts=token_artifacts,
         graph_artifacts=graph_artifacts,
         prediction_result=prediction_result,
         metric_results=metric_results,
@@ -1946,6 +2178,7 @@ def build_checkpoint(
     best_epoch: int,
     evaluations_without_improvement: int,
     history: list[dict[str, Any]],
+    secondary_selection_state: Mapping[str, Mapping[str, Any]],
     run_signature: str,
     resolved_config: Mapping[str, Any],
     run_metadata: Mapping[str, Any],
@@ -1961,6 +2194,9 @@ def build_checkpoint(
             evaluations_without_improvement
         ),
         "history": list(history),
+        "secondary_selection_state": deepcopy(
+            dict(secondary_selection_state)
+        ),
         "rng_state": capture_rng_state(),
         "run_signature": run_signature,
         "resolved_config": deepcopy(dict(resolved_config)),
@@ -2272,6 +2508,90 @@ def main() -> None:
     gradient_clip_norm = float(training_config["gradient_clip_norm"])
     seed = int(training_config["seed"])
 
+    raw_early_stopping_horizons = training_config.get(
+        "early_stopping_horizons"
+    )
+
+    if not isinstance(
+        raw_early_stopping_horizons,
+        (list, tuple),
+    ):
+        raise TypeError(
+            "training.early_stopping_horizons must be a list "
+            "or tuple of integer horizons."
+        )
+
+    early_stopping_horizons = tuple(
+        int(horizon)
+        for horizon in raw_early_stopping_horizons
+    )
+
+    if not early_stopping_horizons:
+        raise ValueError(
+            "training.early_stopping_horizons must not be empty."
+        )
+
+    if any(
+        horizon <= 0
+        for horizon in early_stopping_horizons
+    ):
+        raise ValueError(
+            "training.early_stopping_horizons must contain only "
+            "positive integers."
+        )
+
+    if len(set(early_stopping_horizons)) != len(
+        early_stopping_horizons
+    ):
+        raise ValueError(
+            "training.early_stopping_horizons must not contain "
+            "duplicate horizons."
+        )
+
+    early_stopping_metric = str(
+        training_config.get(
+            "early_stopping_metric",
+            "",
+        )
+    ).strip()
+
+    supported_early_stopping_metrics = {
+        "decoded_cumulative_log_change_mae",
+        "validation_token_loss",
+    }
+
+    if (
+        early_stopping_metric
+        not in supported_early_stopping_metrics
+    ):
+        raise ValueError(
+            "training.early_stopping_metric must be one of "
+            f"{sorted(supported_early_stopping_metrics)}. "
+            f"Observed {early_stopping_metric!r}."
+        )
+
+    if (
+        early_stopping_metric
+        == "validation_token_loss"
+        and args.validation_decode_every != 1
+    ):
+        raise ValueError(
+            "validation_token_loss early stopping currently requires "
+            "--validation-decode-every=1 so that the selected "
+            "checkpoint also has matching decoded validation artefacts."
+        )
+
+    if (
+        data_mode == "synthetic"
+        and early_stopping_metric
+        == "decoded_cumulative_log_change_mae"
+    ):
+        raise ValueError(
+            "Synthetic runs do not currently expose decoded raw-price "
+            "metrics. Use training.early_stopping_metric="
+            "'validation_token_loss' for synthetic data."
+        )
+
     if learning_rate <= 0:
         raise ValueError("training.learning_rate must be positive.")
     if weight_decay < 0:
@@ -2301,6 +2621,25 @@ def main() -> None:
     validation_dataset_full = loaders.validation_dataset
 
     model = DynamicGraphTokenForecaster.from_config(resolved_config).to(device)
+
+    available_evaluation_horizons = tuple(
+        int(horizon)
+        for horizon in model.config.heads.evaluation_horizons
+    )
+
+    missing_early_stopping_horizons = [
+        horizon
+        for horizon in early_stopping_horizons
+        if horizon not in available_evaluation_horizons
+    ]
+
+    if missing_early_stopping_horizons:
+        raise ValueError(
+            "training.early_stopping_horizons contains horizons that "
+            "are not present in the model evaluation horizons. "
+            f"Missing={missing_early_stopping_horizons}, "
+            f"available={list(available_evaluation_horizons)}."
+        )
 
     if (
         graph_regularisation_config
@@ -2448,10 +2787,15 @@ def main() -> None:
             if device.type == "cuda"
             else None
         ),
-        "selection_metric": (
-            "mean_validation_cumulative_log_change_mae"
-            if data_mode == "real"
-            else "validation_supervised_token_loss"
+        "selection_metric": early_stopping_metric,
+        "selection_horizons": (
+            [
+                int(horizon)
+                for horizon in early_stopping_horizons
+            ]
+            if early_stopping_metric
+            == "decoded_cumulative_log_change_mae"
+            else None
         ),
         "graph_regularisation": {
             "graph_reg_layer": (
@@ -2494,7 +2838,22 @@ def main() -> None:
     atomic_json_save(resolved_config, run_dir / "resolved_config.json")
     atomic_json_save(run_metadata, run_dir / "run_metadata.json")
 
+    # best_checkpoint.pt is controlled by the configured
+    # early-stopping metric. For the upcoming run, this is mean
+    # decoded CLG-MAE at horizons [1, 5].
     best_checkpoint_path = run_dir / "best_checkpoint.pt"
+
+    # Secondary checkpoints do not control patience. They preserve
+    # alternative validation-selection views from the same run.
+    best_all_horizons_checkpoint_path = (
+        run_dir
+        / "best_all_horizons_checkpoint.pt"
+    )
+    best_validation_ce_checkpoint_path = (
+        run_dir
+        / "best_validation_ce_checkpoint.pt"
+    )
+
     last_checkpoint_path = run_dir / "last_checkpoint.pt"
     history_path = run_dir / "history.csv"
 
@@ -2503,6 +2862,20 @@ def main() -> None:
     best_score = math.inf
     best_epoch = 0
     evaluations_without_improvement = 0
+
+    secondary_selection_state: dict[
+        str,
+        dict[str, Any],
+    ] = {
+        "all_horizons": {
+            "best_score": math.inf,
+            "best_epoch": 0,
+        },
+        "validation_ce": {
+            "best_score": math.inf,
+            "best_epoch": 0,
+        },
+    }
 
     if args.resume:
         if not last_checkpoint_path.is_file():
@@ -2525,6 +2898,47 @@ def main() -> None:
             checkpoint["evaluations_without_improvement"]
         )
         history = list(checkpoint.get("history", []))
+
+        saved_secondary_selection_state = checkpoint.get(
+            "secondary_selection_state"
+        )
+
+        if saved_secondary_selection_state is not None:
+            if not isinstance(
+                saved_secondary_selection_state,
+                Mapping,
+            ):
+                raise TypeError(
+                    "Checkpoint secondary_selection_state must be "
+                    "a mapping."
+                )
+
+            for selection_name in (
+                "all_horizons",
+                "validation_ce",
+            ):
+                saved_entry = (
+                    saved_secondary_selection_state.get(
+                        selection_name
+                    )
+                )
+
+                if not isinstance(saved_entry, Mapping):
+                    raise ValueError(
+                        "Checkpoint is missing valid secondary "
+                        f"selection state for {selection_name!r}."
+                    )
+
+                secondary_selection_state[
+                    selection_name
+                ] = {
+                    "best_score": float(
+                        saved_entry["best_score"]
+                    ),
+                    "best_epoch": int(
+                        saved_entry["best_epoch"]
+                    ),
+                }
 
         previous_metadata = checkpoint.get("run_metadata")
         if isinstance(previous_metadata, Mapping):
@@ -2593,6 +3007,7 @@ def main() -> None:
                 tokenizer=tokenizer,
                 raw_train_split=raw_train_split,
                 decode_series_batch_size=args.decode_series_batch_size,
+                early_stopping_horizons=early_stopping_horizons,
             )
             _save_best_validation_artifacts(
                 run_dir=run_dir,
@@ -2669,7 +3084,13 @@ def main() -> None:
 
             bundle: ValidationBundle | None = None
             primary_score: float | None = None
+
+            all_horizons_score: float | None = None
+            validation_ce_score: float | None = None
+
             improved = False
+            all_horizons_improved = False
+            validation_ce_improved = False
 
             if should_decode:
                 bundle = generate_validation_artifacts(
@@ -2682,14 +3103,112 @@ def main() -> None:
                     tokenizer=tokenizer,
                     raw_train_split=raw_train_split,
                     decode_series_batch_size=args.decode_series_batch_size,
+                    early_stopping_horizons=early_stopping_horizons,
                 )
 
-                primary_score = (
-                    float(bundle.primary_score)
-                    if data_mode == "real"
-                    else float(validation_teacher.token_loss)
+                if (
+                    early_stopping_metric
+                    == "decoded_cumulative_log_change_mae"
+                ):
+                    if bundle.primary_score is None:
+                        raise RuntimeError(
+                            "Decoded cumulative-log-change MAE was "
+                            "selected for early stopping, but validation "
+                            "did not produce a decoded primary score."
+                        )
+
+                    primary_score = float(
+                        bundle.primary_score
+                    )
+
+                elif (
+                    early_stopping_metric
+                    == "validation_token_loss"
+                ):
+                    primary_score = float(
+                        validation_teacher.token_loss
+                    )
+
+                else:
+                    raise AssertionError(
+                        "Unsupported early-stopping metric passed "
+                        "configuration validation."
+                    )
+
+                validation_ce_score = float(
+                    validation_teacher.token_loss
                 )
 
+                if not math.isfinite(validation_ce_score):
+                    raise ValueError(
+                        "Validation token CE is non-finite."
+                    )
+
+                if data_mode == "real":
+                    if bundle.metric_results is None:
+                        raise RuntimeError(
+                            "Real-data validation did not return "
+                            "decoded metric results."
+                        )
+
+                    all_horizons_score = (
+                        _mean_cumulative_log_change_mae_at_horizons(
+                            metric_results=bundle.metric_results,
+                            available_horizons=(
+                                available_evaluation_horizons
+                            ),
+                            selected_horizons=(
+                                available_evaluation_horizons
+                            ),
+                        )
+                    )
+
+                    all_horizons_best_score = float(
+                        secondary_selection_state[
+                            "all_horizons"
+                        ][
+                            "best_score"
+                        ]
+                    )
+
+                    all_horizons_improved = (
+                        all_horizons_score
+                        < all_horizons_best_score
+                    )
+
+                    if all_horizons_improved:
+                        secondary_selection_state[
+                            "all_horizons"
+                        ] = {
+                            "best_score": float(
+                                all_horizons_score
+                            ),
+                            "best_epoch": int(epoch),
+                        }
+
+                validation_ce_best_score = float(
+                    secondary_selection_state[
+                        "validation_ce"
+                    ][
+                        "best_score"
+                    ]
+                )
+
+                validation_ce_improved = (
+                    validation_ce_score
+                    < validation_ce_best_score
+                )
+
+                if validation_ce_improved:
+                    secondary_selection_state[
+                        "validation_ce"
+                    ] = {
+                        "best_score": float(
+                            validation_ce_score
+                        ),
+                        "best_epoch": int(epoch),
+                    }
+                
                 improved = primary_score < (best_score - args.min_delta)
 
                 if improved:
@@ -2708,6 +3227,9 @@ def main() -> None:
                             evaluations_without_improvement
                         ),
                         history=history,
+                        secondary_selection_state=(
+                            secondary_selection_state
+                        ),
                         run_signature=run_signature,
                         resolved_config=resolved_config,
                         run_metadata=run_metadata,
@@ -2722,6 +3244,100 @@ def main() -> None:
                     )
                 else:
                     evaluations_without_improvement += 1
+
+                if all_horizons_improved:
+                    if all_horizons_score is None:
+                        raise AssertionError(
+                            "all_horizons_improved is True but "
+                            "all_horizons_score is unavailable."
+                        )
+
+                    all_horizons_checkpoint = build_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        epoch=epoch,
+                        best_score=best_score,
+                        best_epoch=best_epoch,
+                        evaluations_without_improvement=(
+                            evaluations_without_improvement
+                        ),
+                        history=history,
+                        secondary_selection_state=(
+                            secondary_selection_state
+                        ),
+                        run_signature=run_signature,
+                        resolved_config=resolved_config,
+                        run_metadata=run_metadata,
+                    )
+
+                    all_horizons_checkpoint[
+                        "checkpoint_selection"
+                    ] = {
+                        "name": "all_horizons",
+                        "metric": (
+                            "mean_validation_"
+                            "cumulative_log_change_mae"
+                        ),
+                        "horizons": [
+                            int(horizon)
+                            for horizon in (
+                                available_evaluation_horizons
+                            )
+                        ],
+                        "score": float(
+                            all_horizons_score
+                        ),
+                        "epoch": int(epoch),
+                    }
+
+                    atomic_torch_save(
+                        all_horizons_checkpoint,
+                        best_all_horizons_checkpoint_path,
+                    )
+
+                if validation_ce_improved:
+                    if validation_ce_score is None:
+                        raise AssertionError(
+                            "validation_ce_improved is True but "
+                            "validation_ce_score is unavailable."
+                        )
+
+                    validation_ce_checkpoint = build_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        epoch=epoch,
+                        best_score=best_score,
+                        best_epoch=best_epoch,
+                        evaluations_without_improvement=(
+                            evaluations_without_improvement
+                        ),
+                        history=history,
+                        secondary_selection_state=(
+                            secondary_selection_state
+                        ),
+                        run_signature=run_signature,
+                        resolved_config=resolved_config,
+                        run_metadata=run_metadata,
+                    )
+
+                    validation_ce_checkpoint[
+                        "checkpoint_selection"
+                    ] = {
+                        "name": "validation_ce",
+                        "metric": "validation_token_loss",
+                        "horizons": None,
+                        "score": float(
+                            validation_ce_score
+                        ),
+                        "epoch": int(epoch),
+                    }
+
+                    atomic_torch_save(
+                        validation_ce_checkpoint,
+                        best_validation_ce_checkpoint_path,
+                    )
 
             epoch_record: dict[str, Any] = {
                 "epoch": epoch,
@@ -2799,6 +3415,48 @@ def main() -> None:
                 "best_score": best_score,
                 "best_epoch": best_epoch,
                 "improved": improved,
+
+                "all_horizons_score": (
+                    all_horizons_score
+                ),
+                "all_horizons_improved": (
+                    all_horizons_improved
+                ),
+                "best_all_horizons_score": float(
+                    secondary_selection_state[
+                        "all_horizons"
+                    ][
+                        "best_score"
+                    ]
+                ),
+                "best_all_horizons_epoch": int(
+                    secondary_selection_state[
+                        "all_horizons"
+                    ][
+                        "best_epoch"
+                    ]
+                ),
+
+                "validation_ce_selection_score": (
+                    validation_ce_score
+                ),
+                "validation_ce_improved": (
+                    validation_ce_improved
+                ),
+                "best_validation_ce_score": float(
+                    secondary_selection_state[
+                        "validation_ce"
+                    ][
+                        "best_score"
+                    ]
+                ),
+                "best_validation_ce_epoch": int(
+                    secondary_selection_state[
+                        "validation_ce"
+                    ][
+                        "best_epoch"
+                    ]
+                ),
                 "evaluations_without_improvement": (
                     evaluations_without_improvement
                 ),
@@ -2823,13 +3481,34 @@ def main() -> None:
             }
 
             if bundle is not None:
-                epoch_record.update(bundle.diagnostics)
+                epoch_record.update(
+                    bundle.diagnostics
+                )
                 epoch_record.update(
                     _flatten_metric_results_for_logging(
                         bundle.metric_results,
                         model.config.heads.evaluation_horizons,
                     )
                 )
+
+            # bundle.diagnostics contains the decoded score. Restore the
+            # actual configured early-stopping score in case validation
+            # token loss is being used instead.
+            epoch_record["primary_score"] = primary_score
+            epoch_record["selection_metric"] = (
+                early_stopping_metric
+            )
+            epoch_record["selection_horizons"] = (
+                json.dumps(
+                    [
+                        int(horizon)
+                        for horizon in early_stopping_horizons
+                    ]
+                )
+                if early_stopping_metric
+                == "decoded_cumulative_log_change_mae"
+                else None
+            )
 
             history.append(epoch_record)
             atomic_csv_save(pd.DataFrame(history), history_path)
@@ -2843,6 +3522,9 @@ def main() -> None:
                 best_epoch=best_epoch,
                 evaluations_without_improvement=evaluations_without_improvement,
                 history=history,
+                secondary_selection_state=(
+                    secondary_selection_state
+                ),
                 run_signature=run_signature,
                 resolved_config=resolved_config,
                 run_metadata=run_metadata,
