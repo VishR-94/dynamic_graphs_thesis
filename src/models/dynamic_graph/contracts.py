@@ -518,6 +518,10 @@ class FuturePredictorConfig:
     ``structured_parallel`` uses learned ordered future queries with
     bidirectional future-query self-attention.
 
+    For ``structured_parallel``, ``num_layers=0`` disables the future
+    Transformer stack. The predictor then applies LayerNorm directly to
+    the final context summary plus learned future-position embeddings.
+
     ``autoregressive`` uses shifted future token-pair embeddings with
     causal self-attention. Training is teacher-forced; inference is
     sequential.
@@ -542,10 +546,24 @@ class FuturePredictorConfig:
                 f"Unsupported future predictor type {self.type!r}."
             )
 
-        _validate_positive_integer(
-            self.num_layers,
-            name="future_predictor.num_layers",
-        )
+        if (
+            isinstance(self.num_layers, bool)
+            or not isinstance(self.num_layers, int)
+            or self.num_layers < 0
+        ):
+            raise ValueError(
+                "future_predictor.num_layers must be a non-negative "
+                f"integer. Received {self.num_layers!r}."
+            )
+
+        if (
+            self.type == "autoregressive"
+            and self.num_layers == 0
+        ):
+            raise ValueError(
+                "future_predictor.num_layers must be positive when "
+                "future_predictor.type='autoregressive'."
+            )
 
         _validate_positive_integer(
             self.num_heads,
