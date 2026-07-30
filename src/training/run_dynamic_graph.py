@@ -40,6 +40,11 @@ from src.models.dynamic_graph.config import (
     validate_dynamic_graph_config,
 )
 from src.models.dynamic_graph.contracts import GraphOutput
+from src.models.dynamic_graph.fixed_graph_resource import (
+    FixedGraphResource,
+    FixedGraphResourceConfig,
+    fit_absolute_return_correlation_resource,
+)
 from src.models.dynamic_graph.future_predictor import (
     FutureTokenPrediction,
     compute_future_token_loss,
@@ -2397,6 +2402,69 @@ def _load_raw_training_split(
     return train_split
 
 
+def _load_or_create_fixed_graph_resource(
+    *,
+    run_dir: Path,
+    raw_train_split: Mapping[str, Any],
+    resource_config: FixedGraphResourceConfig,
+    expected_asset_cols: Sequence[str],
+    add_self_loops: bool,
+    resume: bool,
+    evaluate_only: bool,
+) -> FixedGraphResource:
+    """Fit once, persist, and reuse the exact training-only graph."""
+    resource_path = run_dir / "fixed_graph_resource.pt"
+    summary_path = run_dir / "fixed_graph_resource.json"
+
+    if resource_path.is_file():
+        try:
+            payload = torch.load(
+                resource_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            payload = torch.load(
+                resource_path,
+                map_location="cpu",
+            )
+
+        if not isinstance(payload, Mapping):
+            raise TypeError(
+                "Saved fixed graph resource must be a mapping."
+            )
+
+        resource = FixedGraphResource.from_payload(payload)
+        resource.validate_against(
+            config=resource_config,
+            expected_asset_cols=expected_asset_cols,
+            add_self_loops=add_self_loops,
+        )
+    else:
+        if resume or evaluate_only:
+            raise FileNotFoundError(
+                "A resumed/evaluation fixed-graph run is missing "
+                f"{resource_path}."
+            )
+
+        resource = fit_absolute_return_correlation_resource(
+            raw_train_split,
+            config=resource_config,
+            expected_asset_cols=expected_asset_cols,
+            add_self_loops=add_self_loops,
+        )
+        atomic_torch_save(
+            resource.to_payload(),
+            resource_path,
+        )
+
+    atomic_json_save(
+        resource.metadata(),
+        summary_path,
+    )
+    return resource
+
+
 def main() -> None:
     args = build_argument_parser().parse_args()
 
@@ -2475,6 +2543,47 @@ def main() -> None:
             )
         )
     )
+
+    graph_values = model_values["graph"]
+    graph_type = str(graph_values["type"])
+    graph_add_self_loops = bool(
+        graph_values["add_self_loops"]
+    )
+    graph_resource_config = (
+        FixedGraphResourceConfig.from_mapping(
+            resolved_config.get("graph_resource")
+        )
+    )
+    graph_resource_config.validate(
+        graph_type=graph_type,
+        data_mode=data_mode,
+    )
+
+    if graph_type == "fixed":
+        active_fixed_graph_penalties = {
+            "graph_entropy_reg": (
+                graph_regularisation_config.graph_entropy_reg
+            ),
+            "graph_target_entropy_reg": (
+                graph_regularisation_config
+                .graph_target_entropy_reg
+            ),
+            "graph_temporal_smooth_reg": (
+                graph_regularisation_config
+                .graph_temporal_smooth_reg
+            ),
+        }
+        nonzero = {
+            name: float(value)
+            for name, value in active_fixed_graph_penalties.items()
+            if float(value) != 0.0
+        }
+        if nonzero:
+            raise ValueError(
+                "A fixed graph cannot respond to graph regularisation. "
+                "Set all graph-regularisation coefficients to zero. "
+                f"Observed {nonzero}."
+            )
 
     if data_mode not in {"real", "synthetic"}:
         raise ValueError("data.mode must be 'real' or 'synthetic'.")
@@ -2620,7 +2729,65 @@ def main() -> None:
     train_dataset_full = loaders.train_dataset
     validation_dataset_full = loaders.validation_dataset
 
-    model = DynamicGraphTokenForecaster.from_config(resolved_config).to(device)
+    forecasting_config = load_yaml(forecasting_config_path)
+    tokenizer: KronosTokenizerAdapter | None = None
+    raw_train_split: dict[str, Any] | None = None
+    fixed_graph_resource: FixedGraphResource | None = None
+    fixed_adjacency: Tensor | None = None
+
+    if data_mode == "real":
+        if args.data_dir is None:
+            raise ValueError("--data-dir is required when data.mode='real'.")
+
+        data_dir = args.data_dir.expanduser().resolve()
+        if not data_dir.is_dir():
+            raise FileNotFoundError(data_dir)
+
+        raw_train_split = _load_raw_training_split(
+            data_dir,
+            expected_asset_cols=train_dataset_full.asset_cols,
+        )
+
+        if graph_resource_config.enabled:
+            fixed_graph_resource = (
+                _load_or_create_fixed_graph_resource(
+                    run_dir=run_dir,
+                    raw_train_split=raw_train_split,
+                    resource_config=graph_resource_config,
+                    expected_asset_cols=(
+                        train_dataset_full.asset_cols
+                    ),
+                    add_self_loops=graph_add_self_loops,
+                    resume=bool(args.resume),
+                    evaluate_only=bool(args.evaluate_only),
+                )
+            )
+            fixed_adjacency = fixed_graph_resource.adjacency
+
+        tokenizer = KronosTokenizerAdapter.from_config(
+            forecasting_config,
+            series_batch_size=args.decode_series_batch_size,
+        ).load()
+
+        expected_tokenizer = forecasting_config["models"]["kronos"]
+        for cache_key, config_key in (
+            ("tokenizer_id", "tokenizer_id"),
+            ("tokenizer_revision", "tokenizer_revision"),
+        ):
+            cache_value = train_dataset_full.cache.get(cache_key)
+            expected_value = expected_tokenizer[config_key]
+            if cache_value != expected_value:
+                raise ValueError(
+                    f"Token cache {cache_key}={cache_value!r}, but the "
+                    f"forecasting config expects {expected_value!r}."
+                )
+    else:
+        data_dir = None
+
+    model = DynamicGraphTokenForecaster.from_config(
+        resolved_config,
+        fixed_adjacency=fixed_adjacency,
+    ).to(device)
 
     available_evaluation_horizons = tuple(
         int(horizon)
@@ -2693,42 +2860,6 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    forecasting_config = load_yaml(forecasting_config_path)
-    tokenizer: KronosTokenizerAdapter | None = None
-    raw_train_split: dict[str, Any] | None = None
-
-    if data_mode == "real":
-        if args.data_dir is None:
-            raise ValueError("--data-dir is required when data.mode='real'.")
-
-        data_dir = args.data_dir.expanduser().resolve()
-        if not data_dir.is_dir():
-            raise FileNotFoundError(data_dir)
-
-        tokenizer = KronosTokenizerAdapter.from_config(
-            forecasting_config,
-            series_batch_size=args.decode_series_batch_size,
-        ).load()
-        raw_train_split = _load_raw_training_split(
-            data_dir,
-            expected_asset_cols=train_dataset_full.asset_cols,
-        )
-
-        expected_tokenizer = forecasting_config["models"]["kronos"]
-        for cache_key, config_key in (
-            ("tokenizer_id", "tokenizer_id"),
-            ("tokenizer_revision", "tokenizer_revision"),
-        ):
-            cache_value = train_dataset_full.cache.get(cache_key)
-            expected_value = expected_tokenizer[config_key]
-            if cache_value != expected_value:
-                raise ValueError(
-                    f"Token cache {cache_key}={cache_value!r}, but the "
-                    f"forecasting config expects {expected_value!r}."
-                )
-    else:
-        data_dir = None
-
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
@@ -2797,6 +2928,11 @@ def main() -> None:
             == "decoded_cumulative_log_change_mae"
             else None
         ),
+        "fixed_graph_resource": (
+            None
+            if fixed_graph_resource is None
+            else fixed_graph_resource.metadata()
+        ),
         "graph_regularisation": {
             "graph_reg_layer": (
                 graph_regularisation_config.graph_reg_layer
@@ -2831,6 +2967,11 @@ def main() -> None:
         "train_windows": len(train_dataset),
         "validation_windows": len(validation_dataset),
         "project_git_commit": project_commit,
+        "fixed_graph_resource_hash": (
+            None
+            if fixed_graph_resource is None
+            else fixed_graph_resource.resource_hash
+        ),
     }
     run_signature = _config_signature(signature_values)
     run_metadata["run_signature"] = run_signature
@@ -3621,6 +3762,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
 
 
 

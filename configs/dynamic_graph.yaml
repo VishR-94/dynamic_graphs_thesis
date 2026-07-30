@@ -32,6 +32,14 @@ normalisation:
   clip_min: -5.0
   clip_max: 5.0
   eps: 1.0e-05
+graph_resource:
+  # Deterministic graph fitted outside the neural model. ``none`` keeps
+  # the existing learned/no-graph modes unchanged. The production
+  # correlation graph is always fitted from the cleaned training split.
+  type: none
+  channel: close
+  threshold: 0.18
+  empty_row_policy: error
 models:
   dynamic_graph:
     num_nodes: 93
@@ -162,6 +170,47 @@ presets:
           type: structured_parallel
         loss:
           horizon_weighting: uniform
+  fixed_correlation_coarse_only_exponential:
+    graph_resource:
+      type: absolute_return_correlation
+      channel: close
+      threshold: 0.18
+      empty_row_policy: error
+
+    models:
+      dynamic_graph:
+        graph:
+          type: fixed
+          add_self_loops: false
+
+        graph_regularisation:
+          graph_reg_layer: -1
+          graph_reg_warmup_epochs: 0
+          graph_entropy_reg: 0.0
+          graph_target_entropy: null
+          graph_target_entropy_reg: 0.0
+          graph_temporal_smooth_reg: 0.0
+
+        heads:
+          future_token_mode: coarse_only
+          s2_loss_weight: 0.0
+          s2_conditioning: true_s1
+
+        future_predictor:
+          type: structured_parallel
+          num_layers: 1
+
+        loss:
+          horizon_weighting: exponential_decay
+          exponential_half_life: 5.0
+          exponential_floor_weight: 0.25
+
+    training:
+      early_stopping_metric: decoded_cumulative_log_change_mae
+      early_stopping_horizons:
+        - 1
+        - 5
+
   free_static_full_true_s1:
     models:
       dynamic_graph:
