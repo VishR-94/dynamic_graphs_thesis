@@ -289,3 +289,42 @@ presets:
         loss:
           horizon_weighting: uniform
 
+
+  free_static_coarse_only_remapped150_exponential:
+    models:
+      dynamic_graph:
+        graph:
+          type: free_static
+          base_graph_type: free_static
+          add_self_loops: false
+
+        graph_regularisation:
+          graph_reg_layer: -1
+          graph_reg_warmup_epochs: 0
+          graph_entropy_reg: 0.0
+          graph_target_entropy: 2.2
+          graph_target_entropy_reg: 0.05
+          graph_temporal_smooth_reg: 0.0
+
+        heads:
+          s1_vocabulary_size: 150
+          s2_vocabulary_size: 1024
+          future_token_mode: coarse_only
+          s2_loss_weight: 0.0
+          s2_conditioning: true_s1
+
+        future_predictor:
+          type: structured_parallel
+          num_layers: 1
+
+        loss:
+          horizon_weighting: exponential_decay
+          exponential_half_life: 5.0
+          exponential_floor_weight: 0.25
+
+    training:
+      early_stopping_metric: decoded_cumulative_log_change_mae
+      early_stopping_horizons:
+        - 1
+        - 5
+

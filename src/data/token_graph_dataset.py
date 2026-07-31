@@ -697,7 +697,8 @@ def oracle_path_smoke_metrics(
 # Origin-aligned forecasting-cache generation
 # ==================================================================
 
-ORIGIN_ALIGNED_CACHE_VERSION = 1
+ORIGIN_ALIGNED_CACHE_VERSION = 2
+SUPPORTED_ORIGIN_ALIGNED_CACHE_VERSIONS = (1, 2)
 
 
 def validate_origin_aligned_token_cache(
@@ -758,8 +759,10 @@ def validate_origin_aligned_token_cache(
             f"{sorted(missing)}."
         )
 
-    if int(cache["format_version"]) != (
-        ORIGIN_ALIGNED_CACHE_VERSION
+    format_version = int(cache["format_version"])
+
+    if format_version not in (
+        SUPPORTED_ORIGIN_ALIGNED_CACHE_VERSIONS
     ):
         raise ValueError(
             "Unsupported origin-aligned cache version."
@@ -944,18 +947,132 @@ def validate_origin_aligned_token_cache(
             "evaluation_horizons."
         )
 
-    for name, values in (
-        ("context_tokens", context_tokens),
-        ("target_s1", target_s1),
-        ("target_s2", target_s2),
+    s1_id_space = str(
+        cache.get(
+            "s1_id_space",
+            "kronos_original",
+        )
+    )
+
+    s1_vocabulary_size = int(
+        cache.get(
+            "s1_vocabulary_size",
+            1024,
+        )
+    )
+
+    if not 1 <= s1_vocabulary_size <= 1024:
+        raise ValueError(
+            "s1_vocabulary_size must lie in [1, 1024]."
+        )
+
+    if s1_id_space not in {
+        "kronos_original",
+        "compact_retained_kronos",
+    }:
+        raise ValueError(
+            "Unsupported s1_id_space."
+        )
+
+    context_s1 = context_tokens[..., 0]
+    context_s2 = context_tokens[..., 1]
+
+    for name, values, maximum in (
+        ("context s1", context_s1, s1_vocabulary_size),
+        ("target_s1", target_s1, s1_vocabulary_size),
+        ("context s2", context_s2, 1024),
+        ("target_s2", target_s2, 1024),
     ):
         if (
             values.min().item() < 0
-            or values.max().item() >= 1024
+            or values.max().item() >= maximum
         ):
             raise ValueError(
-                f"{name} contains IDs outside [0, 1023]."
+                f"{name} contains IDs outside [0, {maximum - 1}]."
             )
+
+    if s1_id_space == "compact_retained_kronos":
+        if format_version < 2:
+            raise ValueError(
+                "Compact s1 caches require format_version >= 2."
+            )
+
+        required_mapping_keys = {
+            "s1_compact_to_original",
+            "s1_original_to_compact",
+            "s1_remapping_method",
+            "s1_remapping_resource_hash",
+        }
+
+        missing_mapping = required_mapping_keys - set(cache)
+        if missing_mapping:
+            raise KeyError(
+                "Compact s1 cache is missing mapping keys: "
+                f"{sorted(missing_mapping)}."
+            )
+
+        compact_to_original = torch.as_tensor(
+            cache["s1_compact_to_original"],
+            dtype=torch.long,
+        )
+        original_to_compact = torch.as_tensor(
+            cache["s1_original_to_compact"],
+            dtype=torch.long,
+        )
+
+        if tuple(compact_to_original.shape) != (
+            s1_vocabulary_size,
+        ):
+            raise ValueError(
+                "s1_compact_to_original must have shape [K]."
+            )
+
+        if tuple(original_to_compact.shape) != (1024,):
+            raise ValueError(
+                "s1_original_to_compact must have shape [1024]."
+            )
+
+        if (
+            compact_to_original.min().item() < 0
+            or compact_to_original.max().item() >= 1024
+        ):
+            raise ValueError(
+                "s1_compact_to_original contains invalid Kronos IDs."
+            )
+
+        if torch.unique(compact_to_original).numel() != (
+            s1_vocabulary_size
+        ):
+            raise ValueError(
+                "s1_compact_to_original must contain unique IDs."
+            )
+
+        expected_forward = torch.full(
+            (1024,),
+            fill_value=-1,
+            dtype=torch.long,
+        )
+        expected_forward[compact_to_original] = torch.arange(
+            s1_vocabulary_size,
+            dtype=torch.long,
+        )
+
+        if not torch.equal(
+            original_to_compact,
+            expected_forward,
+        ):
+            raise ValueError(
+                "The compact/original s1 lookup tables are inconsistent."
+            )
+
+        if not str(cache["s1_remapping_resource_hash"]):
+            raise ValueError(
+                "s1_remapping_resource_hash must not be empty."
+            )
+    elif s1_vocabulary_size != 1024:
+        raise ValueError(
+            "Original Kronos s1 ID space must use vocabulary size 1024."
+        )
 
     for name, values in (
         ("context_mean", context_mean),
@@ -1430,6 +1547,8 @@ def build_origin_aligned_token_cache(
         "representation": (
             "origin_aligned_kronos_forecasting_tokens"
         ),
+        "s1_id_space": "kronos_original",
+        "s1_vocabulary_size": 1024,
         "context_tokens": context_tokens,
         "target_s1": target_s1,
         "target_s2": target_s2,

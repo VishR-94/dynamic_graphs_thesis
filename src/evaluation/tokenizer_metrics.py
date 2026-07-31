@@ -1,17 +1,29 @@
 from __future__ import annotations
+
 import random
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
+from typing import Any
+
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
 from matplotlib.axes import Axes
-from matplotlib.figure import Figure
-from collections.abc import Mapping, Sequence
-from typing import Any
-import matplotlib.pyplot as plt
-import numpy as np
-from tqdm.auto import tqdm
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
-from dataclasses import dataclass
+from matplotlib.figure import Figure
+from tqdm.auto import tqdm
+
+from src.data.s1_token_remapping import (
+    build_train_validation_remapped_rolling_caches,
+    fit_top_k_s1_remapping_resource,
+)
+from src.models.kronos_tokenizer import (
+    KronosTokenizerAdapter,
+    decode_causal_split,
+)
 
 def plot_tokenizer_reconstruction(
     split: Mapping[str, Any],
@@ -3867,3 +3879,1197 @@ def plot_cross_asset_mi_regime_heatmaps(
         figure,
         axes,
     )
+
+# ============================================================================
+# Canonical cache slicing and top-k coarse-token reconstruction analysis
+# ============================================================================
+
+@dataclass(frozen=True)
+class TokenizerAnalysisPeriods:
+    """In-memory period views used by the tokenizer-analysis notebook.
+
+    The canonical on-disk rolling caches remain the January--August and
+    September files. This object exposes January--June and July--September
+    views without creating duplicate ``encoded_kronos_*`` or
+    ``decoded_kronos_*`` files.
+    """
+
+    train_split: dict[str, Any]
+    validation_split: dict[str, Any]
+    train_encoded: dict[str, Any]
+    validation_encoded: dict[str, Any]
+    validation_decoded: dict[str, Any]
+
+
+def build_candle_period_view(
+    *,
+    reference_split: Mapping[str, Any],
+    source_splits: Sequence[Mapping[str, Any]],
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+) -> dict[str, Any]:
+    """Build a chronological, half-open date view of cleaned candle splits."""
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    if end <= start:
+        raise ValueError("end_date must be later than start_date.")
+
+    samples = sorted(
+        [
+            sample
+            for split in source_splits
+            for sample in split["samples"]
+            if (
+                start
+                <= pd.Timestamp(sample[2]).normalize()
+                < end
+            )
+        ],
+        key=lambda sample: pd.Timestamp(sample[2]),
+    )
+
+    if not samples:
+        raise ValueError(
+            f"No candle sessions lie in [{start.date()}, {end.date()})."
+        )
+
+    sample_dates = [
+        pd.Timestamp(sample[2]).normalize()
+        for sample in samples
+    ]
+
+    if len(set(sample_dates)) != len(sample_dates):
+        raise ValueError(
+            "The requested candle-period view contains duplicate dates."
+        )
+
+    dropped_days = sorted(
+        [
+            record
+            for split in source_splits
+            for record in split.get("dropped_days", [])
+            if (
+                start
+                <= pd.Timestamp(record[0]).normalize()
+                < end
+            )
+        ],
+        key=lambda record: pd.Timestamp(record[0]),
+    )
+
+    output = dict(reference_split)
+    output["samples"] = samples
+    output["dropped_days"] = dropped_days
+    return output
+
+
+def _load_torch_mapping(path: str | Path) -> dict[str, Any]:
+    resolved = Path(path).expanduser().resolve()
+
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+
+    try:
+        loaded = torch.load(
+            resolved,
+            map_location="cpu",
+            weights_only=False,
+        )
+    except TypeError:
+        loaded = torch.load(
+            resolved,
+            map_location="cpu",
+        )
+
+    if not isinstance(loaded, Mapping):
+        raise TypeError(
+            f"Expected a saved mapping at {resolved}."
+        )
+
+    return dict(loaded)
+
+
+def _cache_session_tensor_keys(
+    cache: Mapping[str, Any],
+) -> tuple[str, ...]:
+    if "context_s1" in cache:
+        return (
+            "context_s1",
+            "context_s2",
+            "context_mean",
+            "context_std",
+            "s1",
+            "s2",
+            "valid_mask",
+        )
+
+    if "decoded_coarse" in cache:
+        return (
+            "decoded_full",
+            "decoded_coarse",
+            "valid_mask",
+        )
+
+    raise ValueError(
+        "Unsupported Kronos cache: expected an encoded rolling cache "
+        "or a decoded reconstruction cache."
+    )
+
+
+def _compare_cache_static_value(
+    left: Any,
+    right: Any,
+) -> bool:
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        try:
+            return torch.equal(
+                torch.as_tensor(left),
+                torch.as_tensor(right),
+            )
+        except (TypeError, ValueError):
+            return False
+
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        try:
+            return np.array_equal(
+                np.asarray(left),
+                np.asarray(right),
+            )
+        except (TypeError, ValueError):
+            return False
+
+    return left == right
+
+
+def build_kronos_cache_period_view(
+    source_caches: Sequence[Mapping[str, Any]],
+    *,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+    name: str,
+) -> dict[str, Any]:
+    """Slice and combine canonical Kronos caches by session date.
+
+    Session tensors are copied into one chronological in-memory view. Static
+    metadata must agree across all source caches. Nothing is written to disk.
+    """
+    if not source_caches:
+        raise ValueError("At least one source cache is required.")
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+
+    if end <= start:
+        raise ValueError("end_date must be later than start_date.")
+
+    caches = [dict(cache) for cache in source_caches]
+    reference = caches[0]
+    session_keys = _cache_session_tensor_keys(reference)
+
+    for cache_index, cache in enumerate(caches):
+        if _cache_session_tensor_keys(cache) != session_keys:
+            raise ValueError(
+                "All source caches must have the same encoded/decoded type."
+            )
+
+        if "dates" not in cache:
+            raise KeyError(
+                f"{name} source cache {cache_index} has no dates metadata."
+            )
+
+        session_count = len(cache["dates"])
+
+        for key in session_keys:
+            if key not in cache:
+                raise KeyError(
+                    f"{name} source cache {cache_index} is missing {key!r}."
+                )
+
+            values = torch.as_tensor(cache[key])
+            if values.ndim == 0 or values.shape[0] != session_count:
+                raise ValueError(
+                    f"{name} source cache {cache_index} field {key!r} "
+                    "does not align with dates."
+                )
+
+    static_keys = (
+        "format_version",
+        "asset_cols",
+        "channels",
+        "tokenizer_channels",
+        "context_length",
+        "num_bars",
+        "zero_amount",
+        "tokenizer_id",
+        "tokenizer_revision",
+        "clip",
+        "eps",
+        "origin_indices",
+        "reconstruction_modes",
+    )
+
+    for cache_index, cache in enumerate(caches[1:], start=1):
+        for key in static_keys:
+            if key not in reference and key not in cache:
+                continue
+
+            if key not in reference or key not in cache:
+                raise ValueError(
+                    f"{name} source caches disagree on presence of {key!r}."
+                )
+
+            if not _compare_cache_static_value(
+                reference[key],
+                cache[key],
+            ):
+                raise ValueError(
+                    f"{name} source caches disagree for {key!r}."
+                )
+
+    tensor_parts: dict[str, list[torch.Tensor]] = {
+        key: []
+        for key in session_keys
+    }
+    selected_dates: list[pd.Timestamp] = []
+
+    for cache in caches:
+        dates = _normalised_cache_dates(cache["dates"])
+        mask = (
+            (dates >= start)
+            & (dates < end)
+        )
+        indices_np = np.flatnonzero(mask)
+
+        if indices_np.size == 0:
+            continue
+
+        indices = torch.as_tensor(
+            indices_np,
+            dtype=torch.long,
+        )
+
+        selected_dates.extend(
+            dates[indices_np].tolist()
+        )
+
+        for key in session_keys:
+            tensor_parts[key].append(
+                torch.as_tensor(cache[key])
+                .index_select(0, indices)
+            )
+
+    if not selected_dates:
+        raise ValueError(
+            f"No cached sessions lie in [{start.date()}, {end.date()})."
+        )
+
+    order = np.argsort(
+        np.asarray(selected_dates, dtype="datetime64[ns]"),
+        kind="stable",
+    )
+    ordered_dates = [
+        selected_dates[index]
+        for index in order.tolist()
+    ]
+
+    if len(set(ordered_dates)) != len(ordered_dates):
+        raise ValueError(
+            f"{name} period view contains duplicate dates."
+        )
+
+    output = dict(reference)
+
+    for key, parts in tensor_parts.items():
+        if not parts:
+            raise RuntimeError(
+                f"No session tensors were selected for {key!r}."
+            )
+
+        combined = torch.cat(parts, dim=0)
+
+        if not np.array_equal(
+            order,
+            np.arange(len(order)),
+        ):
+            combined = combined.index_select(
+                0,
+                torch.as_tensor(order, dtype=torch.long),
+            )
+
+        output[key] = combined.contiguous()
+
+    output["dates"] = [
+        str(date.date())
+        for date in ordered_dates
+    ]
+    output["analysis_period"] = {
+        "name": str(name),
+        "start_date": str(start.date()),
+        "end_date_exclusive": str(end.date()),
+    }
+    return output
+
+
+def _split_dates(
+    split: Mapping[str, Any],
+) -> list[pd.Timestamp]:
+    return [
+        pd.Timestamp(sample[2]).normalize()
+        for sample in split["samples"]
+    ]
+
+
+def _validate_period_alignment(
+    *,
+    split: Mapping[str, Any],
+    encoded: Mapping[str, Any],
+    decoded: Mapping[str, Any] | None,
+    name: str,
+) -> None:
+    split_dates = _split_dates(split)
+    encoded_dates = list(
+        _normalised_cache_dates(encoded["dates"])
+    )
+
+    if split_dates != encoded_dates:
+        raise ValueError(
+            f"{name} candle and encoded-cache dates do not align."
+        )
+
+    if list(split["asset_cols"]) != list(encoded["asset_cols"]):
+        raise ValueError(
+            f"{name} candle and encoded asset ordering differs."
+        )
+
+    if decoded is not None:
+        decoded_dates = list(
+            _normalised_cache_dates(decoded["dates"])
+        )
+
+        if encoded_dates != decoded_dates:
+            raise ValueError(
+                f"{name} encoded and decoded dates do not align."
+            )
+
+        if list(encoded["asset_cols"]) != list(decoded["asset_cols"]):
+            raise ValueError(
+                f"{name} encoded and decoded asset ordering differs."
+            )
+
+        if not torch.equal(
+            torch.as_tensor(encoded["valid_mask"], dtype=torch.bool),
+            torch.as_tensor(decoded["valid_mask"], dtype=torch.bool),
+        ):
+            raise ValueError(
+                f"{name} encoded and decoded valid masks differ."
+            )
+
+
+def load_tokenizer_analysis_periods(
+    *,
+    reference_split: Mapping[str, Any],
+    candle_source_splits: Sequence[Mapping[str, Any]],
+    encoded_cache_paths: Sequence[str | Path],
+    decoded_cache_paths: Sequence[str | Path],
+    training_start: str | pd.Timestamp = "2024-01-01",
+    training_end: str | pd.Timestamp = "2024-07-01",
+    validation_start: str | pd.Timestamp = "2024-07-01",
+    validation_end: str | pd.Timestamp = "2024-10-01",
+) -> TokenizerAnalysisPeriods:
+    """Load canonical caches and create analysis-period views in memory.
+
+    The expected canonical layout is normally:
+
+    - ``encoded_data.pt`` / ``decoded_data.pt``: January--August;
+    - ``encoded_data_val.pt`` / ``decoded_data_val.pt``: September.
+
+    The function builds January--June training and July--September validation
+    views without saving duplicate ``encoded_kronos_*`` files.
+    """
+    if not encoded_cache_paths:
+        raise ValueError(
+            "encoded_cache_paths must not be empty."
+        )
+
+    if not decoded_cache_paths:
+        raise ValueError(
+            "decoded_cache_paths must not be empty."
+        )
+
+    train_split = build_candle_period_view(
+        reference_split=reference_split,
+        source_splits=candle_source_splits,
+        start_date=training_start,
+        end_date=training_end,
+    )
+
+    validation_split = build_candle_period_view(
+        reference_split=reference_split,
+        source_splits=candle_source_splits,
+        start_date=validation_start,
+        end_date=validation_end,
+    )
+
+    encoded_sources = [
+        _load_torch_mapping(path)
+        for path in encoded_cache_paths
+    ]
+
+    train_encoded = build_kronos_cache_period_view(
+        encoded_sources,
+        start_date=training_start,
+        end_date=training_end,
+        name="tokenizer training",
+    )
+
+    validation_encoded = build_kronos_cache_period_view(
+        encoded_sources,
+        start_date=validation_start,
+        end_date=validation_end,
+        name="tokenizer validation",
+    )
+
+    # Release the canonical encoded-cache dictionaries as soon as the two
+    # period views have been materialised.
+    del encoded_sources
+
+    decoded_sources = [
+        _load_torch_mapping(path)
+        for path in decoded_cache_paths
+    ]
+
+    validation_decoded = build_kronos_cache_period_view(
+        decoded_sources,
+        start_date=validation_start,
+        end_date=validation_end,
+        name="tokenizer validation reconstruction",
+    )
+
+    del decoded_sources
+
+    _validate_period_alignment(
+        split=train_split,
+        encoded=train_encoded,
+        decoded=None,
+        name="Tokenizer training",
+    )
+
+    _validate_period_alignment(
+        split=validation_split,
+        encoded=validation_encoded,
+        decoded=validation_decoded,
+        name="Tokenizer validation",
+    )
+
+    if list(train_encoded["asset_cols"]) != list(
+        validation_encoded["asset_cols"]
+    ):
+        raise ValueError(
+            "Tokenizer train/validation asset ordering differs."
+        )
+
+    if int(train_encoded["context_length"]) != int(
+        validation_encoded["context_length"]
+    ):
+        raise ValueError(
+            "Tokenizer train/validation context lengths differ."
+        )
+
+    if train_encoded["tokenizer_id"] != validation_encoded["tokenizer_id"]:
+        raise ValueError(
+            "Tokenizer train/validation tokenizer IDs differ."
+        )
+
+    if (
+        train_encoded["tokenizer_revision"]
+        != validation_encoded["tokenizer_revision"]
+    ):
+        raise ValueError(
+            "Tokenizer train/validation tokenizer revisions differ."
+        )
+
+    return TokenizerAnalysisPeriods(
+        train_split=train_split,
+        validation_split=validation_split,
+        train_encoded=train_encoded,
+        validation_encoded=validation_encoded,
+        validation_decoded=validation_decoded,
+    )
+
+
+def _atomic_torch_save(
+    value: object,
+    path: str | Path,
+) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    temporary = resolved.with_name(f".{resolved.name}.tmp")
+
+    if temporary.exists():
+        temporary.unlink()
+
+    torch.save(value, temporary)
+    temporary.replace(resolved)
+    return resolved
+
+
+def _valid_s1_counts(
+    encoded: Mapping[str, Any],
+    *,
+    vocabulary_size: int = 1024,
+) -> torch.Tensor:
+    s1 = torch.as_tensor(encoded["s1"])
+    valid_mask = torch.as_tensor(
+        encoded["valid_mask"],
+        dtype=torch.bool,
+    )
+
+    if s1.ndim != 3:
+        raise ValueError(
+            "encoded['s1'] must have shape [session, bar, asset]."
+        )
+
+    if tuple(valid_mask.shape) != tuple(s1.shape[:2]):
+        raise ValueError(
+            "encoded valid_mask does not align with s1."
+        )
+
+    values = s1[
+        valid_mask.unsqueeze(-1).expand_as(s1)
+    ].to(torch.long)
+
+    if values.numel() == 0:
+        raise ValueError(
+            "The encoded cache contains no valid s1 values."
+        )
+
+    if (
+        int(values.min().item()) < 0
+        or int(values.max().item()) >= vocabulary_size
+    ):
+        raise ValueError(
+            "Valid s1 values lie outside the expected vocabulary."
+        )
+
+    return torch.bincount(
+        values,
+        minlength=vocabulary_size,
+    ).to(torch.long)
+
+
+def _extract_remap_metadata(
+    encoded_variant: Mapping[str, Any],
+) -> dict[str, Any]:
+    metadata = encoded_variant.get("s1_remapping")
+
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            "The cached encoded variant has no s1_remapping metadata."
+        )
+
+    return dict(metadata)
+
+
+def _metadata_retained_ids(
+    metadata: Mapping[str, Any],
+) -> torch.Tensor:
+    for key in (
+        "retained_original_ids",
+        "retained_s1_ids",
+    ):
+        if key in metadata:
+            return torch.as_tensor(
+                metadata[key],
+                dtype=torch.long,
+            )
+
+    raise KeyError(
+        "Remapping metadata has no retained-token ID field."
+    )
+
+
+def _metadata_k(
+    metadata: Mapping[str, Any],
+) -> int:
+    for key in (
+        "k",
+        "requested_k",
+    ):
+        if key in metadata:
+            return int(metadata[key])
+
+    return int(_metadata_retained_ids(metadata).numel())
+
+
+def _metadata_fallback_id(
+    metadata: Mapping[str, Any],
+) -> int:
+    for key in (
+        "fallback_original_id",
+        "leading_history_fallback_s1_id",
+    ):
+        if key in metadata:
+            return int(metadata[key])
+
+    raise KeyError(
+        "Remapping metadata has no fallback-token field."
+    )
+
+
+def _validate_cached_locf_variant(
+    *,
+    encoded_variant: Mapping[str, Any],
+    validation_encoded: Mapping[str, Any],
+    retained_ids: torch.Tensor,
+    fallback_id: int,
+    k: int,
+) -> None:
+    metadata = _extract_remap_metadata(encoded_variant)
+
+    if _metadata_k(metadata) != int(k):
+        raise ValueError(
+            f"Cached k={k} variant reports a different k."
+        )
+
+    cached_retained = _metadata_retained_ids(metadata)
+
+    if not torch.equal(
+        cached_retained,
+        retained_ids.to(torch.long),
+    ):
+        raise ValueError(
+            f"Cached k={k} retained-token set differs from the "
+            "current training-frequency ranking."
+        )
+
+    if _metadata_fallback_id(metadata) != int(fallback_id):
+        raise ValueError(
+            f"Cached k={k} fallback ID differs from the current mapping."
+        )
+
+    if metadata.get("context_boundary_reset") is True:
+        raise ValueError(
+            f"Cached k={k} variant resets LOCF at context boundaries."
+        )
+
+    cached_dates = _normalised_cache_dates(
+        encoded_variant["dates"]
+    )
+    validation_dates = _normalised_cache_dates(
+        validation_encoded["dates"]
+    )
+
+    if not cached_dates.equals(validation_dates):
+        raise ValueError(
+            f"Cached k={k} variant has different validation dates after "
+            "normalisation. "
+            f"Cached={len(cached_dates)} sessions "
+            f"({cached_dates[0].date()} to {cached_dates[-1].date()}), "
+            f"current={len(validation_dates)} sessions "
+            f"({validation_dates[0].date()} to "
+            f"{validation_dates[-1].date()})."
+        )
+
+    for key in (
+        "asset_cols",
+        "context_length",
+        "num_bars",
+        "tokenizer_id",
+        "tokenizer_revision",
+    ):
+        if not _compare_cache_static_value(
+            encoded_variant[key],
+            validation_encoded[key],
+        ):
+            raise ValueError(
+                f"Cached k={k} variant differs from validation for {key!r}."
+            )
+
+    for key in (
+        "context_s2",
+        "s2",
+        "valid_mask",
+        "origin_indices",
+    ):
+        if not torch.equal(
+            torch.as_tensor(encoded_variant[key]),
+            torch.as_tensor(validation_encoded[key]),
+        ):
+            raise ValueError(
+                f"Cached k={k} variant unexpectedly changed {key!r}."
+            )
+
+    retained_lookup = torch.zeros(
+        1024,
+        dtype=torch.bool,
+    )
+    retained_lookup[retained_ids.to(torch.long)] = True
+
+    context_s1 = torch.as_tensor(
+        encoded_variant["context_s1"]
+    ).to(torch.long)
+
+    if not retained_lookup[context_s1].all():
+        raise ValueError(
+            f"Cached k={k} context contains a discarded s1 token."
+        )
+
+    final_s1 = torch.as_tensor(
+        encoded_variant["s1"]
+    ).to(torch.long)
+    valid_mask = torch.as_tensor(
+        encoded_variant["valid_mask"],
+        dtype=torch.bool,
+    )
+    valid_values = final_s1[
+        valid_mask.unsqueeze(-1).expand_as(final_s1)
+    ]
+
+    if not retained_lookup[valid_values].all():
+        raise ValueError(
+            f"Cached k={k} final stream contains a discarded s1 token."
+        )
+
+
+def _validate_cached_decoded_variant(
+    *,
+    decoded_variant: Mapping[str, Any],
+    encoded_variant: Mapping[str, Any],
+    k: int,
+) -> None:
+    decoded_dates = _normalised_cache_dates(
+        decoded_variant["dates"]
+    )
+    encoded_dates = _normalised_cache_dates(
+        encoded_variant["dates"]
+    )
+
+    if not decoded_dates.equals(encoded_dates):
+        raise ValueError(
+            f"Cached decoded k={k} variant has different dates from its "
+            "encoded variant after normalisation."
+        )
+
+    for key in (
+        "asset_cols",
+        "context_length",
+        "num_bars",
+        "tokenizer_id",
+        "tokenizer_revision",
+    ):
+        if not _compare_cache_static_value(
+            decoded_variant[key],
+            encoded_variant[key],
+        ):
+            raise ValueError(
+                f"Cached decoded k={k} variant differs for {key!r}."
+            )
+
+    if not torch.equal(
+        torch.as_tensor(decoded_variant["valid_mask"], dtype=torch.bool),
+        torch.as_tensor(encoded_variant["valid_mask"], dtype=torch.bool),
+    ):
+        raise ValueError(
+            f"Cached decoded k={k} valid mask differs from encoded variant."
+        )
+
+    for key in (
+        "decoded_coarse",
+        "decoded_full",
+    ):
+        values = torch.as_tensor(
+            decoded_variant[key],
+            dtype=torch.float32,
+        )
+        valid_mask = torch.as_tensor(
+            decoded_variant["valid_mask"],
+            dtype=torch.bool,
+        )
+
+        if not torch.isfinite(values[valid_mask]).all():
+            raise ValueError(
+                f"Cached decoded k={k} field {key!r} contains "
+                "non-finite valid values."
+            )
+
+
+def _load_tokenizer_for_missing_variants(
+    *,
+    tokenizer: Any | None,
+    tokenizer_config: Mapping[str, Any] | None,
+    series_batch_size: int,
+) -> Any:
+    if tokenizer is not None:
+        return tokenizer
+
+    if tokenizer_config is None:
+        raise RuntimeError(
+            "At least one remapped variant is missing. Pass tokenizer_config "
+            "or a loaded tokenizer so it can be decoded."
+        )
+
+    return (
+        KronosTokenizerAdapter.from_config(
+            tokenizer_config,
+            series_batch_size=series_batch_size,
+        )
+        .load()
+    )
+
+
+def compute_s1_topk_locf_reconstruction_sweep(
+    *,
+    training_encoded: Mapping[str, Any],
+    validation_encoded: Mapping[str, Any],
+    validation_split: Mapping[str, Any],
+    validation_decoded: Mapping[str, Any],
+    baseline_reconstruction_metrics: pd.DataFrame,
+    k_values: Sequence[int],
+    output_dir: str | Path,
+    tokenizer: Any | None = None,
+    tokenizer_config: Mapping[str, Any] | None = None,
+    window_batch_size: int = 8,
+    series_batch_size: int = 93,
+    reuse_existing: bool = True,
+    show_progress: bool = True,
+) -> pd.DataFrame:
+    """Evaluate top-k training-frequency retention with continuous causal LOCF.
+
+    Existing encoded and decoded variants are loaded from ``output_dir``.
+    Missing variants are generated from the canonical in-memory train and
+    validation views, decoded through the frozen Kronos decoder, and saved.
+
+    ``k=1024`` reuses the already-computed ``Coarse (s1)`` baseline row and
+    never writes or decodes another file.
+    """
+    requested_k = tuple(int(value) for value in k_values)
+
+    if not requested_k:
+        raise ValueError("k_values must not be empty.")
+
+    if len(set(requested_k)) != len(requested_k):
+        raise ValueError("k_values must not contain duplicates.")
+
+    if any(value < 1 or value > 1024 for value in requested_k):
+        raise ValueError("Every k must lie in [1, 1024].")
+
+    if window_batch_size <= 0 or series_batch_size <= 0:
+        raise ValueError(
+            "window_batch_size and series_batch_size must be positive."
+        )
+
+    if "Coarse (s1)" not in baseline_reconstruction_metrics.index:
+        raise KeyError(
+            "baseline_reconstruction_metrics has no 'Coarse (s1)' row."
+        )
+
+    output_path = Path(output_dir).expanduser().resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    training_counts = _valid_s1_counts(training_encoded)
+    validation_counts = _valid_s1_counts(validation_encoded)
+    validation_context_s1 = torch.as_tensor(
+        validation_encoded["context_s1"]
+    ).to(torch.long)
+
+    rows: list[dict[str, Any]] = []
+    manifest_rows: list[dict[str, Any]] = []
+    active_tokenizer = tokenizer
+
+    for k in requested_k:
+        start_time = perf_counter()
+
+        if k == 1024:
+            coarse_metrics = (
+                baseline_reconstruction_metrics
+                .loc["Coarse (s1)"]
+                .to_dict()
+            )
+
+            rows.append(
+                {
+                    "Retained s1 Tokens (k)": 1024,
+                    "Codebook Retained (%)": 100.0,
+                    "Train Token Coverage (%)": 100.0,
+                    "Validation Token Coverage (%)": 100.0,
+                    "Validation Context Kept (%)": 100.0,
+                    **coarse_metrics,
+                    "Elapsed (minutes)": 0.0,
+                    "Cache Status": (
+                        "existing full-vocabulary baseline"
+                    ),
+                }
+            )
+
+            manifest_rows.append(
+                {
+                    "k": 1024,
+                    "encoded_path": None,
+                    "decoded_path": None,
+                    "status": "baseline",
+                }
+            )
+            continue
+
+        resource = fit_top_k_s1_remapping_resource(
+            training_encoded,
+            k=k,
+        )
+        retained_ids = (
+            resource.retained_original_ids
+            .detach()
+            .cpu()
+            .to(torch.long)
+        )
+        fallback_id = int(
+            resource.fallback_original_id
+        )
+
+        validation_coverage = float(
+            validation_counts[retained_ids]
+            .sum()
+            .to(torch.float32)
+            .div(
+                validation_counts.sum().to(torch.float32)
+            )
+            .mul(100.0)
+            .item()
+        )
+
+        retained_lookup = torch.zeros(
+            1024,
+            dtype=torch.bool,
+        )
+        retained_lookup[retained_ids] = True
+
+        validation_context_kept = float(
+            retained_lookup[validation_context_s1]
+            .to(torch.float32)
+            .mean()
+            .mul(100.0)
+            .item()
+        )
+
+        encoded_path = output_path / (
+            f"encoded_val_s1_top{k}_global_history_locf.pt"
+        )
+        decoded_path = output_path / (
+            f"decoded_val_s1_top{k}_global_history_locf.pt"
+        )
+
+        encoded_loaded = (
+            reuse_existing
+            and encoded_path.is_file()
+        )
+        decoded_loaded = (
+            reuse_existing
+            and decoded_path.is_file()
+        )
+
+        if encoded_loaded:
+            encoded_variant = _load_torch_mapping(
+                encoded_path
+            )
+            _validate_cached_locf_variant(
+                encoded_variant=encoded_variant,
+                validation_encoded=validation_encoded,
+                retained_ids=retained_ids,
+                fallback_id=fallback_id,
+                k=k,
+            )
+        else:
+            (
+                remapped_training,
+                encoded_variant,
+                fallback_assets,
+            ) = build_train_validation_remapped_rolling_caches(
+                training_encoded,
+                validation_encoded,
+                resource,
+            )
+
+            # The reconstruction sweep needs only the validation variant.
+            del remapped_training
+
+            if fallback_assets:
+                raise RuntimeError(
+                    f"k={k} requires emergency fallback for assets "
+                    f"{fallback_assets}. Inspect before continuing."
+                )
+
+            _atomic_torch_save(
+                encoded_variant,
+                encoded_path,
+            )
+
+        if decoded_loaded:
+            decoded_variant = _load_torch_mapping(
+                decoded_path
+            )
+            _validate_cached_decoded_variant(
+                decoded_variant=decoded_variant,
+                encoded_variant=encoded_variant,
+                k=k,
+            )
+        else:
+            active_tokenizer = _load_tokenizer_for_missing_variants(
+                tokenizer=active_tokenizer,
+                tokenizer_config=tokenizer_config,
+                series_batch_size=series_batch_size,
+            )
+
+            decoded_variant = decode_causal_split(
+                active_tokenizer,
+                encoded_variant,
+                window_batch_size=window_batch_size,
+                series_batch_size=series_batch_size,
+                show_progress=show_progress,
+            )
+            decoded_variant["s1_remapping"] = dict(
+                encoded_variant["s1_remapping"]
+            )
+
+            _atomic_torch_save(
+                decoded_variant,
+                decoded_path,
+            )
+
+        metrics = compute_reconstruction_metrics(
+            validation_split,
+            encoded_variant,
+            decoded_variant,
+            include_rolling_mean_baseline=False,
+        )
+
+        coarse_metrics = (
+            metrics
+            .loc["Coarse (s1)"]
+            .to_dict()
+        )
+
+        if encoded_loaded and decoded_loaded:
+            status = "loaded existing encoded and decoded variants"
+        elif encoded_loaded:
+            status = "loaded encoded; created decoded variant"
+        elif decoded_loaded:
+            # This is unlikely because decoded output normally accompanies
+            # its encoded source, but the status remains explicit.
+            status = "created encoded; loaded decoded variant"
+        else:
+            status = "created encoded and decoded variants"
+
+        elapsed_minutes = (
+            perf_counter()
+            - start_time
+        ) / 60.0
+
+        rows.append(
+            {
+                "Retained s1 Tokens (k)": int(k),
+                "Codebook Retained (%)": (
+                    100.0
+                    * float(k)
+                    / 1024.0
+                ),
+                "Train Token Coverage (%)": float(
+                    resource.training_coverage_percent
+                ),
+                "Validation Token Coverage (%)": (
+                    validation_coverage
+                ),
+                "Validation Context Kept (%)": (
+                    validation_context_kept
+                ),
+                **coarse_metrics,
+                "Elapsed (minutes)": elapsed_minutes,
+                "Cache Status": status,
+            }
+        )
+
+        manifest_rows.append(
+            {
+                "k": int(k),
+                "encoded_path": str(encoded_path),
+                "decoded_path": str(decoded_path),
+                "status": status,
+                "resource_hash": resource.resource_hash,
+                "fallback_original_id": fallback_id,
+            }
+        )
+
+        print(
+            f"k={k}: {status}; "
+            f"validation coverage={validation_coverage:.2f}%; "
+            f"context kept={validation_context_kept:.2f}%; "
+            f"elapsed={elapsed_minutes:.2f} min"
+        )
+
+    result = (
+        pd.DataFrame(rows)
+        .set_index("Retained s1 Tokens (k)")
+    )
+    result.index.name = "Retained s1 Tokens (k)"
+    result.attrs["cache_manifest"] = manifest_rows
+    result.attrs["output_dir"] = str(output_path)
+    result.attrs["remapping"] = (
+        "top-k training frequency plus continuous causal LOCF"
+    )
+    return result
+
+
+def style_s1_topk_locf_reconstruction_table(
+    table: pd.DataFrame,
+    *,
+    caption: str = (
+        "Coarse-token reconstruction after training top-k retention "
+        "and continuous causal LOCF"
+    ),
+) -> pd.io.formats.style.Styler:
+    """Format the compact reconstruction-sweep table for a notebook."""
+    metric_columns = [
+        "Codebook Retained (%)",
+        "Train Token Coverage (%)",
+        "Validation Token Coverage (%)",
+        "Validation Context Kept (%)",
+        "Close Median Error (bps)",
+        "Close P95 Error (bps)",
+        "Return MAE (bps)",
+        "Return Correlation",
+        "Return Volatility Ratio",
+        "Log-Volume MAE",
+        "Invalid Candles (%)",
+    ]
+
+    missing = [
+        column
+        for column in metric_columns
+        if column not in table.columns
+    ]
+
+    if missing:
+        raise KeyError(
+            f"Reconstruction table is missing columns: {missing}."
+        )
+
+    return (
+        table[metric_columns]
+        .style
+        .format(
+            {
+                "Codebook Retained (%)": "{:.2f}",
+                "Train Token Coverage (%)": "{:.2f}",
+                "Validation Token Coverage (%)": "{:.2f}",
+                "Validation Context Kept (%)": "{:.2f}",
+                "Close Median Error (bps)": "{:.6f}",
+                "Close P95 Error (bps)": "{:.6f}",
+                "Return MAE (bps)": "{:.6f}",
+                "Return Correlation": "{:.6f}",
+                "Return Volatility Ratio": "{:.6f}",
+                "Log-Volume MAE": "{:.6f}",
+                "Invalid Candles (%)": "{:.6f}",
+            }
+        )
+        .set_caption(caption)
+    )
+

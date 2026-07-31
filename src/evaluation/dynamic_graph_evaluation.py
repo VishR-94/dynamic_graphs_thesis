@@ -3204,3 +3204,1096 @@ __all__ = [
     "plot_graph_gate_sweep",
 ]
 
+def analyse_token_predictive_distribution(
+    run_dir: str | Path,
+    *,
+    asset: str | int | None = None,
+    horizon: int | None = None,
+    source: MetricsSource = "best",
+    validation_cache_path: str | Path | None = None,
+    training_cache_path: str | Path | None = None,
+    window_indices: Sequence[int] | None = None,
+    max_windows: int | None = None,
+    batch_size: int = 2,
+    device: str | torch.device | None = None,
+    use_amp: bool | None = None,
+    plot_top_n: int = 40,
+    figsize: tuple[float, float] = (14.0, 5.0),
+) -> dict[str, Any]:
+    """Analyse free-running coarse-token probabilities and hard predictions.
+
+    ``asset=None`` pools all assets; otherwise pass a ticker or zero-based
+    asset index. ``horizon=None`` pools all future minutes; otherwise pass a
+    one-based future minute in ``[1, prediction_length]``.
+
+    Probabilities are the raw temperature-1 softmax of generated ``s1``
+    logits. Hard-token frequencies use argmax generation. Training-target
+    frequencies use ``target_s1`` over the same asset/horizon scope.
+    """
+
+    if source not in {"best", "last"}:
+        raise ValueError("source must be 'best' or 'last'.")
+
+    if batch_size <= 0 or plot_top_n <= 0:
+        raise ValueError(
+            "batch_size and plot_top_n must be positive."
+        )
+
+    info = load_run_info(
+        run_dir
+    )
+
+    if asset is None:
+        asset_index = None
+        asset_label = "All assets"
+
+    elif (
+        isinstance(
+            asset,
+            int,
+        )
+        and not isinstance(
+            asset,
+            bool,
+        )
+    ):
+        asset_index = int(
+            asset
+        )
+
+        if not 0 <= asset_index < info.num_nodes:
+            raise IndexError(
+                f"Asset index {asset_index} is out of range."
+            )
+
+        asset_label = info.asset_cols[
+            asset_index
+        ]
+
+    elif isinstance(
+        asset,
+        str,
+    ):
+        if asset not in info.asset_cols:
+            raise KeyError(
+                f"Unknown asset {asset!r}."
+            )
+
+        asset_index = info.asset_cols.index(
+            asset
+        )
+        asset_label = asset
+
+    else:
+        raise TypeError(
+            "asset must be None, a ticker, "
+            "or an integer index."
+        )
+
+    validation_dataset = (
+        _load_validation_dataset_for_run(
+            info,
+            validation_cache_path=(
+                validation_cache_path
+            ),
+        )
+    )
+
+    selected_indices = (
+        _select_diagnostic_window_indices(
+            validation_dataset,
+            window_indices=window_indices,
+            max_windows=max_windows,
+        )
+    )
+
+    validation_loader = (
+        _build_diagnostic_loader(
+            validation_dataset,
+            selected_indices,
+            batch_size=batch_size,
+        )
+    )
+
+    model, _, _ = _load_saved_model(
+        info,
+        source=source,
+    )
+
+    prediction_length = int(
+        model.config.prediction_length
+    )
+
+    vocabulary_size = int(
+        model.config.heads.s1_vocabulary_size
+    )
+
+    if horizon is None:
+        horizon_index = None
+        horizon_label: int | str = (
+            f"All {prediction_length} future minutes"
+        )
+
+    else:
+        horizon = int(
+            horizon
+        )
+
+        if not 1 <= horizon <= prediction_length:
+            raise ValueError(
+                "horizon must lie in "
+                f"[1, {prediction_length}]."
+            )
+
+        horizon_index = horizon - 1
+        horizon_label = horizon
+
+    training_candidates: list[
+        Path
+    ] = []
+
+    if training_cache_path is not None:
+        training_candidates.append(
+            Path(
+                training_cache_path
+            ).expanduser()
+        )
+
+    recorded_train = (
+        info.run_metadata.get(
+            "train_cache_path"
+        )
+    )
+
+    if recorded_train:
+        recorded_path = Path(
+            str(
+                recorded_train
+            )
+        ).expanduser()
+
+        training_candidates.extend(
+            [
+                recorded_path,
+                (
+                    info.run_dir.parent.parent
+                    / "tokens"
+                    / recorded_path.name
+                ),
+            ]
+        )
+
+    training_candidates.append(
+        (
+            info.run_dir.parent.parent
+            / "tokens"
+            / "origin_aligned_train_tokens.pt"
+        )
+    )
+
+    resolved_training_path = next(
+        (
+            candidate.resolve()
+            for candidate in training_candidates
+            if candidate.resolve().is_file()
+        ),
+        None,
+    )
+
+    if resolved_training_path is None:
+        raise FileNotFoundError(
+            "Could not locate the training token cache. "
+            "Pass training_cache_path explicitly."
+        )
+
+    training_dataset = (
+        CachedTokenGraphDataset.from_path(
+            resolved_training_path,
+            data_mode=str(
+                info.run_metadata.get(
+                    "data_mode",
+                    "auto",
+                )
+            ),
+        )
+    )
+
+    if (
+        training_dataset.asset_cols
+        != info.asset_cols
+    ):
+        raise ValueError(
+            "Training-cache asset order differs "
+            "from the run."
+        )
+
+    if (
+        training_dataset.prediction_length
+        != prediction_length
+    ):
+        raise ValueError(
+            "Training-cache prediction length "
+            "differs from the run."
+        )
+
+    # Match the training-token frequency scope to the
+    # selected validation prediction scope.
+    training_targets = (
+        training_dataset.target_s1
+    )
+
+    if horizon_index is not None:
+        training_targets = training_targets[
+            :,
+            horizon_index : horizon_index + 1,
+        ]
+
+    if asset_index is not None:
+        training_targets = training_targets[
+            :,
+            :,
+            asset_index : asset_index + 1,
+        ]
+
+    flat_training_targets = (
+        training_targets
+        .reshape(-1)
+        .to(torch.long)
+    )
+
+    if (
+        int(
+            flat_training_targets.min()
+        ) < 0
+        or int(
+            flat_training_targets.max()
+        ) >= vocabulary_size
+    ):
+        raise ValueError(
+            "Training targets are incompatible with "
+            "the saved s1 vocabulary."
+        )
+
+    training_counts = torch.bincount(
+        flat_training_targets,
+        minlength=vocabulary_size,
+    ).to(torch.float64)
+
+    training_total = int(
+        flat_training_targets.numel()
+    )
+
+    training_frequency = (
+        training_counts
+        / training_total
+    )
+
+    resolved_device = (
+        _resolve_diagnostic_device(
+            device
+        )
+    )
+
+    active_amp = (
+        bool(
+            info.run_metadata.get(
+                "active_cuda_amp",
+                False,
+            )
+        )
+        if use_amp is None
+        else bool(
+            use_amp
+        )
+    ) and resolved_device.type == "cuda"
+
+    model = (
+        model
+        .to(resolved_device)
+        .eval()
+    )
+
+    probability_sum = torch.zeros(
+        vocabulary_size,
+        dtype=torch.float64,
+    )
+
+    hard_counts = torch.zeros(
+        vocabulary_size,
+        dtype=torch.float64,
+    )
+
+    entropy_sum = 0.0
+    maximum_probability_sum = 0.0
+    validation_total = 0
+
+    with torch.inference_mode():
+        for batch in validation_loader:
+            context_tokens = batch[
+                "context_tokens"
+            ].to(
+                resolved_device
+            )
+
+            oracle_graph = None
+
+            if (
+                model.config.graph.type
+                == "oracle"
+            ):
+                oracle_graph = batch[
+                    "true_graph"
+                ].to(
+                    resolved_device
+                )
+
+            with _diagnostic_autocast(
+                resolved_device,
+                active_amp,
+            ):
+                generated = model.generate(
+                    context_tokens,
+                    oracle_graph=oracle_graph,
+                    token_selection="argmax",
+                )
+
+            logits = (
+                generated
+                .forecast
+                .s1_logits
+            )
+
+            hard_ids = (
+                generated
+                .token_ids[
+                    ...,
+                    0,
+                ]
+            )
+
+            if horizon_index is not None:
+                logits = logits[
+                    :,
+                    horizon_index : horizon_index + 1,
+                ]
+
+                hard_ids = hard_ids[
+                    :,
+                    horizon_index : horizon_index + 1,
+                ]
+
+            if asset_index is not None:
+                logits = logits[
+                    :,
+                    :,
+                    asset_index : asset_index + 1,
+                ]
+
+                hard_ids = hard_ids[
+                    :,
+                    :,
+                    asset_index : asset_index + 1,
+                ]
+
+            flat_logits = (
+                logits
+                .reshape(
+                    -1,
+                    vocabulary_size,
+                )
+                .float()
+            )
+
+            flat_hard_ids = (
+                hard_ids
+                .reshape(-1)
+                .to(torch.long)
+            )
+
+            probabilities = F.softmax(
+                flat_logits,
+                dim=-1,
+            )
+
+            log_probabilities = F.log_softmax(
+                flat_logits,
+                dim=-1,
+            )
+
+            probability_sum += (
+                probabilities
+                .sum(0)
+                .cpu()
+                .to(torch.float64)
+            )
+
+            hard_counts += (
+                torch.bincount(
+                    flat_hard_ids,
+                    minlength=vocabulary_size,
+                )
+                .cpu()
+                .to(torch.float64)
+            )
+
+            entropy_sum += float(
+                (
+                    -(
+                        probabilities
+                        * log_probabilities
+                    )
+                    .sum(-1)
+                )
+                .sum()
+                .cpu()
+            )
+
+            maximum_probability_sum += float(
+                probabilities
+                .max(-1)
+                .values
+                .sum()
+                .cpu()
+            )
+
+            validation_total += int(
+                flat_logits.shape[0]
+            )
+
+    mean_probability = (
+        probability_sum
+        / validation_total
+    )
+
+    hard_frequency = (
+        hard_counts
+        / validation_total
+    )
+
+    def distribution_entropy(
+        values: Tensor,
+    ) -> float:
+        positive = values > 0
+        values = values[
+            positive
+        ]
+
+        return float(
+            -(
+                values
+                * values.log()
+            )
+            .sum()
+            .item()
+        )
+
+    mean_position_entropy = (
+        entropy_sum
+        / validation_total
+    )
+
+    mean_distribution_entropy = (
+        distribution_entropy(
+            mean_probability
+        )
+    )
+
+    hard_entropy = (
+        distribution_entropy(
+            hard_frequency
+        )
+    )
+
+    predicted_mask = (
+        hard_counts > 0
+    )
+
+    summary = pd.DataFrame(
+        [
+            {
+                "Checkpoint": source,
+                "Asset": asset_label,
+                "Horizon": horizon_label,
+                "Validation windows": (
+                    len(
+                        selected_indices
+                    )
+                ),
+                "Validation predictions": (
+                    validation_total
+                ),
+                "Training targets": (
+                    training_total
+                ),
+                "Mean per-position entropy (nats)": (
+                    mean_position_entropy
+                ),
+                "Mean per-position perplexity": (
+                    np.exp(
+                        mean_position_entropy
+                    )
+                ),
+                "Entropy of mean distribution (nats)": (
+                    mean_distribution_entropy
+                ),
+                "Perplexity of mean distribution": (
+                    np.exp(
+                        mean_distribution_entropy
+                    )
+                ),
+                "Hard-prediction entropy (nats)": (
+                    hard_entropy
+                ),
+                "Hard-prediction effective vocabulary": (
+                    np.exp(
+                        hard_entropy
+                    )
+                ),
+                "Distinct hard-predicted tokens": (
+                    int(
+                        predicted_mask.sum()
+                    )
+                ),
+                "Largest hard-prediction share (%)": (
+                    float(
+                        hard_frequency.max()
+                        * 100.0
+                    )
+                ),
+                "Mean maximum token probability (%)": (
+                    100.0
+                    * maximum_probability_sum
+                    / validation_total
+                ),
+            }
+        ]
+    )
+
+    # Only include tokens that won the hard argmax
+    # at least once.
+    predicted_ids = torch.nonzero(
+        predicted_mask
+    ).flatten()
+
+    token_table = pd.DataFrame(
+        {
+            "Token ID": (
+                predicted_ids.numpy()
+            ),
+            "Predicted Count": (
+                hard_counts[
+                    predicted_ids
+                ]
+                .to(torch.int64)
+                .numpy()
+            ),
+            "Predicted Frequency (%)": (
+                hard_frequency[
+                    predicted_ids
+                ]
+                .numpy()
+                * 100.0
+            ),
+            "Mean Predictive Probability (%)": (
+                mean_probability[
+                    predicted_ids
+                ]
+                .numpy()
+                * 100.0
+            ),
+            "Training Target Count": (
+                training_counts[
+                    predicted_ids
+                ]
+                .to(torch.int64)
+                .numpy()
+            ),
+            "Training Target Frequency (%)": (
+                training_frequency[
+                    predicted_ids
+                ]
+                .numpy()
+                * 100.0
+            ),
+        }
+    ).sort_values(
+        [
+            "Predicted Frequency (%)",
+            "Token ID",
+        ],
+        ascending=[
+            False,
+            True,
+        ],
+        ignore_index=True,
+    )
+
+    ranked_ids = torch.argsort(
+        mean_probability,
+        descending=True,
+    )
+
+    shown = min(
+        plot_top_n,
+        vocabulary_size,
+    )
+
+    shown_ids = (
+        ranked_ids[
+            :shown
+        ]
+        .numpy()
+    )
+
+    x = np.arange(
+        shown
+    )
+
+    width = 0.27
+
+    fig, ax = plt.subplots(
+        figsize=figsize
+    )
+
+    ax.bar(
+        x - width,
+        (
+            mean_probability[
+                shown_ids
+            ]
+            .numpy()
+            * 100.0
+        ),
+        width,
+        label="Mean model probability",
+    )
+
+    ax.bar(
+        x,
+        (
+            hard_frequency[
+                shown_ids
+            ]
+            .numpy()
+            * 100.0
+        ),
+        width,
+        label="Hard prediction frequency",
+    )
+
+    ax.bar(
+        x + width,
+        (
+            training_frequency[
+                shown_ids
+            ]
+            .numpy()
+            * 100.0
+        ),
+        width,
+        label="Training target frequency",
+    )
+
+    ax.set_xticks(
+        x
+    )
+
+    ax.set_xticklabels(
+        shown_ids,
+        rotation=90,
+    )
+
+    ax.set_xlabel(
+        "Coarse token ID"
+    )
+
+    ax.set_ylabel(
+        "Percentage"
+    )
+
+    ax.set_title(
+        "Coarse-token predictive distribution\n"
+        f"asset={asset_label}; "
+        f"horizon={horizon_label}; "
+        f"checkpoint={source}"
+    )
+
+    ax.legend()
+
+    fig.tight_layout()
+    plt.close(fig)
+
+    token_index = pd.Index(
+        np.arange(
+            vocabulary_size
+        ),
+        name="Token ID",
+    )
+
+    return {
+        "summary": summary,
+        "token_table": token_table,
+        "mean_predictive_distribution": (
+            pd.Series(
+                mean_probability.numpy(),
+                index=token_index,
+                name=(
+                    "Mean predictive probability"
+                ),
+            )
+        ),
+        "hard_prediction_distribution": (
+            pd.Series(
+                hard_frequency.numpy(),
+                index=token_index,
+                name=(
+                    "Hard prediction frequency"
+                ),
+            )
+        ),
+        "training_target_distribution": (
+            pd.Series(
+                training_frequency.numpy(),
+                index=token_index,
+                name=(
+                    "Training target frequency"
+                ),
+            )
+        ),
+        "validation_window_indices": (
+            selected_indices
+        ),
+        "figure": fig,
+        "axes": ax,
+    }
+
+def analyse_s1_topk_accuracy_by_horizon(
+    run_dir: str | Path,
+    *,
+    asset: str | int | None = None,
+    source: MetricsSource = "best",
+    validation_cache_path: str | Path | None = None,
+    training_cache_path: str | Path | None = None,
+    window_indices: Sequence[int] | None = None,
+    max_windows: int | None = None,
+    batch_size: int = 2,
+    device: str | torch.device | None = None,
+    use_amp: bool | None = None,
+    top_k_values: Sequence[int] = (1, 2, 5, 10),
+    horizons: Sequence[int] | None = None,
+) -> pd.DataFrame:
+    """Return free-running s1 Top-k accuracy and excess over a marginal baseline.
+
+    The marginal baseline is fitted from training targets only. At each future
+    horizon, under the same asset filter, it always proposes the k most frequent
+    training tokens. The visible subcolumns are model accuracy and model accuracy
+    minus marginal-baseline accuracy, in percentage points.
+    """
+
+    if source not in {"best", "last"}:
+        raise ValueError("source must be 'best' or 'last'.")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+
+    info = load_run_info(run_dir)
+
+    if asset is None:
+        asset_index, asset_label = None, "All assets"
+    elif isinstance(asset, int) and not isinstance(asset, bool):
+        asset_index = int(asset)
+        if not 0 <= asset_index < info.num_nodes:
+            raise IndexError(f"Asset index {asset_index} is out of range.")
+        asset_label = info.asset_cols[asset_index]
+    elif isinstance(asset, str):
+        if asset not in info.asset_cols:
+            raise KeyError(f"Unknown asset {asset!r}.")
+        asset_index, asset_label = info.asset_cols.index(asset), asset
+    else:
+        raise TypeError(
+            "asset must be None, a ticker, or a zero-based integer index."
+        )
+
+    validation_dataset = _load_validation_dataset_for_run(
+        info,
+        validation_cache_path=validation_cache_path,
+    )
+    selected_indices = _select_diagnostic_window_indices(
+        validation_dataset,
+        window_indices=window_indices,
+        max_windows=max_windows,
+    )
+    validation_loader = _build_diagnostic_loader(
+        validation_dataset,
+        selected_indices,
+        batch_size=batch_size,
+    )
+
+    model, _, _ = _load_saved_model(info, source=source)
+    prediction_length = int(model.config.prediction_length)
+    vocabulary_size = int(model.config.heads.s1_vocabulary_size)
+
+    top_ks = tuple(int(value) for value in top_k_values)
+    if not top_ks or len(set(top_ks)) != len(top_ks):
+        raise ValueError("top_k_values must be non-empty and unique.")
+    if any(k < 1 or k > vocabulary_size for k in top_ks):
+        raise ValueError(f"top_k_values must lie in [1, {vocabulary_size}].")
+    maximum_k = max(top_ks)
+
+    selected_horizons = (
+        tuple(range(1, prediction_length + 1))
+        if horizons is None
+        else tuple(int(value) for value in horizons)
+    )
+    if not selected_horizons or len(set(selected_horizons)) != len(
+        selected_horizons
+    ):
+        raise ValueError("horizons must be non-empty and unique.")
+    invalid_horizons = [
+        value
+        for value in selected_horizons
+        if not 1 <= value <= prediction_length
+    ]
+    if invalid_horizons:
+        raise ValueError(
+            f"Horizons outside [1, {prediction_length}]: {invalid_horizons}."
+        )
+    selected_horizon_indices = [horizon - 1 for horizon in selected_horizons]
+
+    # Resolve the training cache; the empirical ranking is fitted only on train.
+    candidates: list[Path] = []
+    if training_cache_path is not None:
+        candidates.append(Path(training_cache_path).expanduser())
+
+    recorded_train = info.run_metadata.get("train_cache_path")
+    if recorded_train:
+        recorded_path = Path(str(recorded_train)).expanduser()
+        candidates.extend(
+            [
+                recorded_path,
+                info.run_dir.parent.parent / "tokens" / recorded_path.name,
+            ]
+        )
+
+    candidates.append(
+        info.run_dir.parent.parent
+        / "tokens"
+        / "origin_aligned_train_tokens.pt"
+    )
+
+    checked: list[str] = []
+    resolved_training_path: Path | None = None
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        checked.append(str(candidate))
+        if candidate.is_file():
+            resolved_training_path = candidate
+            break
+
+    if resolved_training_path is None:
+        raise FileNotFoundError(
+            "Could not locate the training token cache. Checked:\n"
+            + "\n".join(checked)
+        )
+
+    training_dataset = CachedTokenGraphDataset.from_path(
+        resolved_training_path,
+        data_mode=str(info.run_metadata.get("data_mode", "auto")),
+    )
+    if training_dataset.asset_cols != info.asset_cols:
+        raise ValueError("Training-cache asset order differs from the run.")
+    if training_dataset.num_assets != info.num_nodes:
+        raise ValueError("Training-cache asset count differs from the run.")
+    if training_dataset.prediction_length != prediction_length:
+        raise ValueError("Training-cache prediction length differs from the run.")
+
+    training_targets = training_dataset.target_s1.to(torch.long)
+    if asset_index is not None:
+        training_targets = training_targets[
+            :, :, asset_index : asset_index + 1
+        ]
+    if (
+        int(training_targets.min()) < 0
+        or int(training_targets.max()) >= vocabulary_size
+    ):
+        raise ValueError(
+            "Training targets contain IDs outside the model s1 vocabulary."
+        )
+
+    # rank[h, token] is the token's zero-based training-frequency rank at h.
+    # Ties are broken deterministically by ascending token ID.
+    marginal_rank = torch.empty(
+        (prediction_length, vocabulary_size),
+        dtype=torch.long,
+    )
+    marginal_order = torch.empty_like(marginal_rank)
+    token_ids = np.arange(vocabulary_size, dtype=np.int64)
+
+    for horizon_index in range(prediction_length):
+        counts = torch.bincount(
+            training_targets[:, horizon_index, :].reshape(-1),
+            minlength=vocabulary_size,
+        ).cpu().numpy()
+        order = torch.from_numpy(
+            np.lexsort((token_ids, -counts)).copy()
+        ).to(torch.long)
+        marginal_order[horizon_index] = order
+        marginal_rank[horizon_index, order] = torch.arange(vocabulary_size)
+
+    resolved_device = _resolve_diagnostic_device(device)
+    active_amp = (
+        bool(info.run_metadata.get("active_cuda_amp", False))
+        if use_amp is None
+        else bool(use_amp)
+    ) and resolved_device.type == "cuda"
+
+    model = model.to(resolved_device).eval()
+    marginal_rank = marginal_rank.to(resolved_device)
+
+    count_shape = (prediction_length, len(top_ks))
+    model_correct = torch.zeros(count_shape, dtype=torch.float32)
+    marginal_correct = torch.zeros(count_shape, dtype=torch.float32)
+    totals = torch.zeros(prediction_length, dtype=torch.float32)
+
+    with torch.inference_mode():
+        for batch in validation_loader:
+            context_tokens = batch["context_tokens"].to(resolved_device)
+            target_s1 = batch["target_s1"].to(resolved_device)
+            oracle_graph = (
+                batch["true_graph"].to(resolved_device)
+                if model.config.graph.type == "oracle"
+                else None
+            )
+
+            with _diagnostic_autocast(resolved_device, active_amp):
+                generated = model.generate(
+                    context_tokens,
+                    oracle_graph=oracle_graph,
+                    token_selection="argmax",
+                )
+
+            logits = generated.forecast.s1_logits
+            if tuple(logits.shape[:3]) != tuple(target_s1.shape):
+                raise ValueError(
+                    "s1 logits and targets have incompatible shapes: "
+                    f"{tuple(logits.shape)} vs {tuple(target_s1.shape)}."
+                )
+            if int(logits.shape[-1]) != vocabulary_size:
+                raise ValueError("Unexpected s1 vocabulary dimension.")
+
+            if asset_index is not None:
+                logits = logits[:, :, asset_index : asset_index + 1, :]
+                target_s1 = target_s1[
+                    :, :, asset_index : asset_index + 1
+                ]
+
+            model_top_ids = torch.topk(
+                logits.float(),
+                k=maximum_k,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            ).indices
+            model_matches = model_top_ids.eq(target_s1.unsqueeze(-1))
+
+            target_marginal_rank = (
+                marginal_rank
+                .unsqueeze(0)
+                .expand(target_s1.shape[0], -1, -1)
+                .gather(dim=2, index=target_s1.to(torch.long))
+            )
+
+            totals += float(target_s1.shape[0] * target_s1.shape[2])
+
+            for column_index, k in enumerate(top_ks):
+                model_correct[:, column_index] += (
+                    model_matches[..., :k]
+                    .any(dim=-1)
+                    .to(torch.float32)
+                    .sum(dim=(0, 2))
+                    .cpu()
+                )
+                marginal_correct[:, column_index] += (
+                    (target_marginal_rank < k)
+                    .to(torch.float32)
+                    .sum(dim=(0, 2))
+                    .cpu()
+                )
+
+    if (totals <= 0).any():
+        raise RuntimeError("At least one horizon received no validation cases.")
+
+    model_accuracy = model_correct / totals.unsqueeze(-1) * 100.0
+    marginal_accuracy = marginal_correct / totals.unsqueeze(-1) * 100.0
+    excess = model_accuracy - marginal_accuracy
+
+    # Both Top-k curves must be non-decreasing as k increases.
+    sorted_columns = sorted(enumerate(top_ks), key=lambda item: item[1])
+    for (previous_index, previous_k), (current_index, current_k) in zip(
+        sorted_columns,
+        sorted_columns[1:],
+    ):
+        for name, values in (
+            ("model", model_accuracy),
+            ("marginal baseline", marginal_accuracy),
+        ):
+            if (
+                values[:, current_index] + 1.0e-12
+                < values[:, previous_index]
+            ).any():
+                raise AssertionError(
+                    f"{name} Top-k accuracy decreased from "
+                    f"k={previous_k} to k={current_k}."
+                )
+
+    model_selected = model_accuracy[selected_horizon_indices].numpy()
+    marginal_selected = marginal_accuracy[selected_horizon_indices].numpy()
+    excess_selected = excess[selected_horizon_indices].numpy()
+
+    data: dict[tuple[str, str], np.ndarray] = {}
+    for column_index, k in enumerate(top_ks):
+        data[(f"Top-{k}", "Model Accuracy (%)")] = (
+            model_selected[:, column_index]
+        )
+        data[(f"Top-{k}", "Excess vs Marginal (pp)")] = (
+            excess_selected[:, column_index]
+        )
+
+    table = pd.DataFrame(
+        data,
+        index=pd.Index(
+            selected_horizons,
+            name="Future horizon (minutes)",
+        ),
+    )
+    table.columns = pd.MultiIndex.from_tuples(
+        table.columns,
+        names=("Candidate set", "Metric"),
+    )
+
+    # Baseline values stay accessible without adding a third visible subcolumn.
+    table.attrs.update(
+        {
+            "run_directory": str(info.run_dir),
+            "checkpoint": source,
+            "asset": asset_label,
+            "validation_windows": len(selected_indices),
+            "training_cache_path": str(resolved_training_path),
+            "marginal_baseline_accuracy_percent": {
+                int(horizon): {
+                    f"Top-{k}": float(
+                        marginal_selected[row_index, column_index]
+                    )
+                    for column_index, k in enumerate(top_ks)
+                }
+                for row_index, horizon in enumerate(selected_horizons)
+            },
+            "training_top_token_ids_by_horizon": {
+                int(horizon): marginal_order[
+                    horizon - 1, :maximum_k
+                ].tolist()
+                for horizon in selected_horizons
+            },
+        }
+    )
+
+    return table

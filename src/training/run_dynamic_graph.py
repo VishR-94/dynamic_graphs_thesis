@@ -1823,10 +1823,35 @@ def generate_validation_artifacts(
                     "raw training split."
                 )
 
+            # The trainable model may operate in a compact s1 ID space.
+            # The frozen Kronos decoder must always receive original
+            # Kronos IDs in [0, 1023]. s2 remains in the original space.
+            context_tokens_for_decode = (
+                context_tokens
+                .detach()
+                .cpu()
+                .to(torch.long)
+                .clone()
+            )
+            context_tokens_for_decode[..., 0] = (
+                dataset.s1_to_kronos_ids(
+                    context_tokens_for_decode[..., 0]
+                )
+            )
+
+            generated_s1_for_decode = dataset.s1_to_kronos_ids(
+                generated_tokens[..., 0]
+            )
+
             if predict_s2:
+                generated_tokens_for_decode = generated_tokens.clone()
+                generated_tokens_for_decode[..., 0] = (
+                    generated_s1_for_decode
+                )
+
                 decoded_future = tokenizer.decode_token_path(
-                    context_tokens.detach().cpu(),
-                    generated_tokens,
+                    context_tokens_for_decode,
+                    generated_tokens_for_decode,
                     mean=torch.as_tensor(batch["context_mean"]),
                     std=torch.as_tensor(batch["context_std"]),
                     series_batch_size=decode_series_batch_size,
@@ -1834,8 +1859,8 @@ def generate_validation_artifacts(
                 )
             else:
                 decoded_future = tokenizer.decode_coarse_token_path(
-                    context_tokens.detach().cpu(),
-                    generated_tokens[..., 0],
+                    context_tokens_for_decode,
+                    generated_s1_for_decode,
                     mean=torch.as_tensor(batch["context_mean"]),
                     std=torch.as_tensor(batch["context_std"]),
                     series_batch_size=decode_series_batch_size,
@@ -2363,6 +2388,10 @@ def _validate_cache_against_model(
             model.config.prediction_length,
         ),
         "num_assets": (dataset.num_assets, model.config.num_nodes),
+        "s1_vocabulary_size": (
+            dataset.s1_vocabulary_size,
+            model.config.heads.s1_vocabulary_size,
+        ),
     }
 
     for name, (observed, expected) in checks.items():
@@ -2909,6 +2938,22 @@ def main() -> None:
         "train_windows": len(train_dataset),
         "validation_windows": len(validation_dataset),
         "asset_cols": list(train_dataset_full.asset_cols),
+        "s1_token_space": {
+            "id_space": train_dataset_full.s1_id_space,
+            "vocabulary_size": train_dataset_full.s1_vocabulary_size,
+            "remapping_method": train_dataset_full.cache.get(
+                "s1_remapping_method"
+            ),
+            "resource_hash": (
+                train_dataset_full.s1_remapping_resource_hash
+            ),
+            "training_coverage_percent": train_dataset_full.cache.get(
+                "s1_training_coverage_percent"
+            ),
+            "fallback_original_id": train_dataset_full.cache.get(
+                "s1_fallback_original_id"
+            ),
+        },
         "project_git_commit": project_commit,
         "project_git_status": git_status,
         "torch_version": torch.__version__,
@@ -2971,6 +3016,11 @@ def main() -> None:
             None
             if fixed_graph_resource is None
             else fixed_graph_resource.resource_hash
+        ),
+        "s1_id_space": train_dataset_full.s1_id_space,
+        "s1_vocabulary_size": train_dataset_full.s1_vocabulary_size,
+        "s1_remapping_resource_hash": (
+            train_dataset_full.s1_remapping_resource_hash
         ),
     }
     run_signature = _config_signature(signature_values)

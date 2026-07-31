@@ -967,6 +967,83 @@ class CachedTokenGraphDataset(
         )
 
     @property
+    def s1_id_space(
+        self,
+    ) -> str:
+        return str(
+            self.cache.get(
+                "s1_id_space",
+                "kronos_original",
+            )
+        )
+
+    @property
+    def s1_vocabulary_size(
+        self,
+    ) -> int:
+        return int(
+            self.cache.get(
+                "s1_vocabulary_size",
+                TOKEN_VOCABULARY_SIZE,
+            )
+        )
+
+    @property
+    def s1_remapping_resource_hash(
+        self,
+    ) -> str | None:
+        value = self.cache.get(
+            "s1_remapping_resource_hash"
+        )
+        return None if value is None else str(value)
+
+    @property
+    def s1_compact_to_original(
+        self,
+    ) -> Tensor | None:
+        if self.s1_id_space == "kronos_original":
+            return None
+
+        return torch.as_tensor(
+            self.cache["s1_compact_to_original"],
+            dtype=torch.long,
+        ).contiguous()
+
+    def s1_to_kronos_ids(
+        self,
+        values: Tensor,
+    ) -> Tensor:
+        """Map model-facing s1 IDs to original Kronos decoder IDs."""
+        ids = torch.as_tensor(values).to(torch.long)
+
+        if self.s1_id_space == "kronos_original":
+            if ids.numel() and (
+                ids.min().item() < 0
+                or ids.max().item() >= TOKEN_VOCABULARY_SIZE
+            ):
+                raise ValueError(
+                    "Original s1 ID lies outside [0, 1023]."
+                )
+            return ids
+
+        mapping = self.s1_compact_to_original
+        if mapping is None:
+            raise RuntimeError(
+                "Compact s1 mapping is unavailable."
+            )
+
+        mapping = mapping.to(ids.device)
+        if ids.numel() and (
+            ids.min().item() < 0
+            or ids.max().item() >= mapping.numel()
+        ):
+            raise ValueError(
+                "Compact s1 ID lies outside the saved mapping."
+            )
+
+        return mapping[ids]
+
+    @property
     def has_raw_evaluation_targets(
         self,
     ) -> bool:
@@ -1023,6 +1100,12 @@ class CachedTokenGraphDataset(
             "normalisation",
             "tokenizer_id",
             "tokenizer_revision",
+            "s1_id_space",
+            "s1_vocabulary_size",
+            "s1_remapping_method",
+            "s1_remapping_resource_hash",
+            "s1_training_coverage_percent",
+            "s1_fallback_original_id",
             "graph_orientation",
             "regime_names",
             "generator_config",
@@ -1213,6 +1296,18 @@ def _validate_train_validation_compatibility(
         "evaluation_indices": (
             train_dataset.evaluation_indices,
             validation_dataset.evaluation_indices,
+        ),
+        "s1_id_space": (
+            train_dataset.s1_id_space,
+            validation_dataset.s1_id_space,
+        ),
+        "s1_vocabulary_size": (
+            train_dataset.s1_vocabulary_size,
+            validation_dataset.s1_vocabulary_size,
+        ),
+        "s1_remapping_resource_hash": (
+            train_dataset.s1_remapping_resource_hash,
+            validation_dataset.s1_remapping_resource_hash,
         ),
     }
 
