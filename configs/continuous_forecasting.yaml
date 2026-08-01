@@ -1,0 +1,95 @@
+data:
+  context_length: 60
+  stride: 15
+  horizons: [1, 5, 15, 30, 60]
+  input_channels: [open, high, low, close, volume]
+  target_channel: close
+
+  # raw: context-normalised OHLCV levels
+  # context_log_change: matched-origin within-context one-step log changes
+  input_representation: raw
+
+normalisation:
+  eps: 1.0e-8
+  clip: false
+  clip_min: -5.0
+  clip_max: 5.0
+
+model:
+  temporal:
+    # transformer | modern_tcn
+    type: transformer
+    d_model: 64
+
+    # Transformer-only settings.
+    num_layers: 1
+    num_heads: 4
+    feedforward_multiplier: 2
+    dropout: 0.0
+    relative_position_embedding: true
+
+    # Same p/sin/cos absolute session-position information used by the
+    # validation-selected per-asset OHLCV ModernTCN baseline.
+    session_position_encoding: true
+
+    # Used when temporal.type=modern_tcn.
+    modern_tcn:
+      patch_size: 8
+      patch_stride: 4
+      ffn_ratio: 1
+      num_blocks: 1
+      large_kernel: 51
+      small_kernel: 5
+      dropout: 0.05
+      head_dropout: 0.0
+
+  graph:
+    # none | fixed | free_static
+    type: none
+    num_heads: 2
+    hidden_dim: 32
+    activation: softmax
+    add_self_loops: false
+
+  # Fitted from January-August training observations only when graph.type=fixed.
+  fixed_graph_resource:
+    type: absolute_return_correlation
+    channel: close
+    threshold: 0.18
+    empty_row_policy: error
+
+  spatial:
+    num_layers: 1
+    feedforward_multiplier: 2
+    dropout: 0.0
+
+  head_dropout: 0.0
+
+training:
+  # mse: exactly the normalised-level objective used by ModernTCN
+  # cumulative_log_change_mae: direct financial objective in raw price space
+  loss:
+    type: mse
+    bps_scale: 10000.0
+
+  optimizer: adam
+  scheduler: modern_tcn_type3
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+
+  batch_size: 16
+  validation_batch_size: 32
+  num_workers: 0
+
+  max_epochs: 100
+  patience: 10
+  min_delta: 0.0
+  gradient_clip_norm: 1.0
+  mixed_precision: true
+  seed: 42
+
+  # For an exact ModernTCN-style MSE comparison use validation_loss.
+  # For later graph selection this can be changed to
+  # mean_short_horizon_log_mae with selection_horizons=[1,5].
+  selection_metric: validation_loss
+  selection_horizons: [1, 5]
