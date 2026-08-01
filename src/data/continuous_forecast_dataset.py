@@ -9,6 +9,7 @@ row is zero so the physical 60-minute forecasting origin is unchanged.
 """
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any, Literal
 
 import torch
@@ -18,6 +19,9 @@ from src.data.data_generator import (
     ExampleDict,
     WindowContextNormaliser,
     WindowedCandleDataset,
+)
+from src.evaluation.prediction_transforms import (
+    raw_to_cumulative_log_change,
 )
 
 
@@ -84,6 +88,52 @@ class ContinuousDatasetConfig:
             raise ValueError("clip_min must be smaller than clip_max.")
 
 
+class CumulativeLogChangeTargetAdapter:
+    """Add the direct cumulative-log-change target to an example.
+
+    The wrapped normaliser remains responsible for the model input and for
+    the legacy normalised-Close target.  This adapter adds the exact target
+    used by the direct-return model:
+
+        target[h] = log(P[t + h]) - log(P[t])
+
+    where ``P[t]`` is the final observed raw Close.  Only raw values already
+    present in the supervised example are used; no future value enters input
+    normalisation or any model feature.
+    """
+
+    def __init__(
+        self,
+        normaliser: Callable[[ExampleDict], ExampleDict],
+        *,
+        eps: float,
+    ) -> None:
+        if eps <= 0:
+            raise ValueError("eps must be positive.")
+        self.normaliser = normaliser
+        self.eps = float(eps)
+
+    def __call__(self, example: ExampleDict) -> ExampleDict:
+        output = self.normaliser(example)
+        raw_target = torch.as_tensor(
+            output["y_unnormalised"],
+            dtype=torch.float32,
+        )
+        last_context_target = torch.as_tensor(
+            output["last_context_target"],
+            dtype=torch.float32,
+        )
+        output = dict(output)
+        output["target_cumulative_log_change"] = (
+            raw_to_cumulative_log_change(
+                raw_target,
+                last_context_target,
+                eps=self.eps,
+            )
+        )
+        return output
+
+
 class MatchedContextLogChangeNormaliser:
     """Build matched-origin log-change inputs and raw-level Close targets.
 
@@ -97,9 +147,10 @@ class MatchedContextLogChangeNormaliser:
     The resulting context retains length ``T`` and therefore retains exactly
     the same forecast origins and target timestamps as the raw experiment.
     Input log changes are normalised using their own context statistics.
-    Future target levels are normalised using the *raw observed context* target
-    channel mean and standard deviation, so model outputs have the same
-    continuous target contract as the raw experiment.
+    Future target levels are still normalised using the *raw observed context*
+    target-channel mean and standard deviation for backwards-compatible
+    normalised-Close experiments.  A separate outer adapter adds the direct
+    cumulative-log-change target used by return-output experiments.
     """
 
     def __init__(
@@ -214,6 +265,11 @@ def build_continuous_dataset(
             clip_max=config.clip_max,
         )
 
+    normaliser_with_target = CumulativeLogChangeTargetAdapter(
+        normaliser,
+        eps=config.eps,
+    )
+
     return WindowedCandleDataset(
         split=split,
         context_length=config.context_length,
@@ -221,7 +277,7 @@ def build_continuous_dataset(
         input_channels=list(config.input_channels),
         target_channels=list(config.target_channels),
         stride=config.stride,
-        normaliser=normaliser,
+        normaliser=normaliser_with_target,
     )
 
 
@@ -258,6 +314,23 @@ def _cpu_smoke_test() -> None:
         raise AssertionError("Representations changed target timestamps.")
     if not torch.equal(raw["y_unnormalised"], changed["y_unnormalised"]):
         raise AssertionError("Representations changed raw targets.")
+    torch.testing.assert_close(
+        raw["target_cumulative_log_change"],
+        changed["target_cumulative_log_change"],
+        atol=0.0,
+        rtol=0.0,
+    )
+    expected_target = raw_to_cumulative_log_change(
+        raw["y_unnormalised"],
+        raw["last_context_target"],
+        eps=raw_config.eps,
+    )
+    torch.testing.assert_close(
+        raw["target_cumulative_log_change"],
+        expected_target,
+        atol=0.0,
+        rtol=0.0,
+    )
     if not torch.allclose(
         changed["x"][0],
         (torch.zeros_like(changed["x"][0]) - changed["norm_mean"])

@@ -16,6 +16,15 @@ normalisation:
   clip_max: 5.0
 
 model:
+  # normalised_close: legacy direct price-level output in the context Close
+  # normalisation frame.
+  # cumulative_log_change: direct log(P[t+h] / P[t]) output at each horizon.
+  output_representation: normalised_close
+
+  # Use zero for cumulative-log-change output so the initial forecast is
+  # exactly persistence (zero cumulative return).
+  output_head_initialisation: default
+
   temporal:
     # transformer | modern_tcn
     type: transformer
@@ -66,8 +75,9 @@ model:
   head_dropout: 0.0
 
 training:
-  # mse: exactly the normalised-level objective used by ModernTCN
-  # cumulative_log_change_mae: direct financial objective in raw price space
+  # mse: normalised-Close objective used by the legacy ModernTCN comparison
+  # cumulative_log_change_mae: direct L1 objective in cumulative-log-change
+  # space. Required when model.output_representation=cumulative_log_change.
   loss:
     type: mse
     bps_scale: 10000.0

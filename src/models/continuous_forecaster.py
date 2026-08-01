@@ -38,6 +38,11 @@ from src.models.modern_tcn import _TemporalEncodingModernTCNAdapter
 
 
 TemporalBackboneType = Literal["transformer", "modern_tcn"]
+OutputRepresentation = Literal[
+    "normalised_close",
+    "cumulative_log_change",
+]
+OutputHeadInitialisation = Literal["default", "zero"]
 
 
 @dataclass(frozen=True)
@@ -124,6 +129,8 @@ class ContinuousForecasterConfig:
         "volume",
     )
     target_channel: str = "close"
+    output_representation: OutputRepresentation = "normalised_close"
+    output_head_initialisation: OutputHeadInitialisation = "default"
     temporal: ContinuousTemporalConfig = ContinuousTemporalConfig()
     graph: GraphConfig = GraphConfig(type="none", num_heads=2)
     spatial_num_layers: int = 1
@@ -150,6 +157,18 @@ class ContinuousForecasterConfig:
             raise ValueError(
                 "target_channel must be present in input_channels."
             )
+        if self.output_representation not in {
+            "normalised_close",
+            "cumulative_log_change",
+        }:
+            raise ValueError(
+                "output_representation must be 'normalised_close' or "
+                "'cumulative_log_change'."
+            )
+        if self.output_head_initialisation not in {"default", "zero"}:
+            raise ValueError(
+                "output_head_initialisation must be 'default' or 'zero'."
+            )
         self.temporal.validate(context_length=self.context_length)
         self.graph.validate(
             num_nodes=self.num_nodes,
@@ -174,10 +193,30 @@ class ContinuousForecasterConfig:
 
 @dataclass
 class ContinuousForecastOutput:
-    predictions_normalised: Tensor
+    predictions: Tensor
+    output_representation: OutputRepresentation
     temporal_hidden: Tensor
     spatial_hidden: Tensor
     graph: GraphOutput
+
+    @property
+    def predictions_normalised(self) -> Tensor:
+        """Backward-compatible access for legacy normalised-Close runs."""
+        if self.output_representation != "normalised_close":
+            raise RuntimeError(
+                "predictions_normalised is invalid when the model outputs "
+                "cumulative log changes. Use output.predictions instead."
+            )
+        return self.predictions
+
+    @property
+    def predictions_cumulative_log_change(self) -> Tensor:
+        if self.output_representation != "cumulative_log_change":
+            raise RuntimeError(
+                "The model is not configured for cumulative-log-change "
+                "output."
+            )
+        return self.predictions
 
     def validate(self, config: ContinuousForecasterConfig) -> None:
         batch_size = int(self.temporal_hidden.shape[0])
@@ -187,11 +226,15 @@ class ContinuousForecastOutput:
             config.num_nodes,
             1,
         )
-        if tuple(self.predictions_normalised.shape) != expected_prediction:
+        if tuple(self.predictions.shape) != expected_prediction:
             raise ValueError(
                 "Unexpected prediction shape. "
                 f"Expected {expected_prediction}, received "
-                f"{tuple(self.predictions_normalised.shape)}."
+                f"{tuple(self.predictions.shape)}."
+            )
+        if self.output_representation != config.output_representation:
+            raise ValueError(
+                "Output representation does not match model config."
             )
         if self.temporal_hidden.ndim != 4:
             raise ValueError(
@@ -297,6 +340,7 @@ class DirectFlattenForecastHead(nn.Module):
         feature_length: int,
         num_horizons: int,
         dropout: float,
+        initialisation: OutputHeadInitialisation = "default",
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
@@ -307,6 +351,13 @@ class DirectFlattenForecastHead(nn.Module):
             self.num_horizons,
         )
         self.dropout = nn.Dropout(dropout)
+        if initialisation == "zero":
+            nn.init.zeros_(self.linear.weight)
+            nn.init.zeros_(self.linear.bias)
+        elif initialisation != "default":
+            raise ValueError(
+                "initialisation must be 'default' or 'zero'."
+            )
 
     def forward(self, hidden: Tensor) -> Tensor:
         if hidden.ndim != 4:
@@ -508,6 +559,31 @@ class ModernTCNContinuousBackbone(nn.Module):
     def _official_backbone(self) -> nn.Module:
         return self._outer_official_model.model
 
+    def initialise_forecast_head(
+        self,
+        initialisation: OutputHeadInitialisation,
+    ) -> None:
+        if initialisation == "default":
+            return
+        if initialisation != "zero":
+            raise ValueError(
+                "initialisation must be 'default' or 'zero'."
+            )
+        linear_modules = [
+            module
+            for module in self._official_backbone.head.modules()
+            if isinstance(module, nn.Linear)
+        ]
+        if not linear_modules:
+            raise RuntimeError(
+                "The official ModernTCN forecasting head exposes no "
+                "nn.Linear module to initialise."
+            )
+        for module in linear_modules:
+            nn.init.zeros_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
     def forward(
         self,
         x: Tensor,
@@ -662,10 +738,19 @@ class ContinuousForecaster(nn.Module):
                     feature_length=output_length,
                     num_horizons=len(config.horizons),
                     dropout=config.head_dropout,
+                    initialisation=config.output_head_initialisation,
                 )
             )
         else:
             self.direct_head = None
+            if not isinstance(
+                self.temporal_backbone,
+                ModernTCNContinuousBackbone,
+            ):
+                raise TypeError("Unexpected temporal backbone type.")
+            self.temporal_backbone.initialise_forecast_head(
+                config.output_head_initialisation
+            )
 
     def forward(
         self,
@@ -710,7 +795,8 @@ class ContinuousForecaster(nn.Module):
             predictions = self.direct_head(spatial_hidden)
 
         output = ContinuousForecastOutput(
-            predictions_normalised=predictions,
+            predictions=predictions,
+            output_representation=self.config.output_representation,
             temporal_hidden=temporal_hidden,
             spatial_hidden=spatial_hidden,
             graph=graph,
@@ -748,7 +834,7 @@ def _cpu_smoke_test() -> None:
     starts = torch.tensor([0, 5])
     lengths = torch.tensor([30, 30])
     output = model(x, context_start=starts, session_length=lengths)
-    if tuple(output.predictions_normalised.shape) != (2, 2, 4, 1):
+    if tuple(output.predictions.shape) != (2, 2, 4, 1):
         raise AssertionError("Unexpected continuous forecast shape.")
 
     # No-graph temporal path must be asset independent.
@@ -759,8 +845,8 @@ def _cpu_smoke_test() -> None:
         reference = model(x, context_start=starts, session_length=lengths)
         perturbed = model(changed, context_start=starts, session_length=lengths)
     if not torch.allclose(
-        reference.predictions_normalised[:, :, :3],
-        perturbed.predictions_normalised[:, :, :3],
+        reference.predictions[:, :, :3],
+        perturbed.predictions[:, :, :3],
         atol=1.0e-6,
         rtol=0.0,
     ):
@@ -796,7 +882,7 @@ def _cpu_smoke_test() -> None:
         rtol=0.0,
     ):
         raise AssertionError("Graph rows do not sum to one.")
-    loss = graph_output.predictions_normalised.square().mean()
+    loss = graph_output.predictions.square().mean()
     loss.backward()
     gradient = graph_model.graph_learner.logits.grad
     if gradient is None or not torch.isfinite(gradient).all():

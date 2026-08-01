@@ -3,9 +3,10 @@ from __future__ import annotations
 """Train the modular continuous-price temporal/graph forecaster.
 
 This runner is intentionally independent of the token-generation runner.  It
-uses the canonical raw candle splits and ``WindowContextNormaliser``, predicts
-Close directly at [1,5,15,30,60], and never invokes the Kronos tokenizer or
-decoder.
+uses the canonical raw candle splits and ``WindowContextNormaliser`` and
+never invokes the Kronos tokenizer or decoder.  The output representation is
+explicitly configurable: legacy normalised Close levels or direct cumulative
+Close log changes at [1,5,15,30,60].
 """
 
 import argparse
@@ -41,7 +42,11 @@ from src.data.load_candle_data import (
     load_candle_splits,
 )
 from src.evaluation.metrics import ForecastEvaluator
-from src.evaluation.prediction_transforms import inverse_window_normalisation
+from src.evaluation.prediction_transforms import (
+    cumulative_log_change_to_raw,
+    inverse_window_normalisation,
+    raw_to_cumulative_log_change,
+)
 from src.models.continuous_forecaster import (
     ContinuousForecaster,
     ContinuousForecasterConfig,
@@ -184,6 +189,24 @@ def validate_config(config: Mapping[str, Any]) -> None:
         "mean_short_horizon_log_mae",
     }:
         raise ValueError("Unsupported checkpoint-selection metric.")
+    output_representation = str(model["output_representation"])
+    if output_representation not in {
+        "normalised_close",
+        "cumulative_log_change",
+    }:
+        raise ValueError("Unsupported model.output_representation.")
+    output_initialisation = str(model["output_head_initialisation"])
+    if output_initialisation not in {"default", "zero"}:
+        raise ValueError("Unsupported model.output_head_initialisation.")
+    if (
+        output_representation == "cumulative_log_change"
+        and str(training["loss"]["type"])
+        != "cumulative_log_change_mae"
+    ):
+        raise ValueError(
+            "Direct cumulative-log-change output currently requires "
+            "training.loss.type=cumulative_log_change_mae."
+        )
     if str(model["graph"]["type"]) not in {
         "none",
         "fixed",
@@ -226,6 +249,10 @@ def _model_config(
         horizons=tuple(int(value) for value in data["horizons"]),
         input_channels=tuple(str(value) for value in data["input_channels"]),
         target_channel=str(data["target_channel"]),
+        output_representation=str(model["output_representation"]),
+        output_head_initialisation=str(
+            model["output_head_initialisation"]
+        ),
         temporal=ContinuousTemporalConfig(
             type=str(temporal["type"]),
             d_model=int(temporal["d_model"]),
@@ -324,44 +351,89 @@ def _build_loader(
 
 
 def _prediction_raw(
-    predictions_normalised: Tensor,
+    predictions: Tensor,
     batch: Mapping[str, Any],
     *,
     device: torch.device,
+    output_representation: str,
 ) -> Tensor:
+    predictions_float = predictions.float()
+    if output_representation == "cumulative_log_change":
+        last = torch.as_tensor(batch["last_context_target"]).to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        return cumulative_log_change_to_raw(
+            cumulative_log_change=predictions_float,
+            last_context_target=last,
+        )
+
+    if output_representation != "normalised_close":
+        raise ValueError(
+            f"Unsupported output representation: {output_representation!r}."
+        )
     mean = torch.as_tensor(batch["target_norm_mean"]).to(
         device=device,
-        dtype=predictions_normalised.dtype,
+        dtype=torch.float32,
         non_blocking=True,
     )
     std = torch.as_tensor(batch["target_norm_std"]).to(
         device=device,
-        dtype=predictions_normalised.dtype,
+        dtype=torch.float32,
         non_blocking=True,
     )
     return inverse_window_normalisation(
-        y_norm=predictions_normalised,
+        y_norm=predictions_float,
         target_norm_mean=mean,
         target_norm_std=std,
     )
 
 
 def _loss_values(
-    predictions_normalised: Tensor,
+    predictions: Tensor,
     batch: Mapping[str, Any],
     *,
     device: torch.device,
+    output_representation: str,
     loss_type: str,
     bps_scale: float,
     eps: float,
 ) -> tuple[Tensor, Tensor]:
-    """Return optimisation loss and native reporting loss."""
+    """Return optimisation loss and native reporting loss.
+
+    ``native`` is always in the unscaled units used for checkpoint selection
+    and history.  For direct cumulative-log-change output it is exactly the
+    pointwise Log MAE objective.
+    """
+    predictions_float = predictions.float()
+
+    if output_representation == "cumulative_log_change":
+        if loss_type != "cumulative_log_change_mae":
+            raise ValueError(
+                "Direct cumulative-log-change output requires the "
+                "cumulative_log_change_mae loss."
+            )
+        target_change = torch.as_tensor(
+            batch["target_cumulative_log_change"]
+        ).to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        native = F.l1_loss(predictions_float, target_change)
+        return native * float(bps_scale), native
+
+    if output_representation != "normalised_close":
+        raise ValueError(
+            f"Unsupported output representation: {output_representation!r}."
+        )
+
     target_normalised = torch.as_tensor(batch["y"]).to(
         device=device,
         dtype=torch.float32,
         non_blocking=True,
     )
-    predictions_float = predictions_normalised.float()
     if loss_type == "mse":
         native = F.mse_loss(predictions_float, target_normalised)
         return native, native
@@ -370,22 +442,30 @@ def _loss_values(
         predictions_float,
         batch,
         device=device,
-    ).float().clamp_min(eps)
+        output_representation=output_representation,
+    ).clamp_min(eps)
     true_raw = torch.as_tensor(batch["y_unnormalised"]).to(
         device=device,
         dtype=torch.float32,
         non_blocking=True,
-    ).clamp_min(eps)
+    )
     last = torch.as_tensor(batch["last_context_target"]).to(
         device=device,
         dtype=torch.float32,
         non_blocking=True,
-    ).clamp_min(eps)
-    predicted_change = torch.log(predicted_raw) - torch.log(last[:, None])
-    true_change = torch.log(true_raw) - torch.log(last[:, None])
-    native = torch.abs(predicted_change - true_change).mean()
+    )
+    predicted_change = raw_to_cumulative_log_change(
+        predicted_raw,
+        last,
+        eps=eps,
+    )
+    true_change = raw_to_cumulative_log_change(
+        true_raw,
+        last,
+        eps=eps,
+    )
+    native = F.l1_loss(predicted_change, true_change)
     return native * float(bps_scale), native
-
 
 def _build_optimizer(
     model: torch.nn.Module,
@@ -458,6 +538,7 @@ def _run_train_epoch(
     loss_type = str(config["training"]["loss"]["type"])
     bps_scale = float(config["training"]["loss"]["bps_scale"])
     eps = float(config["normalisation"]["eps"])
+    output_representation = str(config["model"]["output_representation"])
     clip_norm = float(config["training"]["gradient_clip_norm"])
     optimisation_sum = 0.0
     native_sum = 0.0
@@ -483,9 +564,10 @@ def _run_train_epoch(
                 session_length=batch["session_length"],
             )
         optimisation_loss, native_loss = _loss_values(
-            output.predictions_normalised,
+            output.predictions,
             batch,
             device=device,
+            output_representation=output_representation,
             loss_type=loss_type,
             bps_scale=bps_scale,
             eps=eps,
@@ -500,7 +582,12 @@ def _run_train_epoch(
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-        count = int(torch.as_tensor(batch["y"]).numel())
+        target_key = (
+            "target_cumulative_log_change"
+            if output_representation == "cumulative_log_change"
+            else "y"
+        )
+        count = int(torch.as_tensor(batch[target_key]).numel())
         optimisation_sum += float(optimisation_loss.detach().item()) * count
         native_sum += float(native_loss.detach().item()) * count
         target_count += count
@@ -545,6 +632,7 @@ def _run_validation(
     loss_type = str(config["training"]["loss"]["type"])
     bps_scale = float(config["training"]["loss"]["bps_scale"])
     eps = float(config["normalisation"]["eps"])
+    output_representation = str(config["model"]["output_representation"])
     native_sum = 0.0
     optimisation_sum = 0.0
     target_count = 0
@@ -578,19 +666,26 @@ def _run_validation(
                     session_length=batch["session_length"],
                 )
             optimisation_loss, native_loss = _loss_values(
-                output.predictions_normalised,
+                output.predictions,
                 batch,
                 device=device,
+                output_representation=output_representation,
                 loss_type=loss_type,
                 bps_scale=bps_scale,
                 eps=eps,
             )
             raw_prediction = _prediction_raw(
-                output.predictions_normalised.float(),
+                output.predictions,
                 batch,
                 device=device,
+                output_representation=output_representation,
             )
-            count = int(torch.as_tensor(batch["y"]).numel())
+            target_key = (
+                "target_cumulative_log_change"
+                if output_representation == "cumulative_log_change"
+                else "y"
+            )
+            count = int(torch.as_tensor(batch[target_key]).numel())
             optimisation_sum += float(optimisation_loss.item()) * count
             native_sum += float(native_loss.item()) * count
             target_count += count
@@ -640,6 +735,24 @@ def _run_validation(
         horizons=evaluator.horizons,
         channels=evaluator.channels,
     )
+    loss_metric_abs_difference: float | None = None
+    if (
+        output_representation == "cumulative_log_change"
+        and loss_type == "cumulative_log_change_mae"
+    ):
+        evaluator_log_mae = float(
+            metric_results["cumulative_log_change_mae"].mean().item()
+        )
+        native_validation_loss = native_sum / target_count
+        loss_metric_abs_difference = abs(
+            native_validation_loss - evaluator_log_mae
+        )
+        if loss_metric_abs_difference > 1.0e-6:
+            raise AssertionError(
+                "Direct cumulative-log-change validation loss differs from "
+                "the ForecastEvaluator Log MAE. "
+                f"Absolute difference: {loss_metric_abs_difference}."
+            )
     graph_tensor = torch.cat(graphs, dim=0) if graphs else None
     synchronise_device(device)
     return {
@@ -655,6 +768,7 @@ def _run_validation(
             "orientation": "A[target, source]",
         },
         "graph_summary": _graph_summary(graph_tensor),
+        "loss_metric_abs_difference": loss_metric_abs_difference,
         "seconds": perf_counter() - start,
     }
 
@@ -910,6 +1024,10 @@ def main() -> None:
         "input_representation": dataset_config.input_representation,
         "input_channels": list(dataset_config.input_channels),
         "target_channel": dataset_config.target_channels[0],
+        "output_representation": model_config.output_representation,
+        "output_head_initialisation": (
+            model_config.output_head_initialisation
+        ),
         "temporal_backbone": model_config.temporal.type,
         "graph_type": model_config.graph.type,
         "loss_type": training["loss"]["type"],
@@ -1020,6 +1138,9 @@ def main() -> None:
                         "epoch": epoch,
                         "selection_score": score,
                         "validation_loss": validation["native_loss"],
+                        "loss_metric_abs_difference": validation[
+                            "loss_metric_abs_difference"
+                        ],
                         "graph_summary": validation["graph_summary"],
                     },
                     run_dir / "best_validation_diagnostics.json",

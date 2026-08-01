@@ -12,6 +12,7 @@ from src.data.continuous_forecast_dataset import (
     build_continuous_dataset,
 )
 from src.evaluation.prediction_transforms import (
+    cumulative_log_change_to_raw,
     inverse_window_normalisation,
     raw_to_cumulative_log_change,
 )
@@ -87,6 +88,16 @@ def main() -> None:
         atol=1.0e-5,
         rtol=1.0e-6,
     )
+    expected_target_change = raw_to_cumulative_log_change(
+        batch["y_unnormalised"],
+        batch["last_context_target"],
+    )
+    torch.testing.assert_close(
+        batch["target_cumulative_log_change"],
+        expected_target_change,
+        atol=0.0,
+        rtol=0.0,
+    )
 
     temporal = ContinuousTemporalConfig(
         type="transformer",
@@ -115,20 +126,21 @@ def main() -> None:
         context_start=batch["context_start"],
         session_length=batch["session_length"],
     )
-    if tuple(output.predictions_normalised.shape) != (2, 5, 4, 1):
+    if tuple(output.predictions.shape) != (2, 5, 4, 1):
         raise AssertionError("Unexpected forecast shape.")
 
     # MSE parity.
     optimisation, native = _loss_values(
-        output.predictions_normalised,
+        output.predictions,
         batch,
         device=torch.device("cpu"),
+        output_representation="normalised_close",
         loss_type="mse",
         bps_scale=10000.0,
         eps=1.0e-8,
     )
     expected_mse = F.mse_loss(
-        output.predictions_normalised.float(),
+        output.predictions.float(),
         batch["y"].float(),
     )
     torch.testing.assert_close(native, expected_mse)
@@ -136,15 +148,16 @@ def main() -> None:
 
     # CLG-MAE parity against the common transform.
     optimisation, native = _loss_values(
-        output.predictions_normalised,
+        output.predictions,
         batch,
         device=torch.device("cpu"),
+        output_representation="normalised_close",
         loss_type="cumulative_log_change_mae",
         bps_scale=10000.0,
         eps=1.0e-8,
     )
     raw_prediction = inverse_window_normalisation(
-        output.predictions_normalised.float(),
+        output.predictions.float(),
         batch["target_norm_mean"],
         batch["target_norm_std"],
     ).clamp_min(1.0e-8)
@@ -160,6 +173,100 @@ def main() -> None:
     torch.testing.assert_close(native, expected_clg)
     torch.testing.assert_close(optimisation, 10000.0 * expected_clg)
 
+    # Direct cumulative-log-change output and persistence initialisation.
+    direct_config = ContinuousForecasterConfig(
+        num_nodes=4,
+        context_length=60,
+        horizons=(1, 5, 15, 30, 60),
+        output_representation="cumulative_log_change",
+        output_head_initialisation="zero",
+        temporal=temporal,
+        graph=GraphConfig(
+            type="none",
+            num_heads=2,
+            hidden_dim=16,
+            add_self_loops=False,
+            mtgnn_top_k=2,
+        ),
+    )
+    direct_model = ContinuousForecaster(direct_config).eval()
+    direct_output = direct_model(
+        batch["x"],
+        context_start=batch["context_start"],
+        session_length=batch["session_length"],
+    )
+    torch.testing.assert_close(
+        direct_output.predictions,
+        torch.zeros_like(direct_output.predictions),
+        atol=0.0,
+        rtol=0.0,
+    )
+    persistence_raw = cumulative_log_change_to_raw(
+        direct_output.predictions,
+        batch["last_context_target"],
+    )
+    expected_persistence = batch["last_context_target"][:, None].expand_as(
+        persistence_raw
+    )
+    torch.testing.assert_close(
+        persistence_raw,
+        expected_persistence,
+        atol=0.0,
+        rtol=0.0,
+    )
+    direct_optimisation, direct_native = _loss_values(
+        direct_output.predictions,
+        batch,
+        device=torch.device("cpu"),
+        output_representation="cumulative_log_change",
+        loss_type="cumulative_log_change_mae",
+        bps_scale=10000.0,
+        eps=1.0e-8,
+    )
+    expected_direct = F.l1_loss(
+        direct_output.predictions.float(),
+        batch["target_cumulative_log_change"].float(),
+    )
+    torch.testing.assert_close(direct_native, expected_direct)
+    torch.testing.assert_close(
+        direct_optimisation,
+        10000.0 * expected_direct,
+    )
+    reconstructed_change = raw_to_cumulative_log_change(
+        persistence_raw,
+        batch["last_context_target"],
+    )
+    torch.testing.assert_close(
+        reconstructed_change,
+        direct_output.predictions,
+        atol=1.0e-7,
+        rtol=0.0,
+    )
+
+    # Raw and log-change input views must share the exact direct target.
+    log_dataset = build_continuous_dataset(
+        split,
+        config=ContinuousDatasetConfig(
+            context_length=60,
+            horizons=(1, 5, 15, 30, 60),
+            stride=15,
+            input_representation="context_log_change",
+        ),
+    )
+    log_batch = _batch(log_dataset)
+    torch.testing.assert_close(
+        batch["target_cumulative_log_change"],
+        log_batch["target_cumulative_log_change"],
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        batch["y_unnormalised"],
+        log_batch["y_unnormalised"],
+        atol=0.0,
+        rtol=0.0,
+    )
+
     # Asset independence before graph.
     changed_x = batch["x"].clone()
     changed_x[:, :, 3] += 10.0
@@ -170,8 +277,8 @@ def main() -> None:
             session_length=batch["session_length"],
         )
     torch.testing.assert_close(
-        output.predictions_normalised[:, :, :3],
-        changed_output.predictions_normalised[:, :, :3],
+        output.predictions[:, :, :3],
+        changed_output.predictions[:, :, :3],
         atol=1.0e-6,
         rtol=0.0,
     )
@@ -197,7 +304,7 @@ def main() -> None:
         session_length=batch["session_length"],
     )
     graph_loss = F.mse_loss(
-        graph_output.predictions_normalised,
+        graph_output.predictions,
         batch["y"],
     )
     graph_loss.backward()
@@ -246,7 +353,7 @@ def main() -> None:
         )
         if tuple(modern_output.temporal_hidden.shape) != (2, 15, 4, 16):
             raise AssertionError("Unexpected ModernTCN hidden shape.")
-        if tuple(modern_output.predictions_normalised.shape) != (2, 5, 4, 1):
+        if tuple(modern_output.predictions.shape) != (2, 5, 4, 1):
             raise AssertionError("Unexpected ModernTCN forecast shape.")
 
         # No-graph parity against the complete selected official path.
@@ -288,7 +395,7 @@ def main() -> None:
             .contiguous()
         )
         torch.testing.assert_close(
-            modern_output.predictions_normalised,
+            modern_output.predictions,
             official_close,
             atol=1.0e-6,
             rtol=0.0,
@@ -303,8 +410,8 @@ def main() -> None:
                 session_length=batch["session_length"],
             )
         torch.testing.assert_close(
-            modern_output.predictions_normalised[:, :, :3],
-            changed_modern.predictions_normalised[:, :, :3],
+            modern_output.predictions[:, :, :3],
+            changed_modern.predictions[:, :, :3],
             atol=1.0e-6,
             rtol=0.0,
         )
