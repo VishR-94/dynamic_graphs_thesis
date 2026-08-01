@@ -248,6 +248,185 @@ def persistence_win_score_values(
         )
     )
 
+def _normalise_reduction_dims(
+    *,
+    ndim: int,
+    reduce_dims: Sequence[int] | None,
+) -> tuple[int, ...]:
+    """Return validated, non-negative reduction dimensions."""
+    if reduce_dims is None:
+        return tuple(range(ndim))
+
+    normalised: list[int] = []
+
+    for dim in reduce_dims:
+        if not isinstance(dim, int):
+            raise TypeError(
+                "reduce_dims must contain integers, "
+                f"got {type(dim).__name__}."
+            )
+
+        resolved = dim + ndim if dim < 0 else dim
+
+        if not 0 <= resolved < ndim:
+            raise IndexError(
+                f"Reduction dimension {dim} is invalid for a "
+                f"tensor with {ndim} dimensions."
+            )
+
+        normalised.append(resolved)
+
+    if len(set(normalised)) != len(normalised):
+        raise ValueError(
+            "reduce_dims must not contain duplicate dimensions."
+        )
+
+    return tuple(sorted(normalised))
+
+
+def reduce_quantile(
+    values: torch.Tensor,
+    quantile: float,
+    reduce_dims: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """Reduce ``values`` with a linearly interpolated quantile.
+
+    The implementation keeps all calculations in float32 and uses
+    sorting rather than ``torch.quantile``.  This avoids the float64
+    conversion that is unsupported by MPS while matching PyTorch's
+    default linear interpolation rule.
+    """
+    if not isinstance(values, torch.Tensor):
+        raise TypeError(
+            "values must be a torch.Tensor."
+        )
+
+    if values.numel() == 0:
+        raise ValueError(
+            "Cannot calculate a quantile of an empty tensor."
+        )
+
+    if not isinstance(quantile, (float, int)):
+        raise TypeError(
+            "quantile must be numeric."
+        )
+
+    quantile = float(quantile)
+
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError(
+            "quantile must lie in [0, 1], "
+            f"got {quantile}."
+        )
+
+    working = values.to(dtype=torch.float32)
+
+    dims = _normalise_reduction_dims(
+        ndim=working.ndim,
+        reduce_dims=reduce_dims,
+    )
+
+    if len(dims) == 0:
+        return working
+
+    kept_dims = tuple(
+        dim
+        for dim in range(working.ndim)
+        if dim not in dims
+    )
+
+    permutation = kept_dims + dims
+
+    if permutation != tuple(range(working.ndim)):
+        working = working.permute(permutation)
+
+    kept_shape = tuple(
+        values.shape[dim]
+        for dim in kept_dims
+    )
+
+    reduced_size = 1
+    for dim in dims:
+        reduced_size *= int(values.shape[dim])
+
+    flattened = working.reshape(
+        *kept_shape,
+        reduced_size,
+    )
+
+    sorted_values = torch.sort(
+        flattened,
+        dim=-1,
+    ).values
+
+    position = quantile * (reduced_size - 1)
+    lower_index = int(position)
+    upper_index = min(
+        lower_index + 1,
+        reduced_size - 1,
+    )
+    interpolation_weight = float(
+        position - lower_index
+    )
+
+    lower = sorted_values[..., lower_index]
+
+    if upper_index == lower_index:
+        return lower
+
+    upper = sorted_values[..., upper_index]
+
+    return lower + interpolation_weight * (upper - lower)
+
+
+def absolute_error_quantile(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    *,
+    quantile: float,
+    reduce_dims: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """Return a quantile of pointwise absolute errors."""
+    values = absolute_error_values(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    return reduce_quantile(
+        values,
+        quantile=quantile,
+        reduce_dims=reduce_dims,
+    )
+
+
+def median_absolute_error(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    reduce_dims: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """Median pointwise absolute error."""
+    return absolute_error_quantile(
+        y_pred=y_pred,
+        y_true=y_true,
+        quantile=0.50,
+        reduce_dims=reduce_dims,
+    )
+
+
+def p95_absolute_error(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    reduce_dims: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """95th percentile of pointwise absolute error."""
+    return absolute_error_quantile(
+        y_pred=y_pred,
+        y_true=y_true,
+        quantile=0.95,
+        reduce_dims=reduce_dims,
+    )
+
+
 def mae(
     y_pred: torch.Tensor,
     y_true: torch.Tensor,
@@ -1363,7 +1542,13 @@ class MetricDefinition:
 
     compute: MetricFunction
 
-    bootstrap_components: BootstrapComponentFunction
+    bootstrap_components: BootstrapComponentFunction | None = None
+
+    @property
+    def supports_bootstrap(self) -> bool:
+        """Whether this metric has a session-block bootstrap definition."""
+        return self.bootstrap_components is not None
+
 
 class ForecastEvaluator:
     """
@@ -1815,6 +2000,28 @@ class ForecastEvaluator:
                 ),
             ),
 
+            "cumulative_log_change_median_absolute_error": (
+                MetricDefinition(
+                    compute=partial(
+                        self.compute_pairwise_metric,
+                        metric_fn=median_absolute_error,
+                        output_space="cumulative_log_change",
+                    ),
+                    bootstrap_components=None,
+                )
+            ),
+
+            "cumulative_log_change_p95_absolute_error": (
+                MetricDefinition(
+                    compute=partial(
+                        self.compute_pairwise_metric,
+                        metric_fn=p95_absolute_error,
+                        output_space="cumulative_log_change",
+                    ),
+                    bootstrap_components=None,
+                )
+            ),
+
             "cumulative_log_change_pearson_correlation": (
                 MetricDefinition(
                     compute=partial(
@@ -2111,6 +2318,11 @@ class ForecastEvaluator:
                         "ci_upper": Tensor[H, C],
                     }
                 }
+
+            Metrics without a bootstrap definition still return their
+            ordinary ``value``.  Their four bootstrap-summary tensors are
+            filled with NaN so tables can display an em dash without
+            pretending that uncertainty was estimated.
         """
         if isinstance(
             metrics,
@@ -2275,21 +2487,30 @@ class ForecastEvaluator:
                 f"0 and 1, got {confidence_level}."
             )
 
-        session_ids, _ = (
-            self._get_bootstrap_session_mapping()
-        )
+        bootstrap_metric_names = [
+            metric_name
+            for metric_name in metric_names
+            if self._metric_registry[metric_name].supports_bootstrap
+        ]
 
-        num_sessions = int(
-            session_ids.numel()
-        )
+        bootstrap_session_counts: torch.Tensor | None = None
 
-        bootstrap_session_counts = (
-            self._generate_bootstrap_session_counts(
-                num_sessions=num_sessions,
-                n_bootstrap=n_bootstrap,
-                bootstrap_seed=bootstrap_seed,
+        if bootstrap_metric_names:
+            session_ids, _ = (
+                self._get_bootstrap_session_mapping()
             )
-        )
+
+            num_sessions = int(
+                session_ids.numel()
+            )
+
+            bootstrap_session_counts = (
+                self._generate_bootstrap_session_counts(
+                    num_sessions=num_sessions,
+                    n_bootstrap=n_bootstrap,
+                    bootstrap_seed=bootstrap_seed,
+                )
+            )
 
         bootstrap_results: dict[
             str,
@@ -2303,15 +2524,55 @@ class ForecastEvaluator:
                 ]
             )
 
+            ordinary_value = (
+                ordinary_results[
+                    metric_name
+                ]
+                .detach()
+                .cpu()
+                .clone()
+            )
+
+            if not metric_definition.supports_bootstrap:
+                unavailable = torch.full_like(
+                    ordinary_value,
+                    torch.nan,
+                )
+
+                bootstrap_results[
+                    metric_name
+                ] = {
+                    "value": ordinary_value,
+                    "bootstrap_mean": unavailable.clone(),
+                    "bootstrap_std": unavailable.clone(),
+                    "ci_lower": unavailable.clone(),
+                    "ci_upper": unavailable.clone(),
+                }
+
+                continue
+
+            if bootstrap_session_counts is None:
+                raise AssertionError(
+                    "Bootstrap session counts were not generated for "
+                    f"bootstrap-supported metric {metric_name!r}."
+                )
+
             kwargs = resolved_metric_kwargs[
                 metric_name
             ]
 
-            components = (
-                metric_definition
-                .bootstrap_components(
-                    **kwargs,
+            component_builder = (
+                metric_definition.bootstrap_components
+            )
+
+            if component_builder is None:
+                raise AssertionError(
+                    "Metric reports bootstrap support without a "
+                    f"component builder: {metric_name!r}."
                 )
+
+            components = component_builder(
+                **kwargs,
             )
 
             statistics = (
@@ -2392,9 +2653,7 @@ class ForecastEvaluator:
                 )
 
             expected_metric_shape = (
-                ordinary_results[
-                    metric_name
-                ].shape
+                ordinary_value.shape
             )
 
             if bootstrap_samples.shape[1:] != (
@@ -2420,14 +2679,7 @@ class ForecastEvaluator:
             bootstrap_results[
                 metric_name
             ] = {
-                "value": (
-                    ordinary_results[
-                        metric_name
-                    ]
-                    .detach()
-                    .cpu()
-                    .clone()
-                ),
+                "value": ordinary_value,
                 **bootstrap_summary,
             }
 

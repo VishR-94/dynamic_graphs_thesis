@@ -14,6 +14,8 @@ DEFAULT_METRIC_DISPLAY_NAMES = {
     "raw_mae": "Raw MAE",
     "raw_rmse": "Raw RMSE",
     "cumulative_log_change_mae": "Log MAE",
+    "cumulative_log_change_median_absolute_error": "Log MedAE",
+    "cumulative_log_change_p95_absolute_error": "Log P95 AE",
     "cumulative_log_change_rmse": "Log RMSE",
     "mase": "MASE",
     "relative_mae_vs_persistence": "Rel. MAE",
@@ -39,6 +41,20 @@ DEFAULT_MODEL_DISPLAY_NAMES = {
     "modern_tcn": "ModernTCN",
     "kronos": "Kronos",
 }
+
+
+DEFAULT_SUMMARY_METRICS = (
+    "cumulative_log_change_mae",
+    "cumulative_log_change_median_absolute_error",
+    "cumulative_log_change_p95_absolute_error",
+    "relative_mae_vs_persistence",
+    "persistence_win_rate",
+    "cumulative_log_change_pearson_correlation",
+    "cumulative_log_change_cross_sectional_pearson_ic",
+    "cumulative_log_change_cross_sectional_spearman_rank_ic",
+    "cumulative_log_change_movement_magnitude_ratio",
+    "cumulative_log_change_temporal_absolute_correlation",
+)
 
 
 def make_evaluation_table(
@@ -69,6 +85,10 @@ def make_evaluation_table(
                 "ci_upper": Tensor[H, C],
             }
         }
+
+    A metric that is intentionally not bootstrapped uses NaN tensors for
+    the four bootstrap summaries. Notebook styling displays those entries
+    as an em dash while preserving the ordinary full-sample value.
 
     Args:
         metric_results:
@@ -334,6 +354,7 @@ def make_baseline_summary_table(
     models_to_display: Sequence[str],
     namespace: Mapping[str, Any],
     channel: str = "close",
+    metrics_to_display: Sequence[str] | None = None,
     metric_display_names: Mapping[str, str] | None = None,
     model_display_names: Mapping[str, str] | None = None,
 ) -> pd.DataFrame:
@@ -346,6 +367,11 @@ def make_baseline_summary_table(
 
     Only the ordinary full-test-set value is included. Bootstrap
     confidence intervals remain in the individual model tables.
+
+    By default, the compact headline metric set in
+    ``DEFAULT_SUMMARY_METRICS`` is displayed. MASE remains available
+    in the evaluator and detailed tables and can be restored by passing
+    it explicitly through ``metrics_to_display``.
 
     Missing metrics for a model are shown as NaN.
     """
@@ -391,10 +417,6 @@ def make_baseline_summary_table(
         ignore_index=True,
     )
 
-    observed_metrics = list(
-        pd.unique(combined["metric"])
-    )
-
     metric_labels = dict(
         DEFAULT_METRIC_DISPLAY_NAMES
     )
@@ -404,22 +426,32 @@ def make_baseline_summary_table(
             metric_display_names
         )
 
-    preferred_metrics = [
-        metric_name
-        for metric_name in metric_labels
-        if metric_name in observed_metrics
-    ]
+    if metrics_to_display is None:
+        metric_order = list(
+            DEFAULT_SUMMARY_METRICS
+        )
+    else:
+        metric_order = [
+            str(metric_name)
+            for metric_name in metrics_to_display
+        ]
 
-    extra_metrics = [
-        metric_name
-        for metric_name in observed_metrics
-        if metric_name not in preferred_metrics
-    ]
+    if len(metric_order) == 0:
+        raise ValueError(
+            "metrics_to_display must contain at least one metric."
+        )
 
-    metric_order = (
-        preferred_metrics
-        + extra_metrics
-    )
+    duplicate_metrics = {
+        metric_name
+        for metric_name in metric_order
+        if metric_order.count(metric_name) > 1
+    }
+
+    if duplicate_metrics:
+        raise ValueError(
+            "metrics_to_display must not contain duplicates: "
+            f"{sorted(duplicate_metrics)}."
+        )
 
     horizons = sorted(
         combined["horizon"].unique().tolist()

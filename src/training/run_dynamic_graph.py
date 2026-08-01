@@ -2305,6 +2305,13 @@ def _save_best_validation_artifacts(
         },
         run_dir / "best_validation_graphs.pt",
     )
+    atomic_torch_save(
+        {
+            "epoch": int(epoch),
+            "token_artifacts": bundle.token_artifacts,
+        },
+        run_dir / "best_validation_tokens.pt",
+    )
 
     if bundle.metric_table is not None:
         atomic_csv_save(

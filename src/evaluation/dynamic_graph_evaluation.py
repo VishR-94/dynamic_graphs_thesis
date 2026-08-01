@@ -41,7 +41,7 @@ Current public API
 
 from __future__ import annotations
 
-EVALUATION_MODULE_VERSION = "2026-07-30-consolidated-v7-graph-reliance"
+EVALUATION_MODULE_VERSION = "2026-07-31-v8-error-quantiles"
 
 import json
 from contextlib import nullcontext
@@ -72,9 +72,14 @@ from src.models.dynamic_graph.graph_learners import (
 )
 from src.models.dynamic_graph.model import DynamicGraphTokenForecaster
 from src.models.kronos_tokenizer import KronosTokenizerAdapter
+from src.evaluation.metrics import ForecastEvaluator
 from src.evaluation.prediction_transforms import raw_to_cumulative_log_change
 from src.utils.config import load_yaml
-from src.utils.metric_tables import DEFAULT_METRIC_DISPLAY_NAMES
+from src.utils.metric_tables import (
+    DEFAULT_METRIC_DISPLAY_NAMES,
+    DEFAULT_SUMMARY_METRICS,
+    make_evaluation_table,
+)
 from src.visualization.candle_plots import (
     compute_return_correlation_matrix,
     reorder_correlation_matrix,
@@ -1228,70 +1233,267 @@ def _load_last_metrics_long_table(
     return pd.DataFrame.from_records(records), epoch
 
 
+def _augment_best_metrics_from_saved_predictions(
+    run_path: Path,
+    long_table: pd.DataFrame,
+    *,
+    requested_metrics: Sequence[str],
+) -> pd.DataFrame:
+    """Recompute missing best-checkpoint metrics from saved predictions.
+
+    Older runs predate some evaluation-only metrics.  Their exact saved
+    prediction paths are authoritative and can be re-evaluated without
+    regenerating tokens or touching model weights.  MASE is excluded from
+    this fallback because it requires the training-derived scale.
+    """
+    observed = set(
+        long_table.get(
+            "metric",
+            pd.Series(dtype=str),
+        )
+        .astype(str)
+        .tolist()
+    )
+
+    missing = [
+        metric_name
+        for metric_name in requested_metrics
+        if metric_name not in observed
+    ]
+
+    if not missing:
+        return long_table
+
+    prediction_path = (
+        run_path
+        / "best_validation_predictions.pt"
+    )
+
+    if not prediction_path.is_file():
+        return long_table
+
+    payload = _torch_load(
+        prediction_path
+    )
+
+    if not isinstance(payload, Mapping):
+        raise TypeError(
+            "best_validation_predictions.pt must contain a mapping."
+        )
+
+    prediction_result = payload.get(
+        "prediction_result"
+    )
+
+    if not isinstance(
+        prediction_result,
+        Mapping,
+    ):
+        raise KeyError(
+            "best_validation_predictions.pt does not contain a "
+            "prediction_result mapping."
+        )
+
+    evaluator = ForecastEvaluator(
+        prediction_result=dict(
+            prediction_result
+        )
+    )
+
+    backfillable_metrics = {
+        "cumulative_log_change_median_absolute_error",
+        "cumulative_log_change_p95_absolute_error",
+    }
+
+    recomputable = [
+        metric_name
+        for metric_name in missing
+        if (
+            metric_name in backfillable_metrics
+            and metric_name in evaluator.available_metrics
+        )
+    ]
+
+    if not recomputable:
+        return long_table
+
+    results = evaluator.evaluate(
+        metrics=recomputable,
+        reduce_dims=(0, 2),
+        bootstrap=False,
+    )
+
+    additional = make_evaluation_table(
+        metric_results=results,
+        horizons=evaluator.horizons,
+        channels=evaluator.channels,
+    )
+
+    combined = pd.concat(
+        [
+            long_table,
+            additional,
+        ],
+        ignore_index=True,
+    )
+
+    return combined.drop_duplicates(
+        subset=[
+            "metric",
+            "horizon",
+            "channel",
+        ],
+        keep="first",
+    )
+
+
 def make_metrics_table(
     run_dir: str | Path,
     *,
     source: MetricsSource = "best",
     channel: str = "close",
+    metrics_to_display: Sequence[str] | None = None,
 ) -> pd.DataFrame:
-    """Return best- or last-validation metrics in baseline-table format.
+    """Return best- or last-validation metrics in headline-table format.
 
-    ``source='best'`` reads ``best_validation_metric_table.csv``.
-    ``source='last'`` reconstructs the most recent decoded validation metrics
-    from ``history.csv``.
+    ``source='best'`` reads the saved validation table and, for older
+    runs, recomputes any missing evaluation-only metrics from the exact
+    saved prediction path. ``source='last'`` reconstructs metrics logged
+    in ``history.csv``; metrics absent from an older history are shown as
+    missing rather than regenerated from a different checkpoint.
+
+    The default metric list includes mean, median and 95th-percentile
+    cumulative-log-change absolute error and omits MASE from the compact
+    display.  MASE remains implemented and can be restored by passing it
+    explicitly in ``metrics_to_display``.
     """
+    run_path = _resolve_run_dir(
+        run_dir
+    )
 
-    run_path = _resolve_run_dir(run_dir)
-
-    if source == "best":
-        long_table, epoch = _load_best_metrics_long_table(run_path)
-    elif source == "last":
-        long_table, epoch = _load_last_metrics_long_table(
-            run_path,
-            channel=channel,
+    if metrics_to_display is None:
+        metric_order = list(
+            DEFAULT_SUMMARY_METRICS
         )
     else:
-        raise ValueError("source must be 'best' or 'last'.")
+        metric_order = [
+            str(metric_name)
+            for metric_name in metrics_to_display
+        ]
 
-    required = {"metric", "horizon", "channel", "value"}
-    missing = required - set(long_table.columns)
+    if not metric_order:
+        raise ValueError(
+            "metrics_to_display must contain at least one metric."
+        )
+
+    duplicate_metrics = {
+        metric_name
+        for metric_name in metric_order
+        if metric_order.count(metric_name) > 1
+    }
+
+    if duplicate_metrics:
+        raise ValueError(
+            "metrics_to_display must not contain duplicates: "
+            f"{sorted(duplicate_metrics)}."
+        )
+
+    if source == "best":
+        long_table, epoch = (
+            _load_best_metrics_long_table(
+                run_path
+            )
+        )
+        long_table = (
+            _augment_best_metrics_from_saved_predictions(
+                run_path,
+                long_table,
+                requested_metrics=metric_order,
+            )
+        )
+    elif source == "last":
+        long_table, epoch = (
+            _load_last_metrics_long_table(
+                run_path,
+                channel=channel,
+            )
+        )
+    else:
+        raise ValueError(
+            "source must be 'best' or 'last'."
+        )
+
+    required = {
+        "metric",
+        "horizon",
+        "channel",
+        "value",
+    }
+    missing = required - set(
+        long_table.columns
+    )
+
     if missing:
         raise ValueError(
-            f"Metric table is missing columns: {sorted(missing)}."
+            "Metric table is missing columns: "
+            f"{sorted(missing)}."
         )
 
     selected = long_table.loc[
-        long_table["channel"].astype(str) == str(channel),
-        ["metric", "horizon", "value"],
+        long_table["channel"].astype(str)
+        == str(channel),
+        [
+            "metric",
+            "horizon",
+            "value",
+        ],
     ].copy()
+
     if selected.empty:
-        available = sorted(long_table["channel"].astype(str).unique())
+        available = sorted(
+            long_table["channel"]
+            .astype(str)
+            .unique()
+        )
         raise ValueError(
-            f"Channel {channel!r} is unavailable. Available channels: {available}."
+            f"Channel {channel!r} is unavailable. "
+            f"Available channels: {available}."
         )
 
-    observed_metrics = list(pd.unique(selected["metric"]))
-    preferred = [
-        metric
-        for metric in DEFAULT_METRIC_DISPLAY_NAMES
-        if metric in observed_metrics
-    ]
-    extras = [metric for metric in observed_metrics if metric not in preferred]
-    metric_order = preferred + extras
-
-    table = selected.pivot(index="horizon", columns="metric", values="value")
-    table = table.reindex(columns=metric_order).sort_index()
+    table = selected.pivot(
+        index="horizon",
+        columns="metric",
+        values="value",
+    )
+    table = (
+        table
+        .reindex(
+            columns=metric_order
+        )
+        .sort_index()
+    )
     table = table.rename(
         columns={
-            metric: DEFAULT_METRIC_DISPLAY_NAMES.get(metric, metric)
-            for metric in metric_order
+            metric_name: (
+                DEFAULT_METRIC_DISPLAY_NAMES.get(
+                    metric_name,
+                    metric_name,
+                )
+            )
+            for metric_name in metric_order
         }
     )
-    table.index = [f"{int(horizon)} min" for horizon in table.index]
+    table.index = [
+        f"{int(horizon)} min"
+        for horizon in table.index
+    ]
     table.index.name = "Horizon"
     table.columns.name = None
     table.attrs["metrics_source"] = source
     table.attrs["epoch"] = epoch
+    table.attrs["metrics_to_display"] = tuple(
+        metric_order
+    )
     return table
 
 
@@ -1300,26 +1502,45 @@ def style_metrics_table(
     *,
     source: MetricsSource = "best",
     channel: str = "close",
+    metrics_to_display: Sequence[str] | None = None,
     caption: str | None = None,
 ) -> pd.io.formats.style.Styler:
-    """Return a clean pandas Styler matching the baseline summary style."""
-
+    """Return a clean pandas Styler matching the baseline summary."""
     table = make_metrics_table(
         run_dir,
         source=source,
         channel=channel,
+        metrics_to_display=metrics_to_display,
     )
-    run_name = _resolve_run_dir(run_dir).name
-    epoch = table.attrs.get("epoch")
-    epoch_label = f", epoch {epoch}" if epoch is not None else ""
-    source_label = "Best" if source == "best" else "Last"
+    run_name = _resolve_run_dir(
+        run_dir
+    ).name
+    epoch = table.attrs.get(
+        "epoch"
+    )
+    epoch_label = (
+        f", epoch {epoch}"
+        if epoch is not None
+        else ""
+    )
+    source_label = (
+        "Best"
+        if source == "best"
+        else "Last"
+    )
 
     return (
         table.style
-        .format("{:.6g}", na_rep="—")
+        .format(
+            "{:.6g}",
+            na_rep="—",
+        )
         .set_caption(
             caption
-            or f"{run_name} — {source_label} Validation Results{epoch_label}"
+            or (
+                f"{run_name} — {source_label} "
+                f"Validation Results{epoch_label}"
+            )
         )
     )
 
@@ -2522,16 +2743,35 @@ def _decode_intervention_tokens(
     *,
     model: DynamicGraphTokenForecaster,
     tokenizer: KronosTokenizerAdapter,
+    dataset: CachedTokenGraphDataset,
     batch: Mapping[str, Any],
     context_tokens_cpu: Tensor,
     generated_token_ids_cpu: Tensor,
     evaluation_indices: Tensor,
     series_batch_size: int,
 ) -> tuple[Tensor, Tensor, int, int]:
+    # The trainable model may operate in a compact retained-s1 ID space
+    # (for example 0...149), whereas the frozen Kronos decoder always
+    # expects native coarse-token IDs in 0...1023.  Convert both the
+    # observed context and generated future back to native IDs before
+    # either full or coarse-only decoding.  For ordinary 1024-token
+    # caches this method is an identity operation.
+    context_tokens_for_decode = context_tokens_cpu.clone().to(torch.long)
+    generated_tokens_for_decode = (
+        generated_token_ids_cpu.clone().to(torch.long)
+    )
+
+    context_tokens_for_decode[..., 0] = dataset.s1_to_kronos_ids(
+        context_tokens_for_decode[..., 0]
+    )
+    generated_tokens_for_decode[..., 0] = dataset.s1_to_kronos_ids(
+        generated_tokens_for_decode[..., 0]
+    )
+
     if model.config.heads.predicts_s2:
         decoded = tokenizer.decode_token_path(
-            context_tokens_cpu,
-            generated_token_ids_cpu,
+            context_tokens_for_decode,
+            generated_tokens_for_decode,
             mean=torch.as_tensor(batch["context_mean"]),
             std=torch.as_tensor(batch["context_std"]),
             series_batch_size=int(series_batch_size),
@@ -2539,8 +2779,8 @@ def _decode_intervention_tokens(
         )
     else:
         decoded = tokenizer.decode_coarse_token_path(
-            context_tokens_cpu,
-            generated_token_ids_cpu[..., 0],
+            context_tokens_for_decode,
+            generated_tokens_for_decode[..., 0],
             mean=torch.as_tensor(batch["context_mean"]),
             std=torch.as_tensor(batch["context_std"]),
             series_batch_size=int(series_batch_size),
@@ -2929,6 +3169,7 @@ def _run_graph_intervention_diagnostics(
                     ) = _decode_intervention_tokens(
                         model=model,
                         tokenizer=tokenizer,
+                        dataset=dataset,
                         batch=batch,
                         context_tokens_cpu=context_tokens_cpu,
                         generated_token_ids_cpu=generated_ids_cpu,
