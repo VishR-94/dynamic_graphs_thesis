@@ -58,6 +58,10 @@ from src.models.dynamic_graph.fixed_graph_resource import (
     FixedGraphResourceConfig,
     fit_absolute_return_correlation_resource,
 )
+from src.models.dynamic_graph.losses import (
+    GraphRegularisationConfig,
+    compute_graph_regularisation,
+)
 from src.training.run_dynamic_graph import (
     _autocast_context,
     _move_optimizer_state,
@@ -213,6 +217,23 @@ def validate_config(config: Mapping[str, Any]) -> None:
         "free_static",
     }:
         raise ValueError("Unsupported graph type for the first ladder.")
+
+    graph_regularisation = GraphRegularisationConfig.from_mapping(
+        model.get("graph_regularisation")
+    )
+    if graph_regularisation.graph_temporal_smooth_reg > 0.0:
+        raise ValueError(
+            "The current continuous ladder supports static graphs only; "
+            "graph temporal smoothing must remain zero."
+        )
+    if (
+        graph_regularisation.enabled
+        and str(model["graph"]["type"]) != "free_static"
+    ):
+        raise ValueError(
+            "Graph regularisation is supported only for the learned "
+            "free-static graph in this ladder."
+        )
 
 
 def _dataset_config(config: Mapping[str, Any]) -> ContinuousDatasetConfig:
@@ -531,6 +552,7 @@ def _run_train_epoch(
     scaler: Any,
     use_amp: bool,
     config: Mapping[str, Any],
+    current_epoch: int,
     description: str,
 ) -> dict[str, float | int | None]:
     model.train()
@@ -539,8 +561,14 @@ def _run_train_epoch(
     bps_scale = float(config["training"]["loss"]["bps_scale"])
     eps = float(config["normalisation"]["eps"])
     output_representation = str(config["model"]["output_representation"])
+    graph_regularisation_config = GraphRegularisationConfig.from_mapping(
+        config["model"]["graph_regularisation"]
+    )
     clip_norm = float(config["training"]["gradient_clip_norm"])
     optimisation_sum = 0.0
+    forecast_optimisation_sum = 0.0
+    graph_regularisation_sum = 0.0
+    graph_target_entropy_penalty_sum = 0.0
     native_sum = 0.0
     target_count = 0
     graph_entropy_sum = 0.0
@@ -563,7 +591,7 @@ def _run_train_epoch(
                 context_start=batch["context_start"],
                 session_length=batch["session_length"],
             )
-        optimisation_loss, native_loss = _loss_values(
+        forecast_optimisation_loss, native_loss = _loss_values(
             output.predictions,
             batch,
             device=device,
@@ -571,6 +599,15 @@ def _run_train_epoch(
             loss_type=loss_type,
             bps_scale=bps_scale,
             eps=eps,
+        )
+        graph_regularisation = compute_graph_regularisation(
+            output.graph,
+            config=graph_regularisation_config,
+            current_epoch=current_epoch,
+            reference_tensor=forecast_optimisation_loss,
+        )
+        optimisation_loss = (
+            forecast_optimisation_loss + graph_regularisation.total
         )
         if not torch.isfinite(optimisation_loss):
             raise FloatingPointError("Non-finite training loss.")
@@ -589,6 +626,15 @@ def _run_train_epoch(
         )
         count = int(torch.as_tensor(batch[target_key]).numel())
         optimisation_sum += float(optimisation_loss.detach().item()) * count
+        forecast_optimisation_sum += float(
+            forecast_optimisation_loss.detach().item()
+        ) * count
+        graph_regularisation_sum += float(
+            graph_regularisation.total.detach().item()
+        ) * count
+        graph_target_entropy_penalty_sum += float(
+            graph_regularisation.target_entropy_penalty.detach().item()
+        ) * count
         native_sum += float(native_loss.detach().item()) * count
         target_count += count
         summary = _graph_summary(output.graph.selected)
@@ -602,6 +648,15 @@ def _run_train_epoch(
     synchronise_device(device)
     return {
         "optimisation_loss": optimisation_sum / target_count,
+        "forecast_optimisation_loss": (
+            forecast_optimisation_sum / target_count
+        ),
+        "graph_regularisation_loss": (
+            graph_regularisation_sum / target_count
+        ),
+        "graph_target_entropy_penalty": (
+            graph_target_entropy_penalty_sum / target_count
+        ),
         "native_loss": native_sum / target_count,
         "target_count": target_count,
         "graph_mean_row_entropy": (
@@ -801,6 +856,18 @@ def _history_record(
         "learning_rate": float(learning_rate),
         "training_optimisation_loss": float(
             train_metrics["optimisation_loss"]
+        ),
+        "training_forecast_optimisation_loss": float(
+            train_metrics.get(
+                "forecast_optimisation_loss",
+                train_metrics["optimisation_loss"],
+            )
+        ),
+        "training_graph_regularisation_loss": float(
+            train_metrics.get("graph_regularisation_loss", 0.0)
+        ),
+        "training_graph_target_entropy_penalty": float(
+            train_metrics.get("graph_target_entropy_penalty", 0.0)
         ),
         "training_loss": float(train_metrics["native_loss"]),
         "validation_optimisation_loss": float(
@@ -1030,6 +1097,9 @@ def main() -> None:
         ),
         "temporal_backbone": model_config.temporal.type,
         "graph_type": model_config.graph.type,
+        "graph_regularisation": dict(
+            resolved["model"]["graph_regularisation"]
+        ),
         "loss_type": training["loss"]["type"],
         "normalisation": "context-only per asset/channel",
         "cross_asset_path_before_graph": False,
@@ -1092,6 +1162,7 @@ def main() -> None:
                 scaler=scaler,
                 use_amp=use_amp,
                 config=resolved,
+                current_epoch=epoch,
                 description=f"train epoch {epoch}",
             )
             validation = _run_validation(

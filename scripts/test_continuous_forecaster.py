@@ -22,6 +22,10 @@ from src.models.continuous_forecaster import (
     ContinuousTemporalConfig,
 )
 from src.models.dynamic_graph.contracts import GraphConfig
+from src.models.dynamic_graph.losses import (
+    GraphRegularisationConfig,
+    compute_graph_regularisation,
+)
 from src.training.run_continuous_forecaster import _loss_values
 
 
@@ -311,6 +315,31 @@ def main() -> None:
     gradient = graph_model.graph_learner.logits.grad
     if gradient is None or float(gradient.norm().item()) <= 0.0:
         raise AssertionError("Forecast loss did not reach graph logits.")
+
+    graph_model.zero_grad(set_to_none=True)
+    graph_output = graph_model(
+        batch["x"],
+        context_start=batch["context_start"],
+        session_length=batch["session_length"],
+    )
+    graph_regularisation = compute_graph_regularisation(
+        graph_output.graph,
+        config=GraphRegularisationConfig(
+            graph_target_entropy=0.5,
+            graph_target_entropy_reg=0.05,
+        ),
+        current_epoch=1,
+        reference_tensor=graph_output.predictions.sum() * 0.0,
+    )
+    graph_regularisation.total.backward()
+    regularisation_gradient = graph_model.graph_learner.logits.grad
+    if (
+        regularisation_gradient is None
+        or float(regularisation_gradient.norm().item()) <= 0.0
+    ):
+        raise AssertionError(
+            "Target-entropy regularisation did not reach graph logits."
+        )
 
     # Optional official ModernTCN shape check when the submodule is present.
     modern_root = (

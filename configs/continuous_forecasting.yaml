@@ -60,6 +60,16 @@ model:
     activation: softmax
     add_self_loops: false
 
+  # Reuses the project's existing BaseDyGraph-style graph loss. The first
+  # continuous regularisation test uses only target-row-entropy matching.
+  graph_regularisation:
+    graph_reg_layer: -1
+    graph_reg_warmup_epochs: 0
+    graph_entropy_reg: 0.0
+    graph_target_entropy: null
+    graph_target_entropy_reg: 0.0
+    graph_temporal_smooth_reg: 0.0
+
   # Fitted from January-August training observations only when graph.type=fixed.
   fixed_graph_resource:
     type: absolute_return_correlation
