@@ -3,6 +3,7 @@ from __future__ import annotations
 """Fast contract tests for the continuous temporal/graph forecasting path."""
 
 from pathlib import Path
+import math
 
 import torch
 import torch.nn.functional as F
@@ -26,7 +27,13 @@ from src.models.dynamic_graph.losses import (
     GraphRegularisationConfig,
     compute_graph_regularisation,
 )
-from src.training.run_continuous_forecaster import _loss_values
+from src.training.run_continuous_forecaster import (
+    _adjust_learning_rate,
+    _build_optimizer,
+    _current_learning_rates,
+    _loss_values,
+    _trainable_parameter_partition,
+)
 
 
 def _synthetic_split() -> dict:
@@ -300,6 +307,8 @@ def main() -> None:
             add_self_loops=False,
             mtgnn_top_k=2,
         ),
+        spatial_gate_type="learned_scalar",
+        spatial_gate_initial_beta=0.1,
     )
     graph_model = ContinuousForecaster(graph_config)
     graph_output = graph_model(
@@ -315,6 +324,21 @@ def main() -> None:
     gradient = graph_model.graph_learner.logits.grad
     if gradient is None or float(gradient.norm().item()) <= 0.0:
         raise AssertionError("Forecast loss did not reach graph logits.")
+    if graph_output.spatial_beta is None:
+        raise AssertionError("Learned spatial gate did not expose beta.")
+    torch.testing.assert_close(
+        graph_output.spatial_beta.float(),
+        torch.tensor(0.1),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+    if (
+        graph_model.spatial_gate is None
+        or graph_model.spatial_gate.raw_beta is None
+        or graph_model.spatial_gate.raw_beta.grad is None
+        or float(graph_model.spatial_gate.raw_beta.grad.abs().item()) <= 0.0
+    ):
+        raise AssertionError("Forecast loss did not reach the spatial gate.")
 
     graph_model.zero_grad(set_to_none=True)
     graph_output = graph_model(
@@ -340,6 +364,161 @@ def main() -> None:
         raise AssertionError(
             "Target-entropy regularisation did not reach graph logits."
         )
+
+
+    # Dedicated optimizer parameter groups and schedule-ratio preservation.
+    optimizer_config = {
+        "training": {
+            "optimizer": "adam",
+            "learning_rate": 1.0e-4,
+            "graph_learning_rate": 2.0e-3,
+            "weight_decay": 0.0,
+            "scheduler": "modern_tcn_type3",
+        }
+    }
+    optimizer = _build_optimizer(graph_model, optimizer_config)
+    learning_rates = _current_learning_rates(optimizer)
+    if not math.isclose(float(learning_rates["backbone"]), 1.0e-4):
+        raise AssertionError("Unexpected backbone learning rate.")
+    if not math.isclose(float(learning_rates["graph"]), 2.0e-3):
+        raise AssertionError("Unexpected graph learning rate.")
+    backbone_parameters, graph_parameters = _trainable_parameter_partition(
+        graph_model
+    )
+    optimizer_parameter_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    expected_parameter_ids = {
+        id(parameter)
+        for parameter in (*backbone_parameters, *graph_parameters)
+    }
+    if optimizer_parameter_ids != expected_parameter_ids:
+        raise AssertionError("Optimizer parameter groups are incomplete.")
+    scheduled = _adjust_learning_rate(
+        optimizer,
+        config=optimizer_config,
+        completed_epoch=5,
+    )
+    expected_multiplier = 0.9 ** 2
+    if not math.isclose(
+        float(scheduled["backbone"]),
+        1.0e-4 * expected_multiplier,
+        rel_tol=1.0e-12,
+    ):
+        raise AssertionError("Backbone scheduler multiplier is incorrect.")
+    if not math.isclose(
+        float(scheduled["graph"]),
+        2.0e-3 * expected_multiplier,
+        rel_tol=1.0e-12,
+    ):
+        raise AssertionError("Graph scheduler did not preserve the LR ratio.")
+
+    # Convergence contract: a meaningful graph LR must move a near-uniform
+    # softmax graph toward a low target entropy. A non-zero gradient alone is
+    # insufficient and was the failure mode this change fixes.
+    entropy_model = ContinuousForecaster(graph_config)
+    entropy_optimizer = _build_optimizer(entropy_model, optimizer_config)
+    fixed_hidden = torch.randn(2, 3, 4, 16)
+    with torch.no_grad():
+        initial_graph = entropy_model.graph_learner(fixed_hidden)
+        initial_values = initial_graph.selected.clamp_min(1.0e-12)
+        initial_entropy = float(
+            (-(initial_values * initial_values.log()).sum(dim=-1))
+            .mean()
+            .item()
+        )
+    for _ in range(300):
+        entropy_optimizer.zero_grad(set_to_none=True)
+        graph_output_only = entropy_model.graph_learner(fixed_hidden)
+        regularisation = compute_graph_regularisation(
+            graph_output_only,
+            config=GraphRegularisationConfig(
+                graph_target_entropy=0.35,
+                graph_target_entropy_reg=1.0,
+            ),
+            current_epoch=1,
+            reference_tensor=entropy_model.graph_learner.logits.sum() * 0.0,
+        )
+        regularisation.total.backward()
+        entropy_optimizer.step()
+    with torch.no_grad():
+        final_graph = entropy_model.graph_learner(fixed_hidden)
+        final_values = final_graph.selected.clamp_min(1.0e-12)
+        final_entropy = float(
+            (-(final_values * final_values.log()).sum(dim=-1))
+            .mean()
+            .item()
+        )
+    if final_entropy >= initial_entropy - 0.25:
+        raise AssertionError(
+            "Dedicated graph LR did not materially reduce graph entropy: "
+            f"initial={initial_entropy:.6f}, final={final_entropy:.6f}."
+        )
+
+    # Dynamic graph and dynamic-base graph contracts.
+    for graph_type in ("dynamic", "dynamic_base"):
+        dynamic_config = ContinuousForecasterConfig(
+            num_nodes=4,
+            context_length=60,
+            horizons=(1, 5, 15, 30, 60),
+            temporal=temporal,
+            graph=GraphConfig(
+                type=graph_type,
+                num_heads=1,
+                hidden_dim=16,
+                add_self_loops=False,
+                mtgnn_top_k=2,
+                base_graph_type="free_static",
+                gate_type=(
+                    "learned_scalar"
+                    if graph_type == "dynamic_base"
+                    else "none"
+                ),
+                initial_alpha=0.25,
+            ),
+            spatial_gate_type="learned_scalar",
+            spatial_gate_initial_beta=0.1,
+        )
+        dynamic_model = ContinuousForecaster(dynamic_config)
+        dynamic_output = dynamic_model(
+            batch["x"],
+            context_start=batch["context_start"],
+            session_length=batch["session_length"],
+        )
+        if tuple(dynamic_output.graph.selected.shape) != (2, 1, 4, 4):
+            raise AssertionError(
+                f"Unexpected {graph_type} graph shape."
+            )
+        torch.testing.assert_close(
+            dynamic_output.graph.selected.sum(dim=-1),
+            torch.ones(2, 1, 4),
+            atol=1.0e-6,
+            rtol=0.0,
+        )
+        dynamic_loss = F.mse_loss(dynamic_output.predictions, batch["y"])
+        dynamic_loss.backward()
+        q_gradient = dynamic_model.graph_learner.q_proj.weight.grad
+        if q_gradient is None or float(q_gradient.norm().item()) <= 0.0:
+            raise AssertionError(
+                f"Forecast loss did not reach {graph_type} Q projection."
+            )
+        if graph_type == "dynamic_base":
+            alpha = dynamic_model.dynamic_graph_alpha()
+            if alpha is None:
+                raise AssertionError("Dynamic-base alpha is missing.")
+            torch.testing.assert_close(
+                alpha.float().mean(),
+                torch.tensor(0.25),
+                atol=1.0e-6,
+                rtol=0.0,
+            )
+            raw_alpha = dynamic_model.graph_learner.dynamic_residual_raw
+            if raw_alpha is None or raw_alpha.grad is None:
+                raise AssertionError(
+                    "Forecast loss did not reach dynamic-base alpha."
+                )
 
     # Optional official ModernTCN shape check when the submodule is present.
     modern_root = (

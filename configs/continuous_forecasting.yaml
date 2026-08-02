@@ -53,12 +53,18 @@ model:
       head_dropout: 0.0
 
   graph:
-    # none | fixed | free_static
+    # none | fixed | free_static | dynamic | dynamic_base
     type: none
     num_heads: 2
     hidden_dim: 32
     activation: softmax
     add_self_loops: false
+
+    # Dynamic-base graph settings. Alpha is the weight on the full
+    # input-conditioned base-plus-dynamic adjacency.
+    base_graph_type: free_static
+    gate_type: learned_scalar
+    initial_alpha: 0.25
 
   # Reuses the project's existing BaseDyGraph-style graph loss. The first
   # continuous regularisation test uses only target-row-entropy matching.
@@ -82,6 +88,12 @@ model:
     feedforward_multiplier: 2
     dropout: 0.0
 
+    # none: beta=1 and the graph branch is used fully.
+    # fixed: use initial_beta as a fixed convex mixture.
+    # learned_scalar: learn beta=sigmoid(raw_beta).
+    gate_type: none
+    initial_beta: 1.0
+
   head_dropout: 0.0
 
 training:
@@ -94,8 +106,15 @@ training:
 
   optimizer: adam
   scheduler: modern_tcn_type3
+  # Backbone/forecasting parameters and graph-learner parameters use
+  # separate Adam parameter groups. The scheduler preserves this LR ratio.
   learning_rate: 1.0e-4
+  graph_learning_rate: 1.0e-3
   weight_decay: 0.0
+
+  # Separate forecast-vs-regulariser graph-gradient diagnostics are computed
+  # on only this many batches per epoch to keep the sweep inexpensive.
+  graph_diagnostics_batches_per_epoch: 1
 
   batch_size: 16
   validation_batch_size: 32
@@ -108,8 +127,8 @@ training:
   mixed_precision: true
   seed: 42
 
-  # For an exact ModernTCN-style MSE comparison use validation_loss.
-  # For later graph selection this can be changed to
-  # mean_short_horizon_log_mae with selection_horizons=[1,5].
+  # The ModernTCN graph sweep overrides the loss to cumulative-log-change
+  # MAE; under that contract validation_loss is the exact five-horizon mean
+  # Log MAE used for automatic stage selection.
   selection_metric: validation_loss
   selection_horizons: [1, 5]

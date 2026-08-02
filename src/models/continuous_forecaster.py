@@ -43,6 +43,7 @@ OutputRepresentation = Literal[
     "cumulative_log_change",
 ]
 OutputHeadInitialisation = Literal["default", "zero"]
+SpatialGateType = Literal["none", "fixed", "learned_scalar"]
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,8 @@ class ContinuousForecasterConfig:
     spatial_num_layers: int = 1
     spatial_feedforward_multiplier: int = 2
     spatial_dropout: float = 0.0
+    spatial_gate_type: SpatialGateType = "none"
+    spatial_gate_initial_beta: float = 1.0
     head_dropout: float = 0.0
 
     def validate(self) -> None:
@@ -174,10 +177,17 @@ class ContinuousForecasterConfig:
             num_nodes=self.num_nodes,
             d_model=self.temporal.d_model,
         )
-        if self.graph.type not in {"none", "fixed", "free_static"}:
+        if self.graph.type not in {
+            "none",
+            "fixed",
+            "free_static",
+            "dynamic",
+            "dynamic_base",
+        }:
             raise ValueError(
-                "The first continuous ladder supports graph.type in "
-                "{'none','fixed','free_static'} only."
+                "Continuous forecasting supports graph.type in "
+                "{'none','fixed','free_static','dynamic',"
+                "'dynamic_base'} only."
             )
         if self.spatial_num_layers <= 0:
             raise ValueError("spatial_num_layers must be positive.")
@@ -187,6 +197,23 @@ class ContinuousForecasterConfig:
             )
         if not 0.0 <= self.spatial_dropout < 1.0:
             raise ValueError("spatial_dropout must lie in [0,1).")
+        if self.spatial_gate_type not in {
+            "none",
+            "fixed",
+            "learned_scalar",
+        }:
+            raise ValueError(
+                "spatial_gate_type must be 'none', 'fixed', or "
+                "'learned_scalar'."
+            )
+        if not 0.0 <= float(self.spatial_gate_initial_beta) <= 1.0:
+            raise ValueError(
+                "spatial_gate_initial_beta must lie in [0,1]."
+            )
+        if self.graph.type == "none" and self.spatial_gate_type != "none":
+            raise ValueError(
+                "Graph-free models must use spatial_gate_type='none'."
+            )
         if not 0.0 <= self.head_dropout < 1.0:
             raise ValueError("head_dropout must lie in [0,1).")
 
@@ -196,7 +223,9 @@ class ContinuousForecastOutput:
     predictions: Tensor
     output_representation: OutputRepresentation
     temporal_hidden: Tensor
+    graph_spatial_hidden: Tensor
     spatial_hidden: Tensor
+    spatial_beta: Tensor | None
     graph: GraphOutput
 
     @property
@@ -240,10 +269,20 @@ class ContinuousForecastOutput:
             raise ValueError(
                 "temporal_hidden must have shape [B,L,N,D]."
             )
+        if self.graph_spatial_hidden.shape != self.temporal_hidden.shape:
+            raise ValueError(
+                "graph_spatial_hidden must match temporal_hidden shape."
+            )
         if self.spatial_hidden.shape != self.temporal_hidden.shape:
             raise ValueError(
                 "spatial_hidden must match temporal_hidden shape."
             )
+        if self.spatial_beta is not None:
+            if self.spatial_beta.numel() != 1:
+                raise ValueError("spatial_beta must be scalar.")
+            beta_value = float(self.spatial_beta.detach().item())
+            if not math.isfinite(beta_value) or not 0.0 <= beta_value <= 1.0:
+                raise ValueError("spatial_beta must be finite in [0,1].")
         if self.temporal_hidden.shape[2:] != (
             config.num_nodes,
             config.temporal.d_model,
@@ -689,6 +728,79 @@ class ModernTCNContinuousBackbone(nn.Module):
         )
 
 
+class SpatialBranchGate(nn.Module):
+    """Blend temporal and graph-aware features through one scalar beta.
+
+    The graph-aware branch is produced by the existing spatial module. The
+    final representation supplied to the forecasting head is
+
+        H = (1 - beta) * H_temporal + beta * H_graph.
+
+    ``gate_type='none'`` recovers the previous full-spatial behaviour with
+    beta=1. ``fixed`` keeps the configured beta constant, and
+    ``learned_scalar`` optimises a sigmoid-parameterised scalar.
+    """
+
+    def __init__(
+        self,
+        *,
+        gate_type: SpatialGateType,
+        initial_beta: float,
+    ) -> None:
+        super().__init__()
+        if gate_type not in {"none", "fixed", "learned_scalar"}:
+            raise ValueError(f"Unsupported spatial gate type {gate_type!r}.")
+        if not 0.0 <= float(initial_beta) <= 1.0:
+            raise ValueError("initial_beta must lie in [0,1].")
+        self.gate_type = gate_type
+        self.initial_beta = float(initial_beta)
+
+        if gate_type == "none":
+            self.register_parameter("raw_beta", None)
+            self.register_buffer("fixed_beta", None, persistent=False)
+        elif gate_type == "fixed":
+            self.register_parameter("raw_beta", None)
+            self.register_buffer(
+                "fixed_beta",
+                torch.tensor(self.initial_beta, dtype=torch.float32),
+                persistent=True,
+            )
+        else:
+            epsilon = 1.0e-6
+            clipped = min(max(self.initial_beta, epsilon), 1.0 - epsilon)
+            raw = math.log(clipped / (1.0 - clipped))
+            self.raw_beta = nn.Parameter(torch.tensor(raw, dtype=torch.float32))
+            self.register_buffer("fixed_beta", None, persistent=False)
+
+    def beta(self, *, reference: Tensor | None = None) -> Tensor:
+        if self.gate_type == "none":
+            value = torch.tensor(1.0, dtype=torch.float32)
+        elif self.gate_type == "fixed":
+            if self.fixed_beta is None:
+                raise RuntimeError("Fixed spatial beta is missing.")
+            value = self.fixed_beta
+        else:
+            if self.raw_beta is None:
+                raise RuntimeError("Learned spatial beta is missing.")
+            value = torch.sigmoid(self.raw_beta)
+        if reference is not None:
+            value = value.to(device=reference.device, dtype=reference.dtype)
+        return value
+
+    def forward(
+        self,
+        temporal_hidden: Tensor,
+        graph_hidden: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if temporal_hidden.shape != graph_hidden.shape:
+            raise ValueError(
+                "temporal_hidden and graph_hidden must have identical shapes."
+            )
+        beta = self.beta(reference=temporal_hidden)
+        fused = (1.0 - beta) * temporal_hidden + beta * graph_hidden
+        return fused, beta
+
+
 class ContinuousForecaster(nn.Module):
     """Continuous Close forecaster with a swappable temporal backbone."""
 
@@ -719,6 +831,7 @@ class ContinuousForecaster(nn.Module):
         )
         if config.graph.type == "none":
             self.spatial_module: nn.Module = IdentitySpatialModule()
+            self.spatial_gate: SpatialBranchGate | None = None
         else:
             self.spatial_module = SpatialMessagePassing(
                 d_model=config.temporal.d_model,
@@ -728,6 +841,10 @@ class ContinuousForecaster(nn.Module):
                     config.spatial_feedforward_multiplier
                 ),
                 dropout=config.spatial_dropout,
+            )
+            self.spatial_gate = SpatialBranchGate(
+                gate_type=config.spatial_gate_type,
+                initial_beta=config.spatial_gate_initial_beta,
             )
 
         if config.temporal.type == "transformer":
@@ -751,6 +868,17 @@ class ContinuousForecaster(nn.Module):
             self.temporal_backbone.initialise_forecast_head(
                 config.output_head_initialisation
             )
+
+    def spatial_mixing_beta(self) -> Tensor | None:
+        if self.spatial_gate is None:
+            return None
+        return self.spatial_gate.beta()
+
+    def dynamic_graph_alpha(self) -> Tensor | None:
+        method = getattr(self.graph_learner, "dynamic_residual_alpha", None)
+        if method is None:
+            return None
+        return method()
 
     def forward(
         self,
@@ -777,11 +905,19 @@ class ContinuousForecaster(nn.Module):
         )
         graph = self.graph_learner(temporal_hidden)
         if graph.selected is None:
-            spatial_hidden = self.spatial_module(temporal_hidden)
+            graph_spatial_hidden = self.spatial_module(temporal_hidden)
+            spatial_hidden = graph_spatial_hidden
+            spatial_beta = None
         else:
-            spatial_hidden = self.spatial_module(
+            graph_spatial_hidden = self.spatial_module(
                 temporal_hidden,
                 graph.selected,
+            )
+            if self.spatial_gate is None:
+                raise RuntimeError("Graph model is missing its spatial gate.")
+            spatial_hidden, spatial_beta = self.spatial_gate(
+                temporal_hidden,
+                graph_spatial_hidden,
             )
 
         if isinstance(
@@ -798,7 +934,9 @@ class ContinuousForecaster(nn.Module):
             predictions=predictions,
             output_representation=self.config.output_representation,
             temporal_hidden=temporal_hidden,
+            graph_spatial_hidden=graph_spatial_hidden,
             spatial_hidden=spatial_hidden,
+            spatial_beta=spatial_beta,
             graph=graph,
         )
         output.validate(self.config)

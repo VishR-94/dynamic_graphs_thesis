@@ -86,7 +86,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Train the raw/log-change continuous Transformer or ModernTCN "
-            "forecaster with optional fixed/free-static graph mixing."
+            "forecaster with optional fixed, static, dynamic, or "
+            "dynamic-base graph mixing."
         )
     )
     parser.add_argument(
@@ -183,6 +184,14 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Unsupported continuous loss type.")
     if str(training["optimizer"]) not in {"adam", "adamw"}:
         raise ValueError("training.optimizer must be adam or adamw.")
+    if float(training["learning_rate"]) <= 0.0:
+        raise ValueError("training.learning_rate must be positive.")
+    if float(training["graph_learning_rate"]) <= 0.0:
+        raise ValueError("training.graph_learning_rate must be positive.")
+    if int(training["graph_diagnostics_batches_per_epoch"]) < 0:
+        raise ValueError(
+            "training.graph_diagnostics_batches_per_epoch cannot be negative."
+        )
     if str(training["scheduler"]) not in {
         "none",
         "modern_tcn_type3",
@@ -211,25 +220,40 @@ def validate_config(config: Mapping[str, Any]) -> None:
             "Direct cumulative-log-change output currently requires "
             "training.loss.type=cumulative_log_change_mae."
         )
-    if str(model["graph"]["type"]) not in {
+    graph_type = str(model["graph"]["type"])
+    if graph_type not in {
         "none",
         "fixed",
         "free_static",
+        "dynamic",
+        "dynamic_base",
     }:
-        raise ValueError("Unsupported graph type for the first ladder.")
+        raise ValueError("Unsupported graph type for continuous forecasting.")
+
+    spatial = model["spatial"]
+    if str(spatial["gate_type"]) not in {
+        "none",
+        "fixed",
+        "learned_scalar",
+    }:
+        raise ValueError("Unsupported spatial gate type.")
+    initial_beta = float(spatial["initial_beta"])
+    if not 0.0 <= initial_beta <= 1.0:
+        raise ValueError("model.spatial.initial_beta must lie in [0,1].")
+    if graph_type == "none" and str(spatial["gate_type"]) != "none":
+        raise ValueError(
+            "Graph-free models must set model.spatial.gate_type=none."
+        )
 
     graph_regularisation = GraphRegularisationConfig.from_mapping(
         model.get("graph_regularisation")
     )
     if graph_regularisation.graph_temporal_smooth_reg > 0.0:
         raise ValueError(
-            "The current continuous ladder supports static graphs only; "
-            "graph temporal smoothing must remain zero."
+            "The continuous model emits one graph per context window, not "
+            "a graph sequence; graph temporal smoothing must remain zero."
         )
-    if (
-        graph_regularisation.enabled
-        and str(model["graph"]["type"]) != "free_static"
-    ):
+    if graph_regularisation.enabled and graph_type != "free_static":
         raise ValueError(
             "Graph regularisation is supported only for the learned "
             "free-static graph in this ladder."
@@ -307,15 +331,17 @@ def _model_config(
             mtgnn_embedding_dim=16,
             mtgnn_top_k=min(4, num_nodes - 1),
             mtgnn_alpha=3.0,
-            base_graph_type="free_static",
-            gate_type="none",
-            initial_alpha=0.5,
+            base_graph_type=str(graph["base_graph_type"]),
+            gate_type=str(graph["gate_type"]),
+            initial_alpha=float(graph["initial_alpha"]),
         ),
         spatial_num_layers=int(spatial["num_layers"]),
         spatial_feedforward_multiplier=int(
             spatial["feedforward_multiplier"]
         ),
         spatial_dropout=float(spatial["dropout"]),
+        spatial_gate_type=str(spatial["gate_type"]),
+        spatial_gate_initial_beta=float(spatial["initial_beta"]),
         head_dropout=float(model["head_dropout"]),
     )
 
@@ -488,8 +514,40 @@ def _loss_values(
     native = F.l1_loss(predicted_change, true_change)
     return native * float(bps_scale), native
 
+def _trainable_parameter_partition(
+    model: ContinuousForecaster,
+) -> tuple[list[Tensor], list[Tensor]]:
+    """Return disjoint backbone and graph-learner parameter lists.
+
+    Only parameters owned by ``model.graph_learner`` receive the dedicated
+    graph learning rate. Spatial-message-passing parameters and the optional
+    spatial beta gate remain in the backbone group because they transform
+    representations rather than parameterise the adjacency itself.
+    """
+    graph_parameters = [
+        parameter
+        for parameter in model.graph_learner.parameters()
+        if parameter.requires_grad
+    ]
+    graph_ids = {id(parameter) for parameter in graph_parameters}
+    backbone_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in graph_ids
+    ]
+
+    all_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if len(backbone_parameters) + len(graph_parameters) != len(all_parameters):
+        raise AssertionError("Optimizer parameter partition lost parameters.")
+    if {id(parameter) for parameter in backbone_parameters} & graph_ids:
+        raise AssertionError("Optimizer parameter groups overlap.")
+    return backbone_parameters, graph_parameters
+
+
 def _build_optimizer(
-    model: torch.nn.Module,
+    model: ContinuousForecaster,
     config: Mapping[str, Any],
 ) -> torch.optim.Optimizer:
     training = config["training"]
@@ -498,11 +556,46 @@ def _build_optimizer(
         if training["optimizer"] == "adam"
         else torch.optim.AdamW
     )
+    backbone_parameters, graph_parameters = _trainable_parameter_partition(model)
+    backbone_lr = float(training["learning_rate"])
+    graph_lr = float(training["graph_learning_rate"])
+    parameter_groups: list[dict[str, Any]] = [
+        {
+            "params": backbone_parameters,
+            "lr": backbone_lr,
+            "base_lr": backbone_lr,
+            "name": "backbone",
+        }
+    ]
+    if graph_parameters:
+        parameter_groups.append(
+            {
+                "params": graph_parameters,
+                "lr": graph_lr,
+                "base_lr": graph_lr,
+                "name": "graph",
+            }
+        )
     return cls(
-        model.parameters(),
-        lr=float(training["learning_rate"]),
+        parameter_groups,
         weight_decay=float(training["weight_decay"]),
     )
+
+
+def _current_learning_rates(
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, float | None]:
+    values: dict[str, float | None] = {
+        "backbone": None,
+        "graph": None,
+    }
+    for index, group in enumerate(optimizer.param_groups):
+        name = str(group.get("name", "backbone" if index == 0 else f"group_{index}"))
+        if name in values:
+            values[name] = float(group["lr"])
+    if values["backbone"] is None:
+        raise RuntimeError("Optimizer is missing its backbone parameter group.")
+    return values
 
 
 def _adjust_learning_rate(
@@ -510,20 +603,53 @@ def _adjust_learning_rate(
     *,
     config: Mapping[str, Any],
     completed_epoch: int,
-) -> float:
-    training = config["training"]
-    base = float(training["learning_rate"])
-    scheduler = str(training["scheduler"])
+) -> dict[str, float | None]:
+    scheduler = str(config["training"]["scheduler"])
     if scheduler == "none":
-        return float(optimizer.param_groups[0]["lr"])
-    learning_rate = (
-        base
+        return _current_learning_rates(optimizer)
+    multiplier = (
+        1.0
         if completed_epoch < 3
-        else base * (0.9 ** (completed_epoch - 3))
+        else 0.9 ** (completed_epoch - 3)
     )
     for group in optimizer.param_groups:
-        group["lr"] = learning_rate
-    return learning_rate
+        if "base_lr" not in group:
+            raise RuntimeError(
+                "Optimizer parameter group is missing base_lr; cannot preserve "
+                "the backbone-to-graph learning-rate ratio."
+            )
+        group["lr"] = float(group["base_lr"]) * multiplier
+    return _current_learning_rates(optimizer)
+
+
+def _gradient_norm_from_tensors(
+    gradients: Sequence[Tensor | None],
+) -> float:
+    squared = 0.0
+    for gradient in gradients:
+        if gradient is None:
+            continue
+        squared += float(gradient.detach().float().square().sum().item())
+    return squared ** 0.5
+
+
+def _parameter_gradient_norm(parameters: Sequence[Tensor]) -> float:
+    return _gradient_norm_from_tensors(
+        [parameter.grad for parameter in parameters]
+    )
+
+
+def _parameter_update_norm(
+    before: Sequence[Tensor],
+    parameters: Sequence[Tensor],
+) -> float:
+    if len(before) != len(parameters):
+        raise ValueError("Parameter snapshot length differs from parameter list.")
+    squared = 0.0
+    for previous, parameter in zip(before, parameters, strict=True):
+        difference = parameter.detach().float() - previous.float()
+        squared += float(difference.square().sum().item())
+    return squared ** 0.5
 
 
 def _graph_summary(graph: Tensor | None) -> dict[str, float | None]:
@@ -532,15 +658,63 @@ def _graph_summary(graph: Tensor | None) -> dict[str, float | None]:
             "mean_row_entropy": None,
             "mean_effective_neighbours": None,
             "mean_diagonal_weight": None,
+            "maximum_edge_weight": None,
+            "mean_top10_row_mass": None,
         }
     values = graph.detach().float().clamp_min(1.0e-12)
     entropy = -(values * values.log()).sum(dim=-1)
     diagonal = torch.diagonal(values, dim1=-2, dim2=-1)
+    top_k = min(10, int(values.shape[-1]))
+    top10_mass = values.topk(top_k, dim=-1).values.sum(dim=-1)
     return {
         "mean_row_entropy": float(entropy.mean().item()),
         "mean_effective_neighbours": float(entropy.exp().mean().item()),
         "mean_diagonal_weight": float(diagonal.mean().item()),
+        "maximum_edge_weight": float(values.max().item()),
+        "mean_top10_row_mass": float(top10_mass.mean().item()),
     }
+
+
+def _module_gradient_norm(module: torch.nn.Module | None) -> float:
+    if module is None:
+        return 0.0
+    squared = 0.0
+    for parameter in module.parameters():
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        squared += float(gradient.detach().float().square().sum().item())
+    return squared ** 0.5
+
+
+def _scalar_value(value: Tensor | None) -> float | None:
+    if value is None:
+        return None
+    tensor = torch.as_tensor(value).detach().float()
+    if tensor.numel() == 0:
+        return None
+    return float(tensor.mean().item())
+
+
+def _expand_graph_component(
+    graph: Tensor | None,
+    *,
+    batch_size: int,
+) -> Tensor | None:
+    if graph is None:
+        return None
+    values = torch.as_tensor(graph).detach().float().cpu()
+    if values.ndim != 4:
+        raise ValueError(
+            "Graph components must have shape [B,G,N,N] or [1,G,N,N]."
+        )
+    if int(values.shape[0]) == 1 and batch_size > 1:
+        values = values.expand(batch_size, -1, -1, -1)
+    if int(values.shape[0]) != batch_size:
+        raise ValueError(
+            f"Graph batch axis is {int(values.shape[0])}; expected {batch_size}."
+        )
+    return values.contiguous()
 
 
 def _run_train_epoch(
@@ -565,21 +739,43 @@ def _run_train_epoch(
         config["model"]["graph_regularisation"]
     )
     clip_norm = float(config["training"]["gradient_clip_norm"])
+    diagnostics_batch_limit = int(
+        config["training"]["graph_diagnostics_batches_per_epoch"]
+    )
+    _, graph_parameters = _trainable_parameter_partition(model)
+
     optimisation_sum = 0.0
     forecast_optimisation_sum = 0.0
     graph_regularisation_sum = 0.0
     graph_target_entropy_penalty_sum = 0.0
     native_sum = 0.0
     target_count = 0
+
     graph_entropy_sum = 0.0
     graph_effective_sum = 0.0
     graph_diag_sum = 0.0
+    graph_max_edge_sum = 0.0
+    graph_top10_mass_sum = 0.0
     graph_batches = 0
+    spatial_beta_sum = 0.0
+    spatial_beta_batches = 0
+    dynamic_alpha_sum = 0.0
+    dynamic_alpha_batches = 0
+
+    combined_graph_gradient_norm_sum = 0.0
+    combined_graph_gradient_batches = 0
+    forecast_graph_gradient_norm_sum = 0.0
+    regulariser_graph_gradient_norm_sum = 0.0
+    graph_parameter_update_norm_sum = 0.0
+    diagnostic_graph_batches = 0
+    spatial_gate_gradient_norm_sum = 0.0
+    spatial_gate_gradient_batches = 0
+
     synchronise_device(device)
     start = perf_counter()
 
     progress = tqdm(loader, desc=description, leave=False, dynamic_ncols=True)
-    for batch in progress:
+    for batch_index, batch in enumerate(progress):
         x = torch.as_tensor(batch["x"]).to(
             device=device,
             dtype=torch.float32,
@@ -611,12 +807,67 @@ def _run_train_epoch(
         )
         if not torch.isfinite(optimisation_loss):
             raise FloatingPointError("Non-finite training loss.")
+
+        run_diagnostics = (
+            bool(graph_parameters)
+            and batch_index < diagnostics_batch_limit
+        )
+        graph_snapshot: list[Tensor] | None = None
+        if run_diagnostics:
+            forecast_gradients = torch.autograd.grad(
+                forecast_optimisation_loss,
+                graph_parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            if graph_regularisation.total.requires_grad:
+                regulariser_gradients = torch.autograd.grad(
+                    graph_regularisation.total,
+                    graph_parameters,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+            else:
+                regulariser_gradients = tuple(None for _ in graph_parameters)
+            forecast_graph_gradient_norm_sum += _gradient_norm_from_tensors(
+                forecast_gradients
+            )
+            regulariser_graph_gradient_norm_sum += _gradient_norm_from_tensors(
+                regulariser_gradients
+            )
+            graph_snapshot = [
+                parameter.detach().float().clone()
+                for parameter in graph_parameters
+            ]
+
         scaler.scale(optimisation_loss).backward()
+        scaler.unscale_(optimizer)
+
+        if graph_parameters:
+            combined_graph_gradient_norm_sum += _parameter_gradient_norm(
+                graph_parameters
+            )
+            combined_graph_gradient_batches += 1
+        if model.spatial_gate is not None:
+            spatial_gate_gradient_norm_sum += _module_gradient_norm(
+                model.spatial_gate
+            )
+            spatial_gate_gradient_batches += 1
+
         if clip_norm > 0:
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
         scaler.step(optimizer)
         scaler.update()
+
+        if run_diagnostics:
+            if graph_snapshot is None:
+                raise AssertionError("Graph diagnostic snapshot is missing.")
+            graph_parameter_update_norm_sum += _parameter_update_norm(
+                graph_snapshot,
+                graph_parameters,
+            )
+            diagnostic_graph_batches += 1
+
         optimizer.zero_grad(set_to_none=True)
 
         target_key = (
@@ -637,12 +888,23 @@ def _run_train_epoch(
         ) * count
         native_sum += float(native_loss.detach().item()) * count
         target_count += count
+
         summary = _graph_summary(output.graph.selected)
         if summary["mean_row_entropy"] is not None:
             graph_entropy_sum += float(summary["mean_row_entropy"])
             graph_effective_sum += float(summary["mean_effective_neighbours"])
             graph_diag_sum += float(summary["mean_diagonal_weight"])
+            graph_max_edge_sum += float(summary["maximum_edge_weight"])
+            graph_top10_mass_sum += float(summary["mean_top10_row_mass"])
             graph_batches += 1
+        beta_value = _scalar_value(output.spatial_beta)
+        if beta_value is not None:
+            spatial_beta_sum += beta_value
+            spatial_beta_batches += 1
+        alpha_value = _scalar_value(output.graph.alpha)
+        if alpha_value is not None:
+            dynamic_alpha_sum += alpha_value
+            dynamic_alpha_batches += 1
         progress.set_postfix(loss=f"{native_sum / target_count:.6g}")
 
     synchronise_device(device)
@@ -668,6 +930,48 @@ def _run_train_epoch(
         "graph_mean_diagonal_weight": (
             graph_diag_sum / graph_batches if graph_batches else None
         ),
+        "graph_maximum_edge_weight": (
+            graph_max_edge_sum / graph_batches if graph_batches else None
+        ),
+        "graph_mean_top10_row_mass": (
+            graph_top10_mass_sum / graph_batches if graph_batches else None
+        ),
+        "spatial_beta": (
+            spatial_beta_sum / spatial_beta_batches
+            if spatial_beta_batches
+            else None
+        ),
+        "dynamic_alpha": (
+            dynamic_alpha_sum / dynamic_alpha_batches
+            if dynamic_alpha_batches
+            else None
+        ),
+        "graph_combined_gradient_norm": (
+            combined_graph_gradient_norm_sum / combined_graph_gradient_batches
+            if combined_graph_gradient_batches
+            else 0.0
+        ),
+        "graph_forecast_gradient_norm": (
+            forecast_graph_gradient_norm_sum / diagnostic_graph_batches
+            if diagnostic_graph_batches
+            else 0.0
+        ),
+        "graph_regulariser_gradient_norm": (
+            regulariser_graph_gradient_norm_sum / diagnostic_graph_batches
+            if diagnostic_graph_batches
+            else 0.0
+        ),
+        "graph_parameter_update_norm": (
+            graph_parameter_update_norm_sum / diagnostic_graph_batches
+            if diagnostic_graph_batches
+            else 0.0
+        ),
+        "spatial_gate_gradient_norm": (
+            spatial_gate_gradient_norm_sum / spatial_gate_gradient_batches
+            if spatial_gate_gradient_batches
+            else 0.0
+        ),
+        "graph_diagnostic_batches": diagnostic_graph_batches,
         "seconds": perf_counter() - start,
     }
 
@@ -697,7 +1001,11 @@ def _run_validation(
     sample_indices: list[Tensor] = []
     origin_indices: list[Tensor] = []
     target_indices: list[Tensor] = []
-    graphs: list[Tensor] = []
+    selected_graphs: list[Tensor] = []
+    base_graphs: list[Tensor] = []
+    dynamic_graphs: list[Tensor] = []
+    spatial_betas: list[Tensor] = []
+    dynamic_alphas: list[Tensor] = []
     days: list[str] = []
     synchronise_device(device)
     start = perf_counter()
@@ -756,8 +1064,37 @@ def _run_validation(
             target_indices.append(
                 torch.as_tensor(batch["target_indices"]).cpu()
             )
-            if output.graph.selected is not None:
-                graphs.append(output.graph.selected.detach().float().cpu())
+            batch_size = int(raw_prediction.shape[0])
+            selected_component = _expand_graph_component(
+                output.graph.selected,
+                batch_size=batch_size,
+            )
+            base_component = _expand_graph_component(
+                output.graph.base,
+                batch_size=batch_size,
+            )
+            dynamic_component = _expand_graph_component(
+                output.graph.dynamic,
+                batch_size=batch_size,
+            )
+            if selected_component is not None:
+                selected_graphs.append(selected_component)
+            if base_component is not None:
+                base_graphs.append(base_component)
+            if dynamic_component is not None:
+                dynamic_graphs.append(dynamic_component)
+            if output.spatial_beta is not None:
+                spatial_betas.append(
+                    output.spatial_beta.detach().float().cpu().reshape(1)
+                )
+            if output.graph.alpha is not None:
+                dynamic_alphas.append(
+                    torch.as_tensor(output.graph.alpha)
+                    .detach()
+                    .float()
+                    .cpu()
+                    .reshape(-1)
+                )
             batch_days = batch["day"]
             if isinstance(batch_days, (list, tuple)):
                 days.extend(str(value) for value in batch_days)
@@ -808,7 +1145,23 @@ def _run_validation(
                 "the ForecastEvaluator Log MAE. "
                 f"Absolute difference: {loss_metric_abs_difference}."
             )
-    graph_tensor = torch.cat(graphs, dim=0) if graphs else None
+    selected_graph_tensor = (
+        torch.cat(selected_graphs, dim=0) if selected_graphs else None
+    )
+    base_graph_tensor = torch.cat(base_graphs, dim=0) if base_graphs else None
+    dynamic_graph_tensor = (
+        torch.cat(dynamic_graphs, dim=0) if dynamic_graphs else None
+    )
+    spatial_beta_value = (
+        float(torch.cat(spatial_betas).mean().item())
+        if spatial_betas
+        else None
+    )
+    dynamic_alpha_value = (
+        float(torch.cat(dynamic_alphas).mean().item())
+        if dynamic_alphas
+        else None
+    )
     synchronise_device(device)
     return {
         "optimisation_loss": optimisation_sum / target_count,
@@ -818,11 +1171,17 @@ def _run_validation(
         "metric_results": metric_results,
         "metric_table": metric_table,
         "graphs": {
-            "selected": graph_tensor,
+            "selected": selected_graph_tensor,
+            "base": base_graph_tensor,
+            "dynamic": dynamic_graph_tensor,
+            "spatial_beta": spatial_beta_value,
+            "dynamic_alpha": dynamic_alpha_value,
             "dates": days,
             "orientation": "A[target, source]",
         },
-        "graph_summary": _graph_summary(graph_tensor),
+        "graph_summary": _graph_summary(selected_graph_tensor),
+        "spatial_beta": spatial_beta_value,
+        "dynamic_alpha": dynamic_alpha_value,
         "loss_metric_abs_difference": loss_metric_abs_difference,
         "seconds": perf_counter() - start,
     }
@@ -845,15 +1204,24 @@ def _selection_score(validation: Mapping[str, Any], config: Mapping[str, Any]) -
 def _history_record(
     *,
     epoch: int,
-    learning_rate: float,
+    learning_rates: Mapping[str, float | None],
     train_metrics: Mapping[str, Any],
     validation: Mapping[str, Any],
     selection_score: float,
     horizons: Sequence[int],
 ) -> dict[str, Any]:
+    backbone_lr = learning_rates.get("backbone")
+    graph_lr = learning_rates.get("graph")
+    if backbone_lr is None:
+        raise ValueError("Backbone learning rate is missing.")
     record: dict[str, Any] = {
         "epoch": int(epoch),
-        "learning_rate": float(learning_rate),
+        # Backward-compatible alias used by older analysis cells.
+        "learning_rate": float(backbone_lr),
+        "backbone_learning_rate": float(backbone_lr),
+        "graph_learning_rate": (
+            None if graph_lr is None else float(graph_lr)
+        ),
         "training_optimisation_loss": float(
             train_metrics["optimisation_loss"]
         ),
@@ -886,6 +1254,35 @@ def _history_record(
         "graph_mean_diagonal_weight": validation["graph_summary"][
             "mean_diagonal_weight"
         ],
+        "graph_maximum_edge_weight": validation["graph_summary"][
+            "maximum_edge_weight"
+        ],
+        "graph_mean_top10_row_mass": validation["graph_summary"][
+            "mean_top10_row_mass"
+        ],
+        "spatial_beta": validation.get("spatial_beta"),
+        "dynamic_alpha": validation.get("dynamic_alpha"),
+        "training_graph_gradient_norm": float(
+            train_metrics.get("graph_combined_gradient_norm", 0.0)
+        ),
+        "training_graph_combined_gradient_norm": float(
+            train_metrics.get("graph_combined_gradient_norm", 0.0)
+        ),
+        "training_graph_forecast_gradient_norm": float(
+            train_metrics.get("graph_forecast_gradient_norm", 0.0)
+        ),
+        "training_graph_regulariser_gradient_norm": float(
+            train_metrics.get("graph_regulariser_gradient_norm", 0.0)
+        ),
+        "training_graph_parameter_update_norm": float(
+            train_metrics.get("graph_parameter_update_norm", 0.0)
+        ),
+        "training_graph_diagnostic_batches": int(
+            train_metrics.get("graph_diagnostic_batches", 0)
+        ),
+        "training_spatial_gate_gradient_norm": float(
+            train_metrics.get("spatial_gate_gradient_norm", 0.0)
+        ),
     }
     for metric_name, values in validation["metric_results"].items():
         for horizon_index, horizon in enumerate(horizons):
@@ -1056,6 +1453,7 @@ def main() -> None:
         fixed_adjacency=fixed_adjacency,
     ).to(device)
     optimizer = _build_optimizer(model, resolved)
+    backbone_parameters, graph_parameters = _trainable_parameter_partition(model)
     scaler = _new_grad_scaler(use_amp)
 
     project_root = Path(__file__).resolve().parents[2]
@@ -1097,6 +1495,28 @@ def main() -> None:
         ),
         "temporal_backbone": model_config.temporal.type,
         "graph_type": model_config.graph.type,
+        "graph_heads": model_config.graph.num_heads,
+        "graph_hidden_dim": model_config.graph.hidden_dim,
+        "graph_activation": model_config.graph.activation,
+        "graph_gate_type": model_config.graph.gate_type,
+        "graph_initial_alpha": model_config.graph.initial_alpha,
+        "spatial_gate_type": model_config.spatial_gate_type,
+        "spatial_initial_beta": model_config.spatial_gate_initial_beta,
+        "backbone_learning_rate": float(training["learning_rate"]),
+        "graph_learning_rate": (
+            float(training["graph_learning_rate"])
+            if graph_parameters
+            else None
+        ),
+        "trainable_parameters": int(
+            sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+        ),
+        "backbone_trainable_parameters": int(
+            sum(parameter.numel() for parameter in backbone_parameters)
+        ),
+        "graph_trainable_parameters": int(
+            sum(parameter.numel() for parameter in graph_parameters)
+        ),
         "graph_regularisation": dict(
             resolved["model"]["graph_regularisation"]
         ),
@@ -1153,7 +1573,7 @@ def main() -> None:
 
     try:
         for epoch in range(start_epoch, max_epochs + 1):
-            current_lr = float(optimizer.param_groups[0]["lr"])
+            current_learning_rates = _current_learning_rates(optimizer)
             train_metrics = _run_train_epoch(
                 model=model,
                 loader=train_loader,
@@ -1178,7 +1598,7 @@ def main() -> None:
             score = _selection_score(validation, resolved)
             record = _history_record(
                 epoch=epoch,
-                learning_rate=current_lr,
+                learning_rates=current_learning_rates,
                 train_metrics=train_metrics,
                 validation=validation,
                 selection_score=score,
@@ -1213,6 +1633,26 @@ def main() -> None:
                             "loss_metric_abs_difference"
                         ],
                         "graph_summary": validation["graph_summary"],
+                        "spatial_beta": validation.get("spatial_beta"),
+                        "dynamic_alpha": validation.get("dynamic_alpha"),
+                        "backbone_learning_rate": current_learning_rates.get(
+                            "backbone"
+                        ),
+                        "graph_learning_rate": current_learning_rates.get(
+                            "graph"
+                        ),
+                        "graph_combined_gradient_norm": train_metrics.get(
+                            "graph_combined_gradient_norm"
+                        ),
+                        "graph_forecast_gradient_norm": train_metrics.get(
+                            "graph_forecast_gradient_norm"
+                        ),
+                        "graph_regulariser_gradient_norm": train_metrics.get(
+                            "graph_regulariser_gradient_norm"
+                        ),
+                        "graph_parameter_update_norm": train_metrics.get(
+                            "graph_parameter_update_norm"
+                        ),
                     },
                     run_dir / "best_validation_diagnostics.json",
                 )
@@ -1254,11 +1694,18 @@ def main() -> None:
             if wandb_run is not None:
                 wandb_run.log(record, step=epoch)
 
+            graph_lr_text = (
+                "none"
+                if current_learning_rates.get("graph") is None
+                else f"{float(current_learning_rates['graph']):.3g}"
+            )
             print(
                 f"epoch={epoch} train={train_metrics['native_loss']:.6g} "
                 f"val={validation['native_loss']:.6g} "
                 f"selection={score:.6g} best={best_score:.6g} "
-                f"best_epoch={best_epoch}"
+                f"best_epoch={best_epoch} "
+                f"backbone_lr={float(current_learning_rates['backbone']):.3g} "
+                f"graph_lr={graph_lr_text}"
             )
 
             _adjust_learning_rate(
