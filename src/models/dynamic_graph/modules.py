@@ -818,6 +818,12 @@ class GraphNormalizer(nn.Module):
                 "A zero-diagonal graph requires at least two nodes."
             )
 
+        # Graph normalisation is deliberately performed in float32 even
+        # when the temporal backbone is under CUDA autocast. This preserves
+        # row-stochastic probabilities for validation, diagnostics and graph
+        # regularisation while keeping gradients to low-precision logits.
+        logits_float = logits.float()
+
         diagonal_mask = torch.eye(
             num_targets,
             dtype=torch.bool,
@@ -829,13 +835,13 @@ class GraphNormalizer(nn.Module):
             num_targets,
         )
 
-        prepared = logits
+        prepared = logits_float
 
         if not self.add_self_loops:
-            prepared = logits.masked_fill(
+            prepared = logits_float.masked_fill(
                 diagonal_mask,
                 self._mask_value(
-                    logits.dtype
+                    logits_float.dtype
                 ),
             )
 
@@ -871,7 +877,7 @@ class GraphNormalizer(nn.Module):
                 1,
             ).to(
                 device=logits.device,
-                dtype=logits.dtype,
+                dtype=prepared.dtype,
             )
 
             adjacency = torch.sigmoid(
@@ -1090,8 +1096,14 @@ class SpatialMessagePassingLayer(nn.Module):
             )
         )
 
+        # Keep the first-class graph in float32, but use the active value
+        # projection dtype for the mixed-precision aggregation kernel.
+        adjacency_for_values = adjacency.to(
+            device=values.device,
+            dtype=values.dtype,
+        )
         messages = aggregate_graph_values(
-            adjacency,
+            adjacency_for_values,
             values,
         )
 

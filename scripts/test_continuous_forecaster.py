@@ -23,6 +23,7 @@ from src.models.continuous_forecaster import (
     ContinuousTemporalConfig,
 )
 from src.models.dynamic_graph.contracts import GraphConfig
+from src.models.dynamic_graph.graph_learners import FixedGraphLearner
 from src.models.dynamic_graph.losses import (
     GraphRegularisationConfig,
     compute_graph_regularisation,
@@ -456,6 +457,55 @@ def main() -> None:
             "Dedicated graph LR did not materially reduce graph entropy: "
             f"initial={initial_entropy:.6f}, final={final_entropy:.6f}."
         )
+
+    # AMP graph-precision regression: fixed row-stochastic graphs must remain
+    # float32 first-class outputs even when the temporal representation is
+    # low precision. This prevents false stochasticity failures under CUDA AMP.
+    fixed_config = GraphConfig(
+        type="fixed",
+        num_heads=1,
+        hidden_dim=16,
+        activation="softmax",
+        add_self_loops=False,
+        mtgnn_top_k=2,
+        base_graph_type="free_static",
+        gate_type="none",
+        initial_alpha=0.25,
+    )
+    fixed_adjacency = torch.tensor(
+        [
+            [0.0, 0.2, 0.3, 0.5],
+            [0.1, 0.0, 0.6, 0.3],
+            [0.7, 0.2, 0.0, 0.1],
+            [0.25, 0.25, 0.5, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    fixed_learner = FixedGraphLearner(
+        config=fixed_config,
+        num_nodes=4,
+        adjacency=fixed_adjacency,
+    )
+    low_precision_hidden = torch.randn(
+        2,
+        3,
+        4,
+        16,
+        dtype=torch.float16,
+    )
+    fixed_output = fixed_learner(low_precision_hidden)
+    if fixed_output.selected is None:
+        raise AssertionError("Fixed graph output is missing.")
+    if fixed_output.selected.dtype != torch.float32:
+        raise AssertionError(
+            "Fixed graph probabilities must remain float32 under AMP."
+        )
+    torch.testing.assert_close(
+        fixed_output.selected.sum(dim=-1),
+        torch.ones(2, 1, 4),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
 
     # Dynamic graph and dynamic-base graph contracts.
     for graph_type in ("dynamic", "dynamic_base"):

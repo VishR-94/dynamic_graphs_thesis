@@ -836,16 +836,22 @@ class GraphOutput:
                 )
 
             if require_row_stochastic:
-                row_sums = graph.sum(dim=-1)
+                # Graph probabilities should normally remain float32 under
+                # AMP, but accumulate the contract check in float32 as a
+                # final safeguard against low-precision reductions.
+                row_sums = graph.float().sum(dim=-1)
+                row_deviation = (row_sums - 1.0).abs()
+                maximum_deviation = float(
+                    row_deviation.max().item()
+                )
 
-                if not torch.allclose(
-                    row_sums,
-                    torch.ones_like(row_sums),
-                    atol=atol,
-                    rtol=0.0,
-                ):
+                if maximum_deviation > float(atol):
                     raise ValueError(
-                        f"{name} is not row-stochastic."
+                        f"{name} is not row-stochastic: "
+                        f"maximum row-sum deviation="
+                        f"{maximum_deviation:.6g}, "
+                        f"tolerance={float(atol):.6g}, "
+                        f"dtype={graph.dtype}."
                     )
 
         validate_graph(

@@ -390,9 +390,12 @@ class FixedGraphLearner(nn.Module):
             num_nodes=self.num_nodes,
         )
 
+        # Keep graph probabilities in float32 under AMP. Casting a
+        # row-normalised adjacency to float16 before contract validation can
+        # perturb row sums beyond the strict stochasticity tolerance.
         base = self.singleton_adjacency().to(
             device=context_hidden.device,
-            dtype=context_hidden.dtype,
+            dtype=torch.float32,
         )
         logits = _normalisation_logits_from_adjacency(base)
 
@@ -1328,11 +1331,15 @@ class BaseDyGraphDynamicBaseGraphLearner(nn.Module):
             context_hidden
         )
 
+        # Graph probabilities and convex graph mixtures stay in float32
+        # under AMP. The local spatial aggregation casts the validated graph
+        # to the value-projection dtype only for the einsum.
+        dynamic_logits_float = dynamic_logits.float()
         base_adjacency_singleton = (
             self.singleton_base_adjacency()
             .to(
                 device=dynamic_logits.device,
-                dtype=dynamic_logits.dtype,
+                dtype=torch.float32,
             )
         )
 
@@ -1347,7 +1354,7 @@ class BaseDyGraphDynamicBaseGraphLearner(nn.Module):
                 self.singleton_base_logits()
                 .to(
                     device=dynamic_logits.device,
-                    dtype=dynamic_logits.dtype,
+                    dtype=torch.float32,
                 )
             )
 
@@ -1357,7 +1364,7 @@ class BaseDyGraphDynamicBaseGraphLearner(nn.Module):
         )
         full_logits = (
             base_logits
-            + dynamic_logits
+            + dynamic_logits_float
         )
 
         base_adjacency = _expand_singleton_graph(
@@ -1374,7 +1381,7 @@ class BaseDyGraphDynamicBaseGraphLearner(nn.Module):
             selected = full_dynamic_adjacency
         else:
             alpha_view = self._alpha_view(
-                full_logits
+                full_dynamic_adjacency
             )
             selected = (
                 (1.0 - alpha_view)

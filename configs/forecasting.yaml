@@ -15,7 +15,11 @@ forecasting:
     - 60
 
   input_channels:
+    - open
+    - high
+    - low
     - close
+    - volume
 
   target_channels:
     - close
@@ -66,7 +70,7 @@ models:
     temporal_encoding:
       enabled: False
 
-    variable_layout: per_asset
+    variable_layout: joint
     revin: false
     revin_affine: false
     subtract_last: false
