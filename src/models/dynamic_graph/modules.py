@@ -263,6 +263,90 @@ class HierarchicalTokenEmbedding(nn.Module):
         )
 
 
+class CloseScaleFeatureEmbedding(nn.Module):
+    """Project causal Close level/volatility features into model space.
+
+    Input statistics are the context-only Kronos normalisation values saved
+    in the origin-aligned cache:
+
+        context_mean/context_std: [B, N, 6]
+
+    The raw two-vector is:
+
+        log(mean_close)
+        log(std_close / mean_close + eps)
+
+    It is standardised with training-only global statistics supplied by the
+    runner, then projected to ``output_dim``.
+    """
+
+    CLOSE_CHANNEL_INDEX = 3
+
+    def __init__(
+        self,
+        *,
+        output_dim: int,
+        center: Tensor,
+        scale: Tensor,
+        eps: float,
+    ) -> None:
+        super().__init__()
+        if int(output_dim) <= 0:
+            raise ValueError("output_dim must be positive.")
+        if not float(eps) > 0.0:
+            raise ValueError("eps must be positive.")
+        center_values = torch.as_tensor(center, dtype=torch.float32).reshape(-1)
+        scale_values = torch.as_tensor(scale, dtype=torch.float32).reshape(-1)
+        if tuple(center_values.shape) != (2,) or tuple(scale_values.shape) != (2,):
+            raise ValueError("Scale-feature center/scale must each have shape [2].")
+        if not torch.isfinite(center_values).all():
+            raise ValueError("Scale-feature center contains non-finite values.")
+        if not torch.isfinite(scale_values).all() or torch.any(scale_values <= 0):
+            raise ValueError("Scale-feature scale must be finite and positive.")
+
+        self.output_dim = int(output_dim)
+        self.eps = float(eps)
+        self.register_buffer("feature_center", center_values.contiguous())
+        self.register_buffer("feature_scale", scale_values.contiguous())
+        self.projection = nn.Linear(2, self.output_dim)
+        nn.init.normal_(self.projection.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.projection.bias)
+
+    def raw_features(
+        self,
+        context_mean: Tensor,
+        context_std: Tensor,
+    ) -> Tensor:
+        mean = torch.as_tensor(context_mean)
+        std = torch.as_tensor(context_std)
+        if mean.ndim != 3 or std.ndim != 3 or mean.shape != std.shape:
+            raise ValueError(
+                "context_mean/context_std must have identical [B, N, 6] shapes."
+            )
+        if int(mean.shape[-1]) != 6:
+            raise ValueError("Close scale features require six OHLCVA statistics.")
+        if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+            raise ValueError("Context statistics contain non-finite values.")
+        close_mean = mean[..., self.CLOSE_CHANNEL_INDEX].float().clamp_min(self.eps)
+        close_std = std[..., self.CLOSE_CHANNEL_INDEX].float().clamp_min(0.0)
+        level = torch.log(close_mean)
+        relative_volatility = torch.log(
+            (close_std / close_mean).clamp_min(self.eps)
+        )
+        return torch.stack((level, relative_volatility), dim=-1)
+
+    def forward(
+        self,
+        context_mean: Tensor,
+        context_std: Tensor,
+    ) -> Tensor:
+        features = self.raw_features(context_mean, context_std)
+        center = self.feature_center.to(device=features.device)
+        scale = self.feature_scale.to(device=features.device)
+        standardised = (features - center) / scale
+        return self.projection(standardised.to(dtype=self.projection.weight.dtype))
+
+
 class IdentityTemporalEncoder(nn.Module):
     """No-op temporal encoder with the shared ``[B,T,N,D]`` contract."""
 

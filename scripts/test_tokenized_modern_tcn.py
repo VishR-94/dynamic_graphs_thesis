@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """CPU contracts for the final coarse-token ModernTCN graph experiment."""
 
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from src.models.dynamic_graph.contracts import (
+    CloseScaleFeatureConfig,
     DynamicGraphModelConfig,
     ForecastHeadConfig,
     FuturePredictorConfig,
@@ -26,7 +28,9 @@ from src.models.dynamic_graph.modern_tcn_token import (
 from src.models.dynamic_graph.model import DynamicGraphTokenForecaster
 import src.training.run_dynamic_graph as token_runner
 from src.training.run_dynamic_graph import (
+    _raw_close_scale_features,
     average_decoded_paths,
+    fit_close_scale_feature_standardisation,
     generate_validation_artifacts,
 )
 
@@ -136,6 +140,220 @@ def _config() -> DynamicGraphModelConfig:
 
 
 
+
+def _embedded_config(
+    *,
+    temporal_type: str = "modern_tcn",
+    graph_type: str = "dynamic",
+    num_st_blocks: int = 1,
+    scale_features: bool = False,
+) -> DynamicGraphModelConfig:
+    temporal = TemporalConfig(
+        type=temporal_type,
+        num_layers=1,
+        num_heads=2,
+        feedforward_multiplier=2,
+        dropout=0.0,
+        modern_tcn_patch_size=4,
+        modern_tcn_patch_stride=2,
+        modern_tcn_ffn_ratio=1,
+        modern_tcn_num_blocks=1,
+        modern_tcn_large_kernel=3,
+        modern_tcn_small_kernel=3,
+        modern_tcn_dropout=0.0,
+    )
+    return DynamicGraphModelConfig(
+        num_nodes=4,
+        context_length=8,
+        d_model=8,
+        num_st_blocks=num_st_blocks,
+        use_node_embedding=True,
+        token_input_representation="hierarchical_embedding",
+        temporal=temporal,
+        graph=GraphConfig(
+            type=graph_type,
+            num_heads=1,
+            hidden_dim=4,
+            activation="softmax",
+            add_self_loops=False,
+            mtgnn_top_k=3,
+            base_graph_type="free_static",
+            gate_type="none",
+            initial_alpha=0.5,
+        ),
+        spatial=SpatialConfig(
+            num_layers=1,
+            feedforward_multiplier=2,
+            dropout=0.0,
+            gate_type="learned_scalar",
+            initial_beta=0.5,
+        ),
+        close_scale_features=CloseScaleFeatureConfig(
+            enabled=scale_features,
+            eps=1.0e-6,
+        ),
+        heads=ForecastHeadConfig(
+            prediction_length=6,
+            evaluation_horizons=(1, 3, 6),
+            s1_vocabulary_size=1024,
+            s2_vocabulary_size=1024,
+            s2_loss_weight=0.0,
+            future_token_mode="coarse_only",
+            s2_conditioning="true_s1",
+        ),
+        future_predictor=FuturePredictorConfig(
+            type="structured_parallel",
+            num_layers=1,
+            num_heads=2,
+            feedforward_multiplier=2,
+            dropout=0.0,
+        ),
+    )
+
+
+def test_hierarchical_embedding_modern_tcn_contract() -> None:
+    torch.manual_seed(21)
+    config = _embedded_config()
+    model = DynamicGraphTokenForecaster(
+        config,
+        modern_tcn_model_cls=_FakeOfficialModernTCN,
+    )
+    context = torch.randint(
+        0,
+        1024,
+        (2, config.context_length, config.num_nodes, 2),
+    )
+    target_s1 = torch.randint(
+        0,
+        1024,
+        (2, config.prediction_length, config.num_nodes),
+    )
+    output = model(context, target_s1=target_s1)
+    output.validate(config, batch_size=2)
+    assert tuple(output.temporal_hidden.shape) == (2, 4, 4, 8)
+    assert model.token_embedding is not None
+    assert model.modern_tcn_encoder is not None
+    assert model.modern_tcn_encoder.num_token_variables == config.d_model
+
+    loss = F.cross_entropy(
+        output.s1_logits.reshape(-1, 1024),
+        target_s1.reshape(-1),
+    )
+    loss.backward()
+    for name, parameter in {
+        "s1 embedding": model.token_embedding.s1_embedding.weight,
+        "s2 embedding": model.token_embedding.s2_embedding.weight,
+        "node embedding": model.token_embedding.node_embedding.weight,
+        "position embedding": model.token_embedding.position_embedding.weight,
+        "ModernTCN stem": model.modern_tcn_encoder.official_model.model.stem.weight,
+    }.items():
+        if parameter.grad is None or not torch.isfinite(parameter.grad).all():
+            raise AssertionError(f"{name} received no finite gradient.")
+        if parameter.grad.abs().sum().item() == 0.0:
+            raise AssertionError(f"{name} received only zero gradients.")
+
+
+def test_three_interlaced_transformer_blocks() -> None:
+    torch.manual_seed(22)
+    config = _embedded_config(
+        temporal_type="transformer",
+        graph_type="dynamic",
+        num_st_blocks=3,
+    )
+    model = DynamicGraphTokenForecaster(config)
+    context = torch.randint(
+        0, 1024, (2, config.context_length, config.num_nodes, 2)
+    )
+    target_s1 = torch.randint(
+        0, 1024, (2, config.prediction_length, config.num_nodes)
+    )
+    output = model(context, target_s1=target_s1)
+    output.validate(config, batch_size=2)
+    assert len(model.temporal_blocks) == 3
+    assert len(model.graph_learners) == 3
+    assert len(model.spatial_blocks) == 3
+    assert len(model.spatial_gates) == 3
+    assert len(output.graph.per_layer) == 3
+    assert all(graph is not None for graph in output.graph.per_layer)
+
+
+class _ScaleDataset:
+    data_mode = "real"
+
+    def __init__(self) -> None:
+        means = torch.ones(3, 4, 6)
+        stds = torch.ones(3, 4, 6)
+        means[..., 3] = torch.tensor(
+            [100.0, 200.0, 400.0, 800.0]
+        ).view(1, 4).expand(3, -1)
+        stds[..., 3] = means[..., 3] * torch.tensor(
+            [0.001, 0.002, 0.004]
+        ).view(3, 1)
+        self.cache = {"context_mean": means, "context_std": stds}
+
+
+def test_close_scale_feature_contract() -> None:
+    dataset = _ScaleDataset()
+    center, scale, metadata = fit_close_scale_feature_standardisation(
+        dataset, eps=1.0e-6
+    )
+    assert tuple(center.shape) == (2,)
+    assert tuple(scale.shape) == (2,)
+    assert torch.isfinite(center).all()
+    assert torch.isfinite(scale).all() and torch.all(scale > 0)
+    assert metadata["fit_split"] == "training windows only"
+
+    torch.manual_seed(23)
+    config = _embedded_config(
+        temporal_type="transformer",
+        graph_type="free_static",
+        num_st_blocks=1,
+        scale_features=True,
+    )
+    model = DynamicGraphTokenForecaster(
+        config,
+        close_scale_feature_center=center,
+        close_scale_feature_scale=scale,
+    )
+    context = torch.randint(
+        0, 1024, (2, config.context_length, config.num_nodes, 2)
+    )
+    target_s1 = torch.randint(
+        0, 1024, (2, config.prediction_length, config.num_nodes)
+    )
+    means = dataset.cache["context_mean"][:2]
+    stds = dataset.cache["context_std"][:2]
+    output = model(
+        context,
+        target_s1=target_s1,
+        context_mean=means,
+        context_std=stds,
+    )
+    loss = F.cross_entropy(
+        output.s1_logits.reshape(-1, 1024),
+        target_s1.reshape(-1),
+    )
+    loss.backward()
+    if model.close_scale_embedding is None:
+        raise AssertionError("Scale embedding was not constructed.")
+    gradient = model.close_scale_embedding.projection.weight.grad
+    if gradient is None or not torch.isfinite(gradient).all():
+        raise AssertionError("Scale projection received no finite gradient.")
+    if gradient.abs().sum().item() == 0.0:
+        raise AssertionError("Scale projection received only zero gradients.")
+
+    with torch.inference_mode():
+        shifted = means.clone()
+        shifted[..., 3] *= 2.0
+        changed = model(
+            context,
+            target_s1=target_s1,
+            context_mean=shifted,
+            context_std=stds,
+        )
+    if torch.equal(output.s1_logits.detach(), changed.s1_logits):
+        raise AssertionError("Changing Close scale features changed no logits.")
+
 def test_runner_json_loader_contract() -> None:
     """Inference-only modes can reload an existing run metadata file."""
 
@@ -216,6 +434,33 @@ def test_evaluation_signature_allows_code_only_commit_change() -> None:
             **resolved_config,
             "temperature_sweep": {"temperatures": [0.3, 0.8]},
         }
+        explicitly_disabled_scale = {
+            **resolved_config,
+            "models": {
+                "dynamic_graph": {
+                    "d_model": 32,
+                    "close_scale_features": {
+                        "enabled": False,
+                        "eps": 1.0e-6,
+                    },
+                }
+            },
+        }
+        disabled_scale_payload = token_runner._evaluation_compatibility_payload(
+            resolved_config=explicitly_disabled_scale,
+            train_cache="/cache/train.pt",
+            validation_cache="/cache/val.pt",
+            data_mode="real",
+            asset_cols=("A", "B"),
+            train_windows=3,
+            validation_windows=2,
+            fixed_graph_resource_hash=None,
+            s1_id_space="kronos_original",
+            s1_vocabulary_size=1024,
+            s1_remapping_resource_hash=None,
+        )
+        assert token_runner._config_signature(disabled_scale_payload) == expected
+
         changed_payload = token_runner._evaluation_compatibility_payload(
             resolved_config=changed_temperature_config,
             train_cache="/cache/train.pt",
@@ -344,6 +589,16 @@ def test_final_preset_uses_validation_ce_selection() -> None:
     assert decoding["token_selection"] == "argmax"
     assert int(decoding["sample_count"]) == 1
     assert int(temperature_sweep["sample_count"]) == 10
+
+    embedded = payload["presets"]["hierarchical_embedding_coarse_ce"]
+    embedded_model = embedded["models"]["dynamic_graph"]
+    assert embedded_model["token_input_representation"] == (
+        "hierarchical_embedding"
+    )
+    assert embedded_model["future_predictor"]["num_layers"] == 1
+    assert embedded["training"]["early_stopping_metric"] == (
+        "validation_token_loss"
+    )
 
     runner_source = (
         repo_root
@@ -647,6 +902,7 @@ def test_ten_path_decode_then_average_contract() -> None:
     assert bundle.diagnostics["sample_count"] == 10
     assert tuple(bundle.graph_artifacts["spatial_beta"].shape) == (2, 1)
 
+
 def main() -> None:
     test_runner_json_loader_contract()
     test_evaluation_signature_allows_code_only_commit_change()
@@ -654,6 +910,9 @@ def main() -> None:
     test_final_preset_uses_validation_ce_selection()
     test_post_bsq_code_contract()
     test_model_shapes_gradients_and_sampling()
+    test_hierarchical_embedding_modern_tcn_contract()
+    test_three_interlaced_transformer_blocks()
+    test_close_scale_feature_contract()
     test_decoded_continuous_average()
     test_ten_path_decode_then_average_contract()
     print("Tokenized ModernTCN graph contract tests passed.")

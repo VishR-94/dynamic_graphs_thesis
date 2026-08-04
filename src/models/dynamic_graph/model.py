@@ -31,6 +31,7 @@ from .graph_learners import (
     build_graph_learner,
 )
 from .modules import (
+    CloseScaleFeatureEmbedding,
     HierarchicalTokenEmbedding,
     IdentitySpatialModule,
     SpatialMessagePassing,
@@ -248,6 +249,8 @@ class DynamicGraphTokenForecaster(nn.Module):
         correlation_empty_row_policy: EmptyCorrelationRowPolicy = "error",
         oracle_graph: Tensor | None = None,
         modern_tcn_model_cls: type[nn.Module] | None = None,
+        close_scale_feature_center: Tensor | None = None,
+        close_scale_feature_scale: Tensor | None = None,
     ) -> None:
         super().__init__()
         config.validate()
@@ -268,8 +271,13 @@ class DynamicGraphTokenForecaster(nn.Module):
         )
         self._stored_oracle_graph = oracle_graph
 
+        self.token_embedding: HierarchicalTokenEmbedding | None = (
+            HierarchicalTokenEmbedding(config)
+            if config.token_input_representation == "hierarchical_embedding"
+            else None
+        )
+
         if config.temporal.type == "modern_tcn":
-            self.token_embedding: HierarchicalTokenEmbedding | None = None
             self.modern_tcn_encoder: ModernTCNTokenEncoder | None = (
                 ModernTCNTokenEncoder(
                     config,
@@ -278,7 +286,11 @@ class DynamicGraphTokenForecaster(nn.Module):
             )
             self.temporal_blocks = nn.ModuleList()
         else:
-            self.token_embedding = HierarchicalTokenEmbedding(config)
+            if self.token_embedding is None:
+                raise ValueError(
+                    "Non-ModernTCN token encoders require "
+                    "hierarchical_embedding input."
+                )
             self.modern_tcn_encoder = None
             self.temporal_blocks = nn.ModuleList(
                 [
@@ -289,6 +301,42 @@ class DynamicGraphTokenForecaster(nn.Module):
                     for _ in range(config.num_st_blocks)
                 ]
             )
+
+        if config.close_scale_features.enabled:
+            if (
+                close_scale_feature_center is None
+                or close_scale_feature_scale is None
+            ):
+                raise ValueError(
+                    "Enabled Close scale features require training-only "
+                    "center and scale statistics."
+                )
+            scale_output_dim = (
+                20
+                if (
+                    config.temporal.type == "modern_tcn"
+                    and config.token_input_representation == "bsq_bits"
+                )
+                else config.d_model
+            )
+            self.close_scale_embedding: CloseScaleFeatureEmbedding | None = (
+                CloseScaleFeatureEmbedding(
+                    output_dim=scale_output_dim,
+                    center=close_scale_feature_center,
+                    scale=close_scale_feature_scale,
+                    eps=config.close_scale_features.eps,
+                )
+            )
+        else:
+            if (
+                close_scale_feature_center is not None
+                or close_scale_feature_scale is not None
+            ):
+                raise ValueError(
+                    "Scale-feature statistics were supplied while the "
+                    "feature is disabled."
+                )
+            self.close_scale_embedding = None
 
         self.graph_learners = nn.ModuleList()
         self.spatial_blocks = nn.ModuleList()
@@ -341,6 +389,8 @@ class DynamicGraphTokenForecaster(nn.Module):
         correlation_empty_row_policy: EmptyCorrelationRowPolicy = "error",
         oracle_graph: Tensor | None = None,
         modern_tcn_model_cls: type[nn.Module] | None = None,
+        close_scale_feature_center: Tensor | None = None,
+        close_scale_feature_scale: Tensor | None = None,
     ) -> "DynamicGraphTokenForecaster":
         """Build the model from a resolved dynamic-graph config."""
         return cls(
@@ -355,6 +405,8 @@ class DynamicGraphTokenForecaster(nn.Module):
             ),
             oracle_graph=oracle_graph,
             modern_tcn_model_cls=modern_tcn_model_cls,
+            close_scale_feature_center=close_scale_feature_center,
+            close_scale_feature_scale=close_scale_feature_scale,
         )
 
     def _validate_graph_resources(
@@ -503,6 +555,8 @@ class DynamicGraphTokenForecaster(nn.Module):
         self,
         token_ids: Tensor,
         *,
+        context_mean: Tensor | None = None,
+        context_std: Tensor | None = None,
         oracle_graph: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, GraphOutput, Tensor | None]:
         """Encode observed tokens and expose the graphs used by the model.
@@ -517,13 +571,52 @@ class DynamicGraphTokenForecaster(nn.Module):
             graph_output:
                 Final selected graph plus every block-level selected graph.
         """
+        scale_addition: Tensor | None = None
+        if self.close_scale_embedding is not None:
+            if context_mean is None or context_std is None:
+                raise ValueError(
+                    "Enabled Close scale features require context_mean and "
+                    "context_std for every forward/generation call."
+                )
+            scale_addition = self.close_scale_embedding(
+                context_mean,
+                context_std,
+            )
+        elif context_mean is not None or context_std is not None:
+            # The runner may always forward context statistics.  Ignore them
+            # when the ablation is disabled to preserve old model behaviour.
+            pass
+
         if self.modern_tcn_encoder is not None:
-            hidden = self.modern_tcn_encoder(token_ids)
+            embedded_features = (
+                None
+                if self.token_embedding is None
+                else self.token_embedding(token_ids)
+            )
+            modern_tcn_scale = None
+            if scale_addition is not None:
+                if embedded_features is None:
+                    modern_tcn_scale = scale_addition
+                else:
+                    embedded_features = embedded_features + scale_addition.to(
+                        device=embedded_features.device,
+                        dtype=embedded_features.dtype,
+                    ).unsqueeze(1)
+            hidden = self.modern_tcn_encoder(
+                token_ids,
+                embedded_features=embedded_features,
+                scale_addition=modern_tcn_scale,
+            )
             temporal_sequence = (hidden,)
         else:
             if self.token_embedding is None:
                 raise RuntimeError("Hierarchical token embedding is missing.")
             hidden = self.token_embedding(token_ids)
+            if scale_addition is not None:
+                hidden = hidden + scale_addition.to(
+                    device=hidden.device,
+                    dtype=hidden.dtype,
+                ).unsqueeze(1)
             temporal_sequence = tuple(self.temporal_blocks)
 
         per_layer_graphs: list[Tensor | None] = []
@@ -657,6 +750,8 @@ class DynamicGraphTokenForecaster(nn.Module):
         *,
         target_s1: Tensor | None = None,
         target_s2: Tensor | None = None,
+        context_mean: Tensor | None = None,
+        context_std: Tensor | None = None,
         oracle_graph: Tensor | None = None,
         token_selection: TokenSelection = "argmax",
         temperature: float = 1.0,
@@ -683,6 +778,8 @@ class DynamicGraphTokenForecaster(nn.Module):
             spatial_beta,
         ) = self._encode_context(
             token_ids,
+            context_mean=context_mean,
+            context_std=context_std,
             oracle_graph=oracle_graph,
         )
 
@@ -728,6 +825,8 @@ class DynamicGraphTokenForecaster(nn.Module):
         token_ids: Tensor,
         *,
         sample_count: int,
+        context_mean: Tensor | None = None,
+        context_std: Tensor | None = None,
         oracle_graph: Tensor | None = None,
         token_selection: TokenSelection = "sample",
         temperature: float = 1.0,
@@ -761,7 +860,12 @@ class DynamicGraphTokenForecaster(nn.Module):
             context_hidden,
             graph_output,
             spatial_beta,
-        ) = self._encode_context(token_ids, oracle_graph=oracle_graph)
+        ) = self._encode_context(
+            token_ids,
+            context_mean=context_mean,
+            context_std=context_std,
+            oracle_graph=oracle_graph,
+        )
 
         prediction = self.future_predictor.generate(
             context_memory,
@@ -810,6 +914,8 @@ class DynamicGraphTokenForecaster(nn.Module):
         self,
         token_ids: Tensor,
         *,
+        context_mean: Tensor | None = None,
+        context_std: Tensor | None = None,
         oracle_graph: Tensor | None = None,
         token_selection: TokenSelection = "argmax",
         temperature: float = 1.0,
@@ -824,6 +930,8 @@ class DynamicGraphTokenForecaster(nn.Module):
             spatial_beta,
         ) = self._encode_context(
             token_ids,
+            context_mean=context_mean,
+            context_std=context_std,
             oracle_graph=oracle_graph,
         )
 

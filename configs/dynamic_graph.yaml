@@ -85,6 +85,9 @@ models:
       dropout: 0.0
       gate_type: none
       initial_beta: 1.0
+    close_scale_features:
+      enabled: false
+      eps: 1.0e-6
     heads:
       prediction_length: 60
       evaluation_horizons:
@@ -172,6 +175,63 @@ temperature_sweep:
   top_p: 0.9
   seed: 42
 presets:
+  hierarchical_embedding_coarse_ce:
+    models:
+      dynamic_graph:
+        use_node_embedding: true
+        token_input_representation: hierarchical_embedding
+        close_scale_features:
+          enabled: false
+          eps: 1.0e-6
+        heads:
+          prediction_length: 60
+          evaluation_horizons: [1, 5, 15, 30, 60]
+          s1_vocabulary_size: 1024
+          s2_vocabulary_size: 1024
+          s2_loss_weight: 0.0
+          future_token_mode: coarse_only
+          s2_conditioning: true_s1
+        future_predictor:
+          type: structured_parallel
+          num_layers: 1
+          num_heads: 4
+          feedforward_multiplier: 2
+          dropout: 0.0
+        loss:
+          horizon_weighting: uniform
+        graph_regularisation:
+          graph_reg_layer: -1
+          graph_reg_warmup_epochs: 0
+          graph_entropy_reg: 0.0
+          graph_target_entropy: null
+          graph_target_entropy_reg: 0.0
+          graph_temporal_smooth_reg: 0.0
+        backcast:
+          enabled: false
+          loss_weight: 0.0
+          num_channels: 5
+    training:
+      optimizer: adam
+      scheduler: modern_tcn_type3
+      learning_rate: 0.0001
+      graph_learning_rate: 0.0005
+      weight_decay: 0.0
+      batch_size: 2
+      num_workers: 0
+      max_epochs: 100
+      patience: 10
+      seed: 42
+      gradient_clip_norm: 1.0
+      mixed_precision: true
+      early_stopping_metric: validation_token_loss
+      early_stopping_horizons: [1, 5, 15, 30, 60]
+    decoding:
+      token_selection: argmax
+      temperature: 1.0
+      top_k: 0
+      top_p: 1.0
+      sample_count: 1
+
   modern_tcn_dynamic_coarse_mc10:
     models:
       dynamic_graph:

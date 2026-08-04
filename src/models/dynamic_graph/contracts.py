@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Literal, Mapping, Sequence
 
 import torch
@@ -137,8 +138,10 @@ class TemporalConfig:
     kernel_size: int = 3
     dilations: tuple[int, ...] = (1, 2, 4)
 
-    # Official per-asset ModernTCN options. The token path uses the
-    # post-BSQ 20-bit code as the ModernTCN variable axis.
+    # Official per-asset ModernTCN options.  Depending on
+    # token_input_representation, the variable axis is either the exact
+    # 20-dimensional post-BSQ code or the learned D-dimensional hierarchical
+    # token embedding.
     modern_tcn_patch_size: int = 8
     modern_tcn_patch_stride: int = 4
     modern_tcn_ffn_ratio: int = 1
@@ -301,6 +304,33 @@ class SpatialConfig:
         if graph_type == "none" and self.gate_type != "none":
             raise ValueError(
                 "Graph-free token models must use spatial.gate_type='none'."
+            )
+
+
+@dataclass(frozen=True)
+class CloseScaleFeatureConfig:
+    """Optional causal Close-level and relative-volatility features.
+
+    The two raw features are calculated from the observed 60-minute context
+    only:
+
+        log(context mean Close)
+        log(context std Close / context mean Close + eps)
+
+    The training runner standardises them using statistics fitted over the
+    training windows/assets only.  The resulting two-vector is projected and
+    added once before the first temporal module.
+    """
+
+    enabled: bool = False
+    eps: float = 1.0e-6
+
+    def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("close_scale_features.enabled must be boolean.")
+        if not math.isfinite(float(self.eps)) or float(self.eps) <= 0.0:
+            raise ValueError(
+                "close_scale_features.eps must be finite and positive."
             )
 
 
@@ -767,6 +797,9 @@ class DynamicGraphModelConfig:
     spatial: SpatialConfig = field(
         default_factory=SpatialConfig
     )
+    close_scale_features: CloseScaleFeatureConfig = field(
+        default_factory=CloseScaleFeatureConfig
+    )
     heads: ForecastHeadConfig = field(
         default_factory=ForecastHeadConfig
     )
@@ -815,20 +848,18 @@ class DynamicGraphModelConfig:
         )
 
         if self.temporal.type == "modern_tcn":
-            if self.token_input_representation != "bsq_bits":
-                raise ValueError(
-                    "The token ModernTCN path requires the exact post-BSQ "
-                    "20-bit input representation."
-                )
             if self.num_st_blocks != 1:
                 raise ValueError(
-                    "The selected token ModernTCN architecture uses one "
+                    "The token ModernTCN architecture supports exactly one "
                     "temporal/graph/spatial block."
                 )
-            if self.use_node_embedding:
+            if (
+                self.token_input_representation == "bsq_bits"
+                and self.use_node_embedding
+            ):
                 raise ValueError(
-                    "The selected token ModernTCN path does not add a node "
-                    "embedding before the per-asset backbone."
+                    "The exact post-BSQ ModernTCN control must not add a "
+                    "node embedding before the per-asset backbone."
                 )
 
         self.graph.validate(
@@ -839,6 +870,8 @@ class DynamicGraphModelConfig:
         self.spatial.validate(
             graph_type=self.graph.type,
         )
+
+        self.close_scale_features.validate()
 
         self.heads.validate()
 

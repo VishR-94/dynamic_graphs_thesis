@@ -948,6 +948,26 @@ def _normalise_evaluation_config(
 
     normalised = deepcopy(dict(resolved_config))
     normalised.pop("temperature_sweep", None)
+
+    # Backward compatibility for checkpoints trained before the optional
+    # Close scale-feature block existed.  A disabled block has no parameters
+    # and cannot affect the forward path, so missing and explicitly disabled
+    # configurations are evaluation-equivalent.  Enabled scale features remain
+    # part of the compatibility signature.
+    models = normalised.get("models")
+    if isinstance(models, Mapping):
+        dynamic_model = models.get("dynamic_graph")
+        if isinstance(dynamic_model, Mapping):
+            scale_config = dynamic_model.get("close_scale_features")
+            if (
+                scale_config is None
+                or (
+                    isinstance(scale_config, Mapping)
+                    and not bool(scale_config.get("enabled", False))
+                )
+            ):
+                dynamic_model.pop("close_scale_features", None)
+
     return normalised
 
 
@@ -1129,6 +1149,101 @@ def move_training_batch(
             non_blocking=True,
         ),
     )
+
+
+def move_context_statistics(
+    batch: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> tuple[Tensor | None, Tensor | None]:
+    """Move optional context-only OHLCVA statistics to the model device."""
+    mean = batch.get("context_mean")
+    std = batch.get("context_std")
+    if mean is None and std is None:
+        return None, None
+    if mean is None or std is None:
+        raise KeyError(
+            "context_mean and context_std must either both be present or "
+            "both be absent."
+        )
+    return (
+        torch.as_tensor(mean).to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=True,
+        ),
+        torch.as_tensor(std).to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=True,
+        ),
+    )
+
+
+def _raw_close_scale_features(
+    context_mean: Tensor,
+    context_std: Tensor,
+    *,
+    eps: float,
+) -> Tensor:
+    """Return [W,N,2] causal Close level/relative-volatility features."""
+    mean = torch.as_tensor(context_mean, dtype=torch.float32)
+    std = torch.as_tensor(context_std, dtype=torch.float32)
+    if mean.ndim != 3 or std.ndim != 3 or mean.shape != std.shape:
+        raise ValueError(
+            "context_mean/context_std must have identical [W,N,6] shapes."
+        )
+    if int(mean.shape[-1]) != 6:
+        raise ValueError("Close scale features require OHLCVA statistics.")
+    if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+        raise ValueError("Context scale statistics contain non-finite values.")
+    close_mean = mean[..., CLOSE_CHANNEL_INDEX].clamp_min(float(eps))
+    close_std = std[..., CLOSE_CHANNEL_INDEX].clamp_min(0.0)
+    return torch.stack(
+        (
+            torch.log(close_mean),
+            torch.log(
+                (close_std / close_mean).clamp_min(float(eps))
+            ),
+        ),
+        dim=-1,
+    ).contiguous()
+
+
+def fit_close_scale_feature_standardisation(
+    dataset: CachedTokenGraphDataset,
+    *,
+    eps: float,
+) -> tuple[Tensor, Tensor, dict[str, Any]]:
+    """Fit global feature centring/scaling on training windows only."""
+    if dataset.data_mode != "real":
+        raise ValueError(
+            "Close scale features are currently defined only for real data."
+        )
+    if "context_mean" not in dataset.cache or "context_std" not in dataset.cache:
+        raise KeyError(
+            "The origin-aligned cache is missing context_mean/context_std."
+        )
+    features = _raw_close_scale_features(
+        dataset.cache["context_mean"],
+        dataset.cache["context_std"],
+        eps=float(eps),
+    )
+    flattened = features.reshape(-1, 2)
+    center = flattened.mean(dim=0)
+    scale = flattened.std(dim=0, unbiased=False).clamp_min(1.0e-6)
+    metadata = {
+        "feature_names": [
+            "log_context_mean_close",
+            "log_context_std_close_over_mean_close",
+        ],
+        "fit_split": "training windows only",
+        "fit_examples": int(flattened.shape[0]),
+        "center": [float(value) for value in center.tolist()],
+        "scale": [float(value) for value in scale.tolist()],
+        "eps": float(eps),
+    }
+    return center.contiguous(), scale.contiguous(), metadata
 
 
 def _future_prediction_for_loss(output: Any) -> FutureTokenPrediction:
@@ -1509,6 +1624,10 @@ def run_teacher_forced_epoch(
             batch,
             device=device,
         )
+        context_mean, context_std = move_context_statistics(
+            batch,
+            device=device,
+        )
 
         batch_size = int(
             context_tokens.shape[0]
@@ -1537,6 +1656,8 @@ def run_teacher_forced_epoch(
                     context_tokens,
                     target_s1=target_s1,
                     target_s2=target_s2,
+                    context_mean=context_mean,
+                    context_std=context_std,
                 )
 
                 loss = compute_model_loss(
@@ -2075,11 +2196,17 @@ def generate_validation_artifacts(
                 batch,
                 device=device,
             )
+            context_mean_device, context_std_device = move_context_statistics(
+                batch,
+                device=device,
+            )
 
             with _autocast_context(device, use_amp):
                 if sample_count == 1:
                     generated_single: GeneratedTokenForecast = model.generate(
                         context_tokens,
+                        context_mean=context_mean_device,
+                        context_std=context_std_device,
                         token_selection=token_selection,
                         temperature=temperature,
                         top_k=top_k,
@@ -2094,6 +2221,8 @@ def generate_validation_artifacts(
                         model.generate_samples(
                             context_tokens,
                             sample_count=sample_count,
+                            context_mean=context_mean_device,
+                            context_std=context_std_device,
                             token_selection=token_selection,
                             temperature=temperature,
                             top_k=top_k,
@@ -3479,8 +3608,11 @@ def main() -> None:
     if args.temperature_sweep and args.resume:
         raise ValueError("--temperature-sweep and --resume cannot be combined.")
 
-    if args.validation_decode_every <= 0:
-        raise ValueError("--validation-decode-every must be positive.")
+    if args.validation_decode_every < 0:
+        raise ValueError(
+            "--validation-decode-every cannot be negative. Use zero to "
+            "disable periodic decoding for validation-CE-selected runs."
+        )
 
     if args.decode_series_batch_size <= 0:
         raise ValueError("--decode-series-batch-size must be positive.")
@@ -3698,6 +3830,15 @@ def main() -> None:
             f"Observed {early_stopping_metric!r}."
         )
 
+    if (
+        early_stopping_metric == "decoded_cumulative_log_change_mae"
+        and args.validation_decode_every == 0
+    ):
+        raise ValueError(
+            "Decoded price-space early stopping requires a positive "
+            "--validation-decode-every value."
+        )
+
     # Validation-token-loss selection is evaluated every epoch and is
     # deliberately decoupled from the much more expensive frozen-decoder
     # validation pass.  The selected CE checkpoint is decoded once after
@@ -3821,9 +3962,29 @@ def main() -> None:
     else:
         data_dir = None
 
+    scale_feature_config = (
+        resolved_config["models"]["dynamic_graph"]
+        .get("close_scale_features", {})
+    )
+    scale_features_enabled = bool(
+        scale_feature_config.get("enabled", False)
+    )
+    close_scale_feature_center: Tensor | None = None
+    close_scale_feature_scale: Tensor | None = None
+    close_scale_feature_metadata: dict[str, Any] | None = None
+    if scale_features_enabled:
+        close_scale_feature_center, close_scale_feature_scale, (
+            close_scale_feature_metadata
+        ) = fit_close_scale_feature_standardisation(
+            train_dataset_full,
+            eps=float(scale_feature_config.get("eps", 1.0e-6)),
+        )
+
     model = DynamicGraphTokenForecaster.from_config(
         resolved_config,
         fixed_adjacency=fixed_adjacency,
+        close_scale_feature_center=close_scale_feature_center,
+        close_scale_feature_scale=close_scale_feature_scale,
     ).to(device)
 
     available_evaluation_horizons = tuple(
@@ -3943,6 +4104,9 @@ def main() -> None:
         "gradient_clip_norm": gradient_clip_norm,
         "seed": seed,
         "validation_decode_every": args.validation_decode_every,
+        "close_scale_feature_standardisation": (
+            close_scale_feature_metadata
+        ),
         "decode_series_batch_size": args.decode_series_batch_size,
         "max_train_windows": args.max_train_windows,
         "max_validation_windows": args.max_validation_windows,
@@ -4452,9 +4616,12 @@ def main() -> None:
                 }
 
             should_decode = (
-                epoch == 1
-                or epoch == max_epochs
-                or epoch % args.validation_decode_every == 0
+                args.validation_decode_every > 0
+                and (
+                    epoch == 1
+                    or epoch == max_epochs
+                    or epoch % args.validation_decode_every == 0
+                )
             )
 
             bundle: ValidationBundle | None = None

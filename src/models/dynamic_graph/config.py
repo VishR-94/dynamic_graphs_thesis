@@ -8,6 +8,7 @@ from src.utils.config import load_yaml
 
 from .contracts import (
     BackcastConfig,
+    CloseScaleFeatureConfig,
     DynamicGraphModelConfig,
     ForecastHeadConfig,
     FuturePredictorConfig,
@@ -230,6 +231,14 @@ def build_model_config(
             **dict(
                 model.get(
                     "spatial",
+                    {},
+                )
+            )
+        ),
+        close_scale_features=CloseScaleFeatureConfig(
+            **dict(
+                model.get(
+                    "close_scale_features",
                     {},
                 )
             )
@@ -553,6 +562,9 @@ def _cpu_smoke_test() -> None:
     modern_tcn_token = typed[
         "modern_tcn_dynamic_coarse_mc10"
     ]
+    embedded_token = typed[
+        "hierarchical_embedding_coarse_ce"
+    ]
 
     assert (
         parallel_uniform
@@ -739,6 +751,14 @@ def _cpu_smoke_test() -> None:
         )
 
 
+
+    assert embedded_token.token_input_representation == (
+        "hierarchical_embedding"
+    )
+    assert embedded_token.heads.future_token_mode == "coarse_only"
+    assert embedded_token.future_predictor.type == "structured_parallel"
+    assert embedded_token.future_predictor.num_layers == 1
+    assert not embedded_token.close_scale_features.enabled
 
     assert modern_tcn_token.temporal.type == "modern_tcn"
     assert modern_tcn_token.token_input_representation == "bsq_bits"

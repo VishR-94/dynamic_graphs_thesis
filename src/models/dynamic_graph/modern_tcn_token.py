@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-"""Post-BSQ token input adapter for the official per-asset ModernTCN.
+"""Token-input adapters for the official per-asset ModernTCN.
 
-The frozen Kronos encoder is represented by the origin-aligned token cache.
-Each saved ``s1``/``s2`` ID is converted back into the exact 20-dimensional
-bipolar BSQ code (least-significant-bit first, scaled by ``1/sqrt(20)``).
-The official ModernTCN then processes each asset independently. Cross-asset
-information first enters through the explicit graph learner downstream.
+Two backward-compatible input contracts are supported:
+
+``bsq_bits``
+    Reconstruct the exact 20-dimensional post-BSQ bipolar code from the
+    cached ``s1``/``s2`` IDs.
+
+``hierarchical_embedding``
+    Consume the project's existing learned ``s1 + s2 + node + position``
+    embedding with shape ``[B,T,N,D]``.  Its D coordinates become the
+    within-asset ModernTCN variable axis.
+
+Assets are always folded into the batch before the official ModernTCN, so
+cross-asset information first enters through the explicit graph learner.
 """
 
 import math
@@ -83,22 +91,13 @@ def token_ids_to_bsq_codes(token_ids: Tensor) -> Tensor:
 
 
 class ModernTCNTokenEncoder(nn.Module):
-    """Official one-stage ModernTCN on post-BSQ token-code channels.
+    """Official one-stage ModernTCN on token-derived within-asset variables.
 
-    Tensor flow:
-
-        token IDs                 [B, 60, N, 2]
-        post-BSQ code             [B, 60, N, 20]
-        assets folded into batch  [B*N, 20, 60]
-        official features         [B*N, 20, D, P]
-        learned bit-stream pool   [B*N, D, P]
-        restored asset axis       [B, P, N, D]
-
-    The 20 BSQ dimensions are treated as ModernTCN variables. The official
-    ConvFFN2 therefore mixes coarse/fine code dimensions within one asset.
-    A tiny learned pooling layer, initialised to a uniform mean, converts the
-    20 output streams into one asset representation per patch. Assets cannot
-    interact before the explicit graph stage.
+    For ``bsq_bits`` the variable count is 20.  For
+    ``hierarchical_embedding`` it is ``D``.  The official variable-mixing
+    layers operate only within one asset.  A learned pooling layer,
+    initialised to a uniform mean, returns one representation per asset and
+    observed patch.
     """
 
     def __init__(
@@ -111,17 +110,28 @@ class ModernTCNTokenEncoder(nn.Module):
         config.validate()
         if config.temporal.type != "modern_tcn":
             raise ValueError("ModernTCNTokenEncoder requires modern_tcn.")
-        if config.token_input_representation != "bsq_bits":
-            raise ValueError("ModernTCNTokenEncoder requires bsq_bits input.")
+        if config.token_input_representation not in {
+            "bsq_bits",
+            "hierarchical_embedding",
+        }:
+            raise ValueError(
+                "ModernTCNTokenEncoder requires bsq_bits or "
+                "hierarchical_embedding input."
+            )
 
         temporal = config.temporal
+        self.input_representation = str(config.token_input_representation)
         self.context_length = int(config.context_length)
         self.num_nodes = int(config.num_nodes)
         self.d_model = int(config.d_model)
         self.patch_size = int(temporal.modern_tcn_patch_size)
         self.patch_stride = int(temporal.modern_tcn_patch_stride)
         self.output_length = int(config.temporal_output_length)
-        self.num_token_variables = KRONOS_CODEBOOK_DIM
+        self.num_token_variables = (
+            KRONOS_CODEBOOK_DIM
+            if self.input_representation == "bsq_bits"
+            else self.d_model
+        )
 
         if official_model_cls is None:
             project_root = Path(__file__).resolve().parents[3]
@@ -188,7 +198,13 @@ class ModernTCNTokenEncoder(nn.Module):
         )
         self.output_norm = nn.LayerNorm(self.d_model)
 
-    def forward(self, token_ids: Tensor) -> Tensor:
+    def forward(
+        self,
+        token_ids: Tensor,
+        *,
+        embedded_features: Tensor | None = None,
+        scale_addition: Tensor | None = None,
+    ) -> Tensor:
         values = torch.as_tensor(token_ids)
         expected = (
             int(values.shape[0]),
@@ -201,10 +217,53 @@ class ModernTCNTokenEncoder(nn.Module):
                 "token_ids does not match [B, context_length, N, 2]."
             )
 
-        code = token_ids_to_bsq_codes(values).to(device=values.device)
-        batch_size = int(code.shape[0])
+        if self.input_representation == "bsq_bits":
+            if embedded_features is not None:
+                raise ValueError(
+                    "embedded_features must be omitted for bsq_bits input."
+                )
+            input_features = token_ids_to_bsq_codes(values).to(
+                device=values.device
+            )
+        else:
+            if embedded_features is None:
+                raise ValueError(
+                    "hierarchical_embedding input requires embedded_features."
+                )
+            input_features = torch.as_tensor(embedded_features)
+            expected_features = (
+                int(values.shape[0]),
+                self.context_length,
+                self.num_nodes,
+                self.d_model,
+            )
+            if tuple(input_features.shape) != expected_features:
+                raise ValueError(
+                    "embedded_features has shape "
+                    f"{tuple(input_features.shape)}; expected "
+                    f"{expected_features}."
+                )
+
+        if scale_addition is not None:
+            addition = torch.as_tensor(scale_addition)
+            expected_scale = (
+                int(values.shape[0]),
+                self.num_nodes,
+                self.num_token_variables,
+            )
+            if tuple(addition.shape) != expected_scale:
+                raise ValueError(
+                    f"scale_addition has shape {tuple(addition.shape)}; "
+                    f"expected {expected_scale}."
+                )
+            input_features = input_features + addition.to(
+                device=input_features.device,
+                dtype=input_features.dtype,
+            ).unsqueeze(1)
+
+        batch_size = int(input_features.shape[0])
         per_asset = (
-            code.permute(0, 2, 1, 3)
+            input_features.permute(0, 2, 1, 3)
             .contiguous()
             .reshape(
                 batch_size * self.num_nodes,
@@ -228,7 +287,6 @@ class ModernTCNTokenEncoder(nn.Module):
                 f"{tuple(features.shape)}."
             )
 
-        # [BN, M, D, P] -> [BN, D, P, M] -> [BN, D, P]
         pooled = self.variable_pool(
             features.permute(0, 2, 3, 1).contiguous()
         ).squeeze(-1)
