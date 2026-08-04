@@ -1186,7 +1186,7 @@ def _raw_close_scale_features(
     *,
     eps: float,
 ) -> Tensor:
-    """Return [W,N,2] causal Close level/relative-volatility features."""
+    """Return the causal Close log-variance feature with shape [W,N,1]."""
     mean = torch.as_tensor(context_mean, dtype=torch.float32)
     std = torch.as_tensor(context_std, dtype=torch.float32)
     if mean.ndim != 3 or std.ndim != 3 or mean.shape != std.shape:
@@ -1197,17 +1197,10 @@ def _raw_close_scale_features(
         raise ValueError("Close scale features require OHLCVA statistics.")
     if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
         raise ValueError("Context scale statistics contain non-finite values.")
-    close_mean = mean[..., CLOSE_CHANNEL_INDEX].clamp_min(float(eps))
     close_std = std[..., CLOSE_CHANNEL_INDEX].clamp_min(0.0)
-    return torch.stack(
-        (
-            torch.log(close_mean),
-            torch.log(
-                (close_std / close_mean).clamp_min(float(eps))
-            ),
-        ),
-        dim=-1,
-    ).contiguous()
+    return torch.log(
+        close_std.square().add(float(eps))
+    ).unsqueeze(-1).contiguous()
 
 
 def fit_close_scale_feature_standardisation(
@@ -1229,14 +1222,15 @@ def fit_close_scale_feature_standardisation(
         dataset.cache["context_std"],
         eps=float(eps),
     )
-    flattened = features.reshape(-1, 2)
+    flattened = features.reshape(-1, 1)
     center = flattened.mean(dim=0)
     scale = flattened.std(dim=0, unbiased=False).clamp_min(1.0e-6)
     metadata = {
+        "feature_contract": "close_log_variance_v2",
         "feature_names": [
-            "log_context_mean_close",
-            "log_context_std_close_over_mean_close",
+            "log_context_close_variance",
         ],
+        "formula": "log(context_close_std ** 2 + eps)",
         "fit_split": "training windows only",
         "fit_examples": int(flattened.shape[0]),
         "center": [float(value) for value in center.tolist()],

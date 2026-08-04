@@ -421,12 +421,12 @@ def load_temperature_result(
     }
 
 
-def clone_with_close_scale_features(
+def clone_with_close_log_variance_feature(
     spec: TokenArchitectureSpec,
     *,
     run_name: str,
 ) -> TokenArchitectureSpec:
-    """Create a matched retraining spec with only Close scale features on."""
+    """Create a matched retraining spec with only Close log variance on."""
     prefixes = (
         "models.dynamic_graph.close_scale_features.enabled=",
         "models.dynamic_graph.close_scale_features.eps=",
@@ -437,10 +437,22 @@ def clone_with_close_scale_features(
     return replace(
         spec,
         run_name=str(run_name),
-        label=spec.label + " + Close level/volatility features",
+        label=spec.label + " + Close log-variance feature",
         overrides=(
             *retained,
             "models.dynamic_graph.close_scale_features.enabled=true",
             "models.dynamic_graph.close_scale_features.eps=1.0e-6",
         ),
+    )
+
+
+def clone_with_close_scale_features(
+    spec: TokenArchitectureSpec,
+    *,
+    run_name: str,
+) -> TokenArchitectureSpec:
+    """Backward-compatible alias for the Close log-variance clone helper."""
+    return clone_with_close_log_variance_feature(
+        spec,
+        run_name=run_name,
     )

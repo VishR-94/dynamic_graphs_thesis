@@ -309,17 +309,17 @@ class SpatialConfig:
 
 @dataclass(frozen=True)
 class CloseScaleFeatureConfig:
-    """Optional causal Close-level and relative-volatility features.
+    """Optional causal Close log-variance feature.
 
-    The two raw features are calculated from the observed 60-minute context
+    The single raw feature is calculated from the observed 60-minute context
     only:
 
-        log(context mean Close)
-        log(context std Close / context mean Close + eps)
+        log(context Close variance + eps)
+        = log(context Close std ** 2 + eps)
 
-    The training runner standardises them using statistics fitted over the
-    training windows/assets only.  The resulting two-vector is projected and
-    added once before the first temporal module.
+    The training runner standardises it using statistics fitted over the
+    training windows/assets only.  The resulting scalar is projected and added
+    once before the first temporal module.
     """
 
     enabled: bool = False

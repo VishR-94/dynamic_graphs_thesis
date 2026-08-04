@@ -297,8 +297,20 @@ def test_close_scale_feature_contract() -> None:
     center, scale, metadata = fit_close_scale_feature_standardisation(
         dataset, eps=1.0e-6
     )
-    assert tuple(center.shape) == (2,)
-    assert tuple(scale.shape) == (2,)
+    raw = _raw_close_scale_features(
+        dataset.cache["context_mean"],
+        dataset.cache["context_std"],
+        eps=1.0e-6,
+    )
+    assert tuple(raw.shape) == (3, 4, 1)
+    expected_raw = torch.log(
+        dataset.cache["context_std"][..., 3].square().add(1.0e-6)
+    ).unsqueeze(-1)
+    torch.testing.assert_close(raw, expected_raw)
+    assert tuple(center.shape) == (1,)
+    assert tuple(scale.shape) == (1,)
+    assert metadata["feature_contract"] == "close_log_variance_v2"
+    assert metadata["feature_names"] == ["log_context_close_variance"]
     assert torch.isfinite(center).all()
     assert torch.isfinite(scale).all() and torch.all(scale > 0)
     assert metadata["fit_split"] == "training windows only"
@@ -343,16 +355,30 @@ def test_close_scale_feature_contract() -> None:
         raise AssertionError("Scale projection received only zero gradients.")
 
     with torch.inference_mode():
-        shifted = means.clone()
-        shifted[..., 3] *= 2.0
+        shifted_mean = means.clone()
+        shifted_mean[..., 3] *= 2.0
+        unchanged = model(
+            context,
+            target_s1=target_s1,
+            context_mean=shifted_mean,
+            context_std=stds,
+        )
+        shifted_std = stds.clone()
+        shifted_std[..., 3] *= 2.0
         changed = model(
             context,
             target_s1=target_s1,
-            context_mean=shifted,
-            context_std=stds,
+            context_mean=means,
+            context_std=shifted_std,
         )
+    torch.testing.assert_close(
+        output.s1_logits.detach(),
+        unchanged.s1_logits,
+        atol=0.0,
+        rtol=0.0,
+    )
     if torch.equal(output.s1_logits.detach(), changed.s1_logits):
-        raise AssertionError("Changing Close scale features changed no logits.")
+        raise AssertionError("Changing Close variance changed no logits.")
 
 def test_runner_json_loader_contract() -> None:
     """Inference-only modes can reload an existing run metadata file."""

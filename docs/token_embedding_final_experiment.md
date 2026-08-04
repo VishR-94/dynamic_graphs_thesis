@@ -88,20 +88,20 @@ The architecture winner is compared at temperatures 0.8, 1.0 and 1.2. The
 screening result supplies T=1.0; it is not redundantly regenerated. The selected
 temperature is the strict lowest five-horizon mean validation Log MAE.
 
-## Close scale/volatility ablation
+## Close log-variance ablation
 
-The winning architecture is retrained once with two context-only Close features:
+The winning architecture is retrained once with one context-only Close feature:
 
 ```text
-log(mean Close)
-log(std Close / mean Close + eps)
+log(Close variance + eps)
+= log(Close std ** 2 + eps)
 ```
 
-Their centre and scale are fitted from training windows/assets only. The two
-features are projected to the model input dimension and added once before the
-first temporal module. The scale model is evaluated only at the already selected
+Its centre and scale are fitted from training windows/assets only. The scalar is
+projected to the model input dimension and added once before the first temporal
+module. The log-variance model is evaluated only at the already selected
 temperature. The final version is the lower decoded validation Log-MAE model
-between matched no-scale and scale runs.
+between the matched no-feature and log-variance runs.
 
 ## Saved stochastic artefacts
 

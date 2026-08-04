@@ -12,6 +12,7 @@ from src.training.token_embedding_final_sweep import (
     BSQ_CONTROL_PRESET,
     BSQ_CONTROL_RUN_NAME,
     EMBEDDED_MODERN_TCN_DYNAMIC_RUN_NAME,
+    clone_with_close_log_variance_feature,
     clone_with_close_scale_features,
     load_temperature_result,
     make_architecture_specs,
@@ -126,16 +127,22 @@ def test_bsq_control_and_scale_clone() -> None:
     assert control.token_input_representation == "bsq_bits"
     assert control.overrides == ()
 
-    scale = clone_with_close_scale_features(
+    scale = clone_with_close_log_variance_feature(
         control,
-        run_name="bsq_control_close_scale",
+        run_name="bsq_control_close_log_variance",
     )
     assert scale.preset == control.preset
     assert scale.token_input_representation == "bsq_bits"
+    assert scale.label.endswith("Close log-variance feature")
     assert (
         "models.dynamic_graph.close_scale_features.enabled=true"
         in scale.overrides
     )
+    legacy_alias = clone_with_close_scale_features(
+        control,
+        run_name="bsq_control_close_log_variance_alias",
+    )
+    assert legacy_alias.label.endswith("Close log-variance feature")
 
 
 def test_temperature_result_loader_contract() -> None:
