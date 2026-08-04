@@ -1,0 +1,431 @@
+from __future__ import annotations
+
+"""CPU contracts for the final coarse-token ModernTCN graph experiment."""
+
+from types import SimpleNamespace
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+from src.models.dynamic_graph.contracts import (
+    DynamicGraphModelConfig,
+    ForecastHeadConfig,
+    FuturePredictorConfig,
+    GraphConfig,
+    SpatialConfig,
+    TemporalConfig,
+)
+from src.models.dynamic_graph.modern_tcn_token import (
+    KRONOS_CODEBOOK_DIM,
+    token_ids_to_bsq_codes,
+)
+from src.models.dynamic_graph.model import DynamicGraphTokenForecaster
+import src.training.run_dynamic_graph as token_runner
+from src.training.run_dynamic_graph import (
+    average_decoded_paths,
+    generate_validation_artifacts,
+)
+
+
+class _FakeModernTCNBackbone(nn.Module):
+    def __init__(self, config: SimpleNamespace) -> None:
+        super().__init__()
+        self.num_variables = int(config.enc_in)
+        self.d_model = int(config.dims[0])
+        self.patch_size = int(config.patch_size)
+        self.patch_stride = int(config.patch_stride)
+        self.stem = nn.Conv1d(
+            1,
+            self.d_model,
+            kernel_size=self.patch_size,
+            stride=self.patch_stride,
+        )
+        self.variable_gain = nn.Parameter(
+            torch.ones(self.num_variables, self.d_model)
+        )
+
+    def forward_feature(self, x: Tensor) -> Tensor:
+        if x.ndim != 3:
+            raise ValueError("Fake ModernTCN expects [B, M, T].")
+        batch_size, variables, _ = x.shape
+        padding = self.patch_size - self.patch_stride
+        if padding > 0:
+            x = torch.cat(
+                [x, x[..., -1:].expand(-1, -1, padding)],
+                dim=-1,
+            )
+        patches = self.stem(
+            x.reshape(batch_size * variables, 1, x.shape[-1])
+        )
+        patches = patches.reshape(
+            batch_size,
+            variables,
+            self.d_model,
+            patches.shape[-1],
+        )
+        return patches * self.variable_gain[None, :, :, None]
+
+
+class _FakeOfficialModernTCN(nn.Module):
+    def __init__(self, config: SimpleNamespace) -> None:
+        super().__init__()
+        self.model = _FakeModernTCNBackbone(config)
+
+
+def _config() -> DynamicGraphModelConfig:
+    return DynamicGraphModelConfig(
+        num_nodes=4,
+        context_length=8,
+        d_model=8,
+        num_st_blocks=1,
+        use_node_embedding=False,
+        token_input_representation="bsq_bits",
+        temporal=TemporalConfig(
+            type="modern_tcn",
+            num_layers=1,
+            num_heads=2,
+            feedforward_multiplier=2,
+            dropout=0.0,
+            modern_tcn_patch_size=4,
+            modern_tcn_patch_stride=2,
+            modern_tcn_ffn_ratio=1,
+            modern_tcn_num_blocks=1,
+            modern_tcn_large_kernel=3,
+            modern_tcn_small_kernel=3,
+            modern_tcn_dropout=0.0,
+        ),
+        graph=GraphConfig(
+            type="dynamic",
+            num_heads=1,
+            hidden_dim=4,
+            activation="softmax",
+            add_self_loops=False,
+            mtgnn_top_k=3,
+            base_graph_type="free_static",
+            gate_type="none",
+            initial_alpha=0.5,
+        ),
+        spatial=SpatialConfig(
+            num_layers=1,
+            feedforward_multiplier=2,
+            dropout=0.0,
+            gate_type="learned_scalar",
+            initial_beta=0.5,
+        ),
+        heads=ForecastHeadConfig(
+            prediction_length=6,
+            evaluation_horizons=(1, 3, 6),
+            s1_vocabulary_size=1024,
+            s2_vocabulary_size=1024,
+            s2_loss_weight=0.0,
+            future_token_mode="coarse_only",
+            s2_conditioning="true_s1",
+        ),
+        future_predictor=FuturePredictorConfig(
+            type="structured_parallel",
+            num_layers=1,
+            num_heads=2,
+            feedforward_multiplier=2,
+            dropout=0.0,
+        ),
+    )
+
+
+def test_post_bsq_code_contract() -> None:
+    token_ids = torch.tensor(
+        [[[[1, 2], [1023, 0]]]],
+        dtype=torch.long,
+    )
+    code = token_ids_to_bsq_codes(token_ids)
+    assert tuple(code.shape) == (1, 1, 2, 20)
+    scale = 1.0 / (KRONOS_CODEBOOK_DIM ** 0.5)
+    expected_first = torch.tensor(
+        [1.0] + [-1.0] * 9 + [-1.0, 1.0] + [-1.0] * 8
+    ) * scale
+    torch.testing.assert_close(code[0, 0, 0], expected_first)
+    torch.testing.assert_close(
+        code.square().sum(dim=-1),
+        torch.ones(1, 1, 2),
+    )
+
+
+def test_model_shapes_gradients_and_sampling() -> None:
+    torch.manual_seed(42)
+    config = _config()
+    model = DynamicGraphTokenForecaster(
+        config,
+        modern_tcn_model_cls=_FakeOfficialModernTCN,
+    )
+    context = torch.randint(
+        0,
+        1024,
+        (2, config.context_length, config.num_nodes, 2),
+    )
+    target_s1 = torch.randint(
+        0,
+        1024,
+        (2, config.prediction_length, config.num_nodes),
+    )
+    target_s2 = torch.randint(
+        0,
+        1024,
+        (2, config.prediction_length, config.num_nodes),
+    )
+    output = model(context, target_s1=target_s1, target_s2=target_s2)
+    output.validate(config, batch_size=2)
+    assert tuple(output.temporal_hidden.shape) == (2, 4, 4, 8)
+    assert tuple(output.s1_logits.shape) == (2, 6, 4, 1024)
+    assert output.s2_logits is None
+    assert output.graph.selected is not None
+    assert tuple(output.graph.selected.shape) == (2, 1, 4, 4)
+    assert output.spatial_beta is not None
+
+    loss = F.cross_entropy(
+        output.s1_logits.reshape(-1, 1024),
+        target_s1.reshape(-1),
+    )
+    loss.backward()
+    required_parameters = {
+        "ModernTCN stem": model.modern_tcn_encoder.official_model.model.stem.weight,
+        "token-variable pool": model.modern_tcn_encoder.variable_pool.weight,
+        "dynamic query": model.graph_learners[0].q_proj.weight,
+        "future s1 head": model.future_predictor.token_heads.s1_classifier.weight,
+        "spatial beta": model.spatial_gates[0].raw_beta,
+    }
+    for name, parameter in required_parameters.items():
+        if parameter is None or parameter.grad is None:
+            raise AssertionError(f"{name} received no gradient.")
+        if not torch.isfinite(parameter.grad).all():
+            raise AssertionError(f"{name} received a non-finite gradient.")
+        if parameter.grad.abs().sum().item() == 0.0:
+            raise AssertionError(f"{name} received only zero gradients.")
+
+    torch.manual_seed(123)
+    first = model.generate_samples(
+        context,
+        sample_count=10,
+        token_selection="sample",
+        temperature=0.6,
+        top_k=0,
+        top_p=0.9,
+    )
+    torch.manual_seed(123)
+    second = model.generate_samples(
+        context,
+        sample_count=10,
+        token_selection="sample",
+        temperature=0.6,
+        top_k=0,
+        top_p=0.9,
+    )
+    assert tuple(first.token_ids.shape) == (10, 2, 6, 4, 2)
+    assert torch.equal(first.token_ids, second.token_ids)
+    assert torch.count_nonzero(first.token_ids[..., 1]).item() == 0
+
+
+def test_decoded_continuous_average() -> None:
+    paths = torch.tensor(
+        [
+            [[[[10.0, 11.0, 9.0, 10.5, 100.0]]]],
+            [[[[12.0, 13.0, 11.0, 12.5, 120.0]]]],
+        ]
+    )
+    averaged = average_decoded_paths(paths)
+    expected = torch.tensor([[[[11.0, 12.0, 10.0, 11.5, 110.0]]]])
+    torch.testing.assert_close(averaged, expected)
+
+
+
+class _FakeTokenDataset:
+    data_mode = "real"
+    asset_cols = ("A", "B", "C", "D")
+
+    @staticmethod
+    def s1_to_kronos_ids(values: Tensor) -> Tensor:
+        return torch.as_tensor(values).long()
+
+
+class _FakeCoarseDecoder:
+    def decode_coarse_token_path(
+        self,
+        context_tokens: Tensor,
+        future_s1: Tensor,
+        *,
+        mean: Tensor,
+        std: Tensor,
+        series_batch_size: int,
+        return_full_path: bool,
+    ) -> Tensor:
+        del context_tokens, mean, std, series_batch_size, return_full_path
+        close = future_s1.float() + 100.0
+        return torch.stack(
+            (
+                close,
+                close + 1.0,
+                close - 1.0,
+                close,
+                torch.ones_like(close),
+            ),
+            dim=-1,
+        )
+
+
+class _FakeEvaluator:
+    available_metrics = ("cumulative_log_change_mae",)
+
+    def __init__(self, *, prediction_result, train_split) -> None:
+        del train_split
+        self.prediction_result = prediction_result
+        self.horizons = tuple(prediction_result["horizons"])
+        self.channels = tuple(prediction_result["channels"])
+
+    def evaluate(self, *, metrics, reduce_dims, bootstrap):
+        del metrics, reduce_dims, bootstrap
+        predicted = self.prediction_result["y_pred"].float().clamp_min(1.0e-6)
+        target = self.prediction_result["y_true"].float().clamp_min(1.0e-6)
+        last = self.prediction_result["last_context_target"].float().clamp_min(1.0e-6)
+        predicted_change = predicted.log() - last.unsqueeze(1).log()
+        true_change = target.log() - last.unsqueeze(1).log()
+        value = (predicted_change - true_change).abs().mean(dim=(0, 2, 3))
+        return {"cumulative_log_change_mae": value}
+
+
+def _fake_metric_table(*, metric_results, horizons, channels):
+    rows = []
+    values = torch.as_tensor(
+        metric_results["cumulative_log_change_mae"]
+    ).reshape(-1)
+    for horizon, value in zip(horizons, values, strict=True):
+        rows.append(
+            {
+                "metric": "cumulative_log_change_mae",
+                "horizon": int(horizon),
+                "channel": str(channels[0]),
+                "value": float(value.item()),
+            }
+        )
+    import pandas as pd
+    return pd.DataFrame(rows)
+
+
+def test_ten_path_decode_then_average_contract() -> None:
+    torch.manual_seed(7)
+    config = _config()
+    model = DynamicGraphTokenForecaster(
+        config,
+        modern_tcn_model_cls=_FakeOfficialModernTCN,
+    )
+    batch_size = 2
+    context = torch.randint(
+        0,
+        1024,
+        (batch_size, config.context_length, config.num_nodes, 2),
+    )
+    target_s1 = torch.randint(
+        0,
+        1024,
+        (batch_size, config.prediction_length, config.num_nodes),
+    )
+    target_s2 = torch.randint(
+        0,
+        1024,
+        (batch_size, config.prediction_length, config.num_nodes),
+    )
+    evaluation_true = torch.full(
+        (batch_size, 3, config.num_nodes, 5),
+        200.0,
+    )
+    evaluation_true[..., 4] = 1.0
+    last_context = torch.full(
+        (batch_size, config.num_nodes, 5),
+        190.0,
+    )
+    last_context[..., 4] = 1.0
+    batch = {
+        "context_tokens": context,
+        "target_s1": target_s1,
+        "target_s2": target_s2,
+        "context_mean": torch.zeros(batch_size, config.num_nodes, 6),
+        "context_std": torch.ones(batch_size, config.num_nodes, 6),
+        "evaluation_true": evaluation_true,
+        "last_context_target": last_context,
+        "sample_idx": torch.arange(batch_size),
+        "origin_idx": torch.full((batch_size,), 59),
+        "target_indices": torch.tensor(
+            [[60, 61, 62, 63, 64, 65]] * batch_size
+        ),
+        "date": ["2024-09-03", "2024-09-04"],
+    }
+
+    original_evaluator = token_runner.ForecastEvaluator
+    original_table = token_runner.make_evaluation_table
+    token_runner.ForecastEvaluator = _FakeEvaluator
+    token_runner.make_evaluation_table = _fake_metric_table
+    try:
+        torch.manual_seed(1234)
+        bundle = generate_validation_artifacts(
+            model=model,
+            loader=[batch],
+            dataset=_FakeTokenDataset(),
+            device=torch.device("cpu"),
+            use_amp=False,
+            decoding_config={
+                "token_selection": "sample",
+                "temperature": 0.6,
+                "top_k": 0,
+                "top_p": 0.9,
+                "sample_count": 10,
+            },
+            tokenizer=_FakeCoarseDecoder(),
+            raw_train_split={"unused": True},
+            decode_series_batch_size=64,
+            early_stopping_horizons=(1, 3, 6),
+        )
+    finally:
+        token_runner.ForecastEvaluator = original_evaluator
+        token_runner.make_evaluation_table = original_table
+
+    sampled = bundle.token_artifacts["sampled_s1_evaluation"].float()
+    expected_close = sampled.mean(dim=0).unsqueeze(-1) + 100.0
+    observed_close = bundle.prediction_result["y_pred"]
+    torch.testing.assert_close(observed_close, expected_close)
+
+    path_artifacts = bundle.sampled_price_path_artifacts
+    if path_artifacts is None:
+        raise AssertionError("Sampled price-path artifacts were not retained.")
+    sampled_close_paths = path_artifacts["sampled_close_paths"]
+    sampled_close_evaluation = path_artifacts[
+        "sampled_close_paths_at_evaluation_horizons"
+    ]
+    assert tuple(sampled_close_paths.shape) == (10, 2, 6, 4, 1)
+    assert tuple(sampled_close_evaluation.shape) == (10, 2, 3, 4, 1)
+    torch.testing.assert_close(
+        sampled_close_evaluation,
+        sampled.unsqueeze(-1) + 100.0,
+    )
+    torch.testing.assert_close(
+        path_artifacts["ensemble_mean_close_path"].index_select(
+            dim=1,
+            index=torch.tensor([0, 2, 5]),
+        ),
+        observed_close,
+    )
+    assert path_artifacts["sample_count"] == 10
+    assert path_artifacts["channel"] == "close"
+    assert path_artifacts["output_space"] == "raw"
+
+    assert bundle.token_artifacts["sample_count"] == 10
+    assert bundle.diagnostics["sample_count"] == 10
+    assert tuple(bundle.graph_artifacts["spatial_beta"].shape) == (2, 1)
+
+def main() -> None:
+    test_post_bsq_code_contract()
+    test_model_shapes_gradients_and_sampling()
+    test_decoded_continuous_average()
+    test_ten_path_decode_then_average_contract()
+    print("Tokenized ModernTCN graph contract tests passed.")
+
+
+if __name__ == "__main__":
+    main()

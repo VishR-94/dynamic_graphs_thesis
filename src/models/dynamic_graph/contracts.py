@@ -17,6 +17,12 @@ TemporalType = Literal[
     "identity",
     "transformer",
     "tcn",
+    "modern_tcn",
+]
+
+TokenInputRepresentation = Literal[
+    "hierarchical_embedding",
+    "bsq_bits",
 ]
 
 GraphType = Literal[
@@ -131,6 +137,16 @@ class TemporalConfig:
     kernel_size: int = 3
     dilations: tuple[int, ...] = (1, 2, 4)
 
+    # Official per-asset ModernTCN options. The token path uses the
+    # post-BSQ 20-bit code as the ModernTCN variable axis.
+    modern_tcn_patch_size: int = 8
+    modern_tcn_patch_stride: int = 4
+    modern_tcn_ffn_ratio: int = 1
+    modern_tcn_num_blocks: int = 1
+    modern_tcn_large_kernel: int = 15
+    modern_tcn_small_kernel: int = 5
+    modern_tcn_dropout: float = 0.05
+
     def validate(
         self,
         *,
@@ -140,6 +156,7 @@ class TemporalConfig:
             "identity",
             "transformer",
             "tcn",
+            "modern_tcn",
         }:
             raise ValueError(
                 f"Unsupported temporal type {self.type!r}."
@@ -175,6 +192,29 @@ class TemporalConfig:
                 "Transformer heads."
             )
 
+        if self.type == "modern_tcn":
+            for name, value in {
+                "modern_tcn_patch_size": self.modern_tcn_patch_size,
+                "modern_tcn_patch_stride": self.modern_tcn_patch_stride,
+                "modern_tcn_ffn_ratio": self.modern_tcn_ffn_ratio,
+                "modern_tcn_num_blocks": self.modern_tcn_num_blocks,
+                "modern_tcn_large_kernel": self.modern_tcn_large_kernel,
+                "modern_tcn_small_kernel": self.modern_tcn_small_kernel,
+            }.items():
+                _validate_positive_integer(value, name=f"temporal.{name}")
+
+            if self.modern_tcn_patch_size < self.modern_tcn_patch_stride:
+                raise ValueError(
+                    "temporal.modern_tcn_patch_size must be greater than "
+                    "or equal to temporal.modern_tcn_patch_stride."
+                )
+
+            _validate_probability(
+                self.modern_tcn_dropout,
+                name="temporal.modern_tcn_dropout",
+                inclusive_upper=False,
+            )
+
         if self.type == "tcn":
             _validate_positive_integer(
                 self.kernel_size,
@@ -207,6 +247,61 @@ class TemporalConfig:
         return 1 + (
             self.kernel_size - 1
         ) * sum(self.dilations)
+
+    def output_length(self, context_length: int) -> int:
+        """Return the temporal feature length exposed to graph/prediction.
+
+        Transformer, identity and causal-TCN encoders preserve all observed
+        context positions. The one-stage ModernTCN path repeats the final
+        value for patch padding, yielding exactly ``context / stride``
+        patch positions for the supported session contract.
+        """
+        if self.type != "modern_tcn":
+            return int(context_length)
+
+        if int(context_length) % self.modern_tcn_patch_stride != 0:
+            raise ValueError(
+                "context_length must be divisible by the ModernTCN patch "
+                "stride."
+            )
+
+        return int(context_length) // self.modern_tcn_patch_stride
+
+
+@dataclass(frozen=True)
+class SpatialConfig:
+    """Configuration for graph message passing and temporal/spatial fusion."""
+
+    num_layers: int = 1
+    feedforward_multiplier: int = 2
+    dropout: float = 0.0
+    gate_type: Literal["none", "fixed", "learned_scalar"] = "none"
+    initial_beta: float = 1.0
+
+    def validate(self, *, graph_type: GraphType) -> None:
+        _validate_positive_integer(self.num_layers, name="spatial.num_layers")
+        _validate_positive_integer(
+            self.feedforward_multiplier,
+            name="spatial.feedforward_multiplier",
+        )
+        _validate_probability(
+            self.dropout,
+            name="spatial.dropout",
+            inclusive_upper=False,
+        )
+        if self.gate_type not in {"none", "fixed", "learned_scalar"}:
+            raise ValueError(
+                "spatial.gate_type must be 'none', 'fixed', or "
+                "'learned_scalar'."
+            )
+        _validate_probability(
+            self.initial_beta,
+            name="spatial.initial_beta",
+        )
+        if graph_type == "none" and self.gate_type != "none":
+            raise ValueError(
+                "Graph-free token models must use spatial.gate_type='none'."
+            )
 
 
 @dataclass(frozen=True)
@@ -659,12 +754,18 @@ class DynamicGraphModelConfig:
     d_model: int = 64
     num_st_blocks: int = 1
     use_node_embedding: bool = True
+    token_input_representation: TokenInputRepresentation = (
+        "hierarchical_embedding"
+    )
 
     temporal: TemporalConfig = field(
         default_factory=TemporalConfig
     )
     graph: GraphConfig = field(
         default_factory=GraphConfig
+    )
+    spatial: SpatialConfig = field(
+        default_factory=SpatialConfig
     )
     heads: ForecastHeadConfig = field(
         default_factory=ForecastHeadConfig
@@ -700,13 +801,43 @@ class DynamicGraphModelConfig:
             name="num_st_blocks",
         )
 
+        if self.token_input_representation not in {
+            "hierarchical_embedding",
+            "bsq_bits",
+        }:
+            raise ValueError(
+                "token_input_representation must be "
+                "'hierarchical_embedding' or 'bsq_bits'."
+            )
+
         self.temporal.validate(
             d_model=self.d_model,
         )
 
+        if self.temporal.type == "modern_tcn":
+            if self.token_input_representation != "bsq_bits":
+                raise ValueError(
+                    "The token ModernTCN path requires the exact post-BSQ "
+                    "20-bit input representation."
+                )
+            if self.num_st_blocks != 1:
+                raise ValueError(
+                    "The selected token ModernTCN architecture uses one "
+                    "temporal/graph/spatial block."
+                )
+            if self.use_node_embedding:
+                raise ValueError(
+                    "The selected token ModernTCN path does not add a node "
+                    "embedding before the per-asset backbone."
+                )
+
         self.graph.validate(
             num_nodes=self.num_nodes,
             d_model=self.d_model,
+        )
+
+        self.spatial.validate(
+            graph_type=self.graph.type,
         )
 
         self.heads.validate()
@@ -718,6 +849,32 @@ class DynamicGraphModelConfig:
         self.loss.validate()
         self.backcast.validate()
 
+        if self.temporal.type == "modern_tcn":
+            if self.future_predictor.type != "structured_parallel":
+                raise ValueError(
+                    "The final token ModernTCN experiment requires the "
+                    "structured-parallel 60-position predictor."
+                )
+            if self.heads.future_token_mode != "coarse_only":
+                raise ValueError(
+                    "The final token ModernTCN experiment predicts only the "
+                    "coarse s1 subtoken."
+                )
+            if self.heads.s1_vocabulary_size != 1024:
+                raise ValueError(
+                    "The final token ModernTCN experiment uses the original "
+                    "1024-way coarse vocabulary."
+                )
+            if self.backcast.enabled:
+                raise ValueError(
+                    "Backcasting is not implemented for patch-level token "
+                    "ModernTCN features."
+                )
+
+        # Evaluate once here so invalid patch/stride contracts fail during
+        # configuration validation rather than at the first GPU forward.
+        _ = self.temporal_output_length
+
         if (
             self.context_length
             + self.heads.prediction_length
@@ -727,6 +884,10 @@ class DynamicGraphModelConfig:
                 "Context plus future path exceeds the current "
                 "Kronos sequence limit of 512 positions."
             )
+
+    @property
+    def temporal_output_length(self) -> int:
+        return self.temporal.output_length(self.context_length)
 
     @property
     def prediction_length(self) -> int:
@@ -902,6 +1063,7 @@ class TokenForecastOutput:
     context_hidden: Tensor
     temporal_hidden: Tensor
     future_hidden: Tensor
+    spatial_beta: Tensor | None = None
     backcast: Tensor | None = None
 
     def validate(
@@ -967,7 +1129,7 @@ class TokenForecastOutput:
 
         expected_temporal_hidden = (
             batch_size,
-            config.context_length,
+            config.temporal_output_length,
             config.num_nodes,
             config.d_model,
         )
@@ -1046,6 +1208,17 @@ class TokenForecastOutput:
             raise ValueError(
                 "s2_logits contains non-finite values."
             )
+
+        if self.spatial_beta is not None:
+            beta = torch.as_tensor(self.spatial_beta).float()
+            if beta.numel() != 1 or not torch.isfinite(beta).all():
+                raise ValueError(
+                    "spatial_beta must be one finite scalar."
+                )
+            if float(beta.item()) < 0.0 or float(beta.item()) > 1.0:
+                raise ValueError(
+                    "spatial_beta must lie in [0, 1]."
+                )
 
         self.graph.validate(
             batch_size=batch_size,

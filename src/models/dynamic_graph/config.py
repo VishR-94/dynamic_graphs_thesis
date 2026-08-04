@@ -12,6 +12,7 @@ from .contracts import (
     ForecastHeadConfig,
     FuturePredictorConfig,
     GraphConfig,
+    SpatialConfig,
     TemporalConfig,
     TokenLossConfig,
 )
@@ -146,6 +147,37 @@ def build_model_config(
         ]
     )
 
+    # Keep the YAML readable while retaining one immutable typed temporal
+    # config. Historical configs do not contain this nested mapping and
+    # therefore continue to use the dataclass defaults.
+    modern_tcn_values = dict(
+        temporal_values.pop(
+            "modern_tcn",
+            {},
+        )
+    )
+    modern_tcn_key_map = {
+        "patch_size": "modern_tcn_patch_size",
+        "patch_stride": "modern_tcn_patch_stride",
+        "ffn_ratio": "modern_tcn_ffn_ratio",
+        "num_blocks": "modern_tcn_num_blocks",
+        "large_kernel": "modern_tcn_large_kernel",
+        "small_kernel": "modern_tcn_small_kernel",
+        "dropout": "modern_tcn_dropout",
+    }
+    unknown_modern_tcn_keys = (
+        set(modern_tcn_values)
+        - set(modern_tcn_key_map)
+    )
+    if unknown_modern_tcn_keys:
+        raise KeyError(
+            "Unknown temporal.modern_tcn keys: "
+            f"{sorted(unknown_modern_tcn_keys)}."
+        )
+    for yaml_key, dataclass_key in modern_tcn_key_map.items():
+        if yaml_key in modern_tcn_values:
+            temporal_values[dataclass_key] = modern_tcn_values[yaml_key]
+
     head_values = dict(
         model["heads"]
     )
@@ -182,11 +214,25 @@ def build_model_config(
         use_node_embedding=bool(
             model["use_node_embedding"]
         ),
+        token_input_representation=str(
+            model.get(
+                "token_input_representation",
+                "hierarchical_embedding",
+            )
+        ),
         temporal=TemporalConfig(
             **temporal_values
         ),
         graph=GraphConfig(
             **dict(model["graph"])
+        ),
+        spatial=SpatialConfig(
+            **dict(
+                model.get(
+                    "spatial",
+                    {},
+                )
+            )
         ),
         heads=ForecastHeadConfig(
             **head_values
@@ -374,6 +420,50 @@ def validate_dynamic_graph_config(
             "The Kronos token path must be clipped to [-5, 5]."
         )
 
+    training = experiment_config.get("training")
+    if not isinstance(training, Mapping):
+        raise ValueError("Config must contain a training mapping.")
+    if str(training.get("optimizer", "adamw")) not in {"adam", "adamw"}:
+        raise ValueError("training.optimizer must be 'adam' or 'adamw'.")
+    if str(training.get("scheduler", "none")) not in {
+        "none",
+        "modern_tcn_type3",
+    }:
+        raise ValueError(
+            "training.scheduler must be 'none' or 'modern_tcn_type3'."
+        )
+    if float(training.get("graph_learning_rate", training["learning_rate"])) <= 0:
+        raise ValueError("training.graph_learning_rate must be positive.")
+
+    decoding = experiment_config.get("decoding")
+    if not isinstance(decoding, Mapping):
+        raise ValueError("Config must contain a decoding mapping.")
+    if int(decoding.get("sample_count", 1)) <= 0:
+        raise ValueError("decoding.sample_count must be positive.")
+
+    temperature_sweep = experiment_config.get("temperature_sweep")
+    if temperature_sweep is not None:
+        if not isinstance(temperature_sweep, Mapping):
+            raise ValueError("temperature_sweep must be a mapping.")
+        temperatures = temperature_sweep.get("temperatures")
+        if not isinstance(temperatures, (list, tuple)) or not temperatures:
+            raise ValueError(
+                "temperature_sweep.temperatures must be a non-empty list."
+            )
+        if any(float(value) <= 0.0 for value in temperatures):
+            raise ValueError(
+                "Every temperature_sweep temperature must be positive."
+            )
+        if int(temperature_sweep.get("sample_count", 10)) <= 0:
+            raise ValueError(
+                "temperature_sweep.sample_count must be positive."
+            )
+        top_p = float(temperature_sweep.get("top_p", 0.9))
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError(
+                "temperature_sweep.top_p must lie in (0, 1]."
+            )
+
 
 def _cpu_smoke_test() -> None:
     config_path = Path(
@@ -409,6 +499,7 @@ def _cpu_smoke_test() -> None:
         "free_static_full_true_s1",
         "free_static_coarse_only",
         "free_static_full_predicted_s1",
+        "modern_tcn_dynamic_coarse_mc10",
     }
 
     missing_presets = (
@@ -457,6 +548,10 @@ def _cpu_smoke_test() -> None:
     ]
     free_static_predicted_s1 = typed[
         "free_static_full_predicted_s1"
+    ]
+
+    modern_tcn_token = typed[
+        "modern_tcn_dynamic_coarse_mc10"
     ]
 
     assert (
@@ -642,6 +737,24 @@ def _cpu_smoke_test() -> None:
             )
             == 0.0
         )
+
+
+
+    assert modern_tcn_token.temporal.type == "modern_tcn"
+    assert modern_tcn_token.token_input_representation == "bsq_bits"
+    assert modern_tcn_token.d_model == 32
+    assert modern_tcn_token.temporal.modern_tcn_patch_size == 8
+    assert modern_tcn_token.temporal.modern_tcn_patch_stride == 4
+    assert modern_tcn_token.temporal.modern_tcn_large_kernel == 15
+    assert modern_tcn_token.temporal.modern_tcn_num_blocks == 1
+    assert modern_tcn_token.graph.type == "dynamic"
+    assert modern_tcn_token.graph.num_heads == 1
+    assert modern_tcn_token.graph.hidden_dim == 32
+    assert modern_tcn_token.spatial.gate_type == "learned_scalar"
+    assert modern_tcn_token.spatial.initial_beta == 0.5
+    assert modern_tcn_token.heads.future_token_mode == "coarse_only"
+    assert modern_tcn_token.heads.s1_vocabulary_size == 1024
+    assert modern_tcn_token.temporal_output_length == 15
 
     print(
         "Dynamic-graph configuration smoke test passed."

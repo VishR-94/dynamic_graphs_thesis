@@ -783,7 +783,7 @@ class FutureTokenPredictorBase(
         config.validate()
 
         self.context_length = int(
-            config.context_length
+            config.temporal_output_length
         )
         self.prediction_length = int(
             config.prediction_length
@@ -852,8 +852,8 @@ class FutureTokenPredictorBase(
         self,
         context_memory: Tensor,
         *,
-        s1_embedding: nn.Embedding,
-        s2_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
+        s2_embedding: nn.Embedding | None,
     ) -> tuple[int, Tensor, Tensor]:
         (
             batch_size,
@@ -867,23 +867,30 @@ class FutureTokenPredictorBase(
             d_model=self.d_model,
         )
 
-        _validate_embedding(
-            s1_embedding,
-            name="s1_embedding",
-            vocabulary_size=(
-                self.s1_vocabulary_size
-            ),
-            d_model=self.d_model,
-        )
+        if s1_embedding is not None:
+            _validate_embedding(
+                s1_embedding,
+                name="s1_embedding",
+                vocabulary_size=(
+                    self.s1_vocabulary_size
+                ),
+                d_model=self.d_model,
+            )
 
-        _validate_embedding(
-            s2_embedding,
-            name="s2_embedding",
-            vocabulary_size=(
-                self.s2_vocabulary_size
-            ),
-            d_model=self.d_model,
-        )
+        if s2_embedding is not None:
+            _validate_embedding(
+                s2_embedding,
+                name="s2_embedding",
+                vocabulary_size=(
+                    self.s2_vocabulary_size
+                ),
+                d_model=self.d_model,
+            )
+
+        if self.predict_s2 and s1_embedding is None:
+            raise ValueError(
+                "Full-token prediction requires the shared s1 embedding."
+            )
 
         memory = _flatten_nodes(
             context_memory
@@ -942,7 +949,7 @@ class FutureTokenPredictorBase(
         self,
         future_hidden: Tensor,
         *,
-        s1_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
         target_s1: Tensor | None,
         token_selection: TokenSelection,
         temperature: float,
@@ -1002,6 +1009,11 @@ class FutureTokenPredictorBase(
                 f"{self.s2_conditioning!r}."
             )
 
+        if s1_embedding is None:
+            raise RuntimeError(
+                "Full-token classification requires s1_embedding."
+            )
+
         s2_logits = self.token_heads.s2_logits(
             future_hidden,
             s1_for_fine,
@@ -1028,8 +1040,8 @@ class FutureTokenPredictorBase(
         self,
         context_memory: Tensor,
         *,
-        s1_embedding: nn.Embedding,
-        s2_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
+        s2_embedding: nn.Embedding | None,
         target_s1: Tensor | None = None,
         target_s2: Tensor | None = None,
         token_selection: TokenSelection = "argmax",
@@ -1044,8 +1056,8 @@ class FutureTokenPredictorBase(
         self,
         context_memory: Tensor,
         *,
-        s1_embedding: nn.Embedding,
-        s2_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
+        s2_embedding: nn.Embedding | None,
         token_selection: TokenSelection = "argmax",
         temperature: float = 1.0,
         top_k: int = 0,
@@ -1082,8 +1094,8 @@ class StructuredParallelFuturePredictor(
         self,
         context_memory: Tensor,
         *,
-        s1_embedding: nn.Embedding,
-        s2_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
+        s2_embedding: nn.Embedding | None,
     ) -> tuple[int, Tensor]:
         (
             batch_size,
@@ -1128,8 +1140,8 @@ class StructuredParallelFuturePredictor(
         self,
         context_memory: Tensor,
         *,
-        s1_embedding: nn.Embedding,
-        s2_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
+        s2_embedding: nn.Embedding | None,
         target_s1: Tensor | None = None,
         target_s2: Tensor | None = None,
         token_selection: TokenSelection = "argmax",
@@ -1180,8 +1192,8 @@ class StructuredParallelFuturePredictor(
         self,
         context_memory: Tensor,
         *,
-        s1_embedding: nn.Embedding,
-        s2_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
+        s2_embedding: nn.Embedding | None,
         token_selection: TokenSelection = "argmax",
         temperature: float = 1.0,
         top_k: int = 0,
@@ -1243,8 +1255,8 @@ class AutoregressiveFuturePredictor(
         target_s1: Tensor,
         target_s2: Tensor | None,
         context_summary: Tensor,
-        s1_embedding: nn.Embedding,
-        s2_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
+        s2_embedding: nn.Embedding | None,
         device: torch.device,
     ) -> Tensor:
         target_s1 = _validate_target_tokens(
@@ -1321,8 +1333,8 @@ class AutoregressiveFuturePredictor(
         self,
         context_memory: Tensor,
         *,
-        s1_embedding: nn.Embedding,
-        s2_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
+        s2_embedding: nn.Embedding | None,
         target_s1: Tensor | None = None,
         target_s2: Tensor | None = None,
         token_selection: TokenSelection = "argmax",
@@ -1410,8 +1422,8 @@ class AutoregressiveFuturePredictor(
         self,
         context_memory: Tensor,
         *,
-        s1_embedding: nn.Embedding,
-        s2_embedding: nn.Embedding,
+        s1_embedding: nn.Embedding | None,
+        s2_embedding: nn.Embedding | None,
         token_selection: TokenSelection = "argmax",
         temperature: float = 1.0,
         top_k: int = 0,

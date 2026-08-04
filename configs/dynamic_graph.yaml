@@ -47,6 +47,7 @@ models:
     d_model: 64
     num_st_blocks: 1
     use_node_embedding: true
+    token_input_representation: hierarchical_embedding
     temporal:
       type: transformer
       num_layers: 1
@@ -58,6 +59,14 @@ models:
       - 1
       - 2
       - 4
+      modern_tcn:
+        patch_size: 8
+        patch_stride: 4
+        ffn_ratio: 1
+        num_blocks: 1
+        large_kernel: 15
+        small_kernel: 5
+        dropout: 0.05
     graph:
       type: mtgnn_static
       num_heads: 2
@@ -70,6 +79,12 @@ models:
       base_graph_type: mtgnn_static
       gate_type: learned_scalar
       initial_alpha: 0.5
+    spatial:
+      num_layers: 1
+      feedforward_multiplier: 2
+      dropout: 0.0
+      gate_type: none
+      initial_beta: 1.0
     heads:
       prediction_length: 60
       evaluation_horizons:
@@ -105,7 +120,10 @@ models:
       loss_weight: 0.0
       num_channels: 5
 training:
+  optimizer: adamw
+  scheduler: none
   learning_rate: 0.0001
+  graph_learning_rate: 0.0001
   weight_decay: 0.0
   batch_size: 2
   num_workers: 0
@@ -133,12 +151,126 @@ training:
     - 30
     - 60
 decoding:
+  # Training/checkpoint selection is deliberately deterministic.
   token_selection: argmax
   temperature: 1.0
   top_k: 0
   top_p: 1.0
   sample_count: 1
+
+# Post-training inference-only Monte Carlo sweep. Temperature never enters
+# the supervised cross-entropy objective or checkpoint selection.
+temperature_sweep:
+  temperatures:
+    - 0.3
+    - 0.45
+    - 0.6
+    - 0.8
+    - 1.0
+  sample_count: 10
+  top_k: 0
+  top_p: 0.9
+  seed: 42
 presets:
+  modern_tcn_dynamic_coarse_mc10:
+    models:
+      dynamic_graph:
+        num_nodes: 93
+        context_length: 60
+        d_model: 32
+        num_st_blocks: 1
+        use_node_embedding: false
+        token_input_representation: bsq_bits
+
+        temporal:
+          type: modern_tcn
+          num_layers: 1
+          num_heads: 4
+          feedforward_multiplier: 2
+          dropout: 0.0
+          kernel_size: 3
+          dilations: [1, 2, 4]
+          modern_tcn:
+            patch_size: 8
+            patch_stride: 4
+            ffn_ratio: 1
+            num_blocks: 1
+            large_kernel: 15
+            small_kernel: 5
+            dropout: 0.05
+
+        graph:
+          type: dynamic
+          num_heads: 1
+          hidden_dim: 32
+          activation: softmax
+          add_self_loops: false
+          base_graph_type: free_static
+          gate_type: none
+          initial_alpha: 0.5
+
+        spatial:
+          num_layers: 1
+          feedforward_multiplier: 2
+          dropout: 0.0
+          gate_type: learned_scalar
+          initial_beta: 0.5
+
+        heads:
+          prediction_length: 60
+          evaluation_horizons: [1, 5, 15, 30, 60]
+          s1_vocabulary_size: 1024
+          s2_vocabulary_size: 1024
+          s2_loss_weight: 0.0
+          future_token_mode: coarse_only
+          s2_conditioning: true_s1
+
+        future_predictor:
+          type: structured_parallel
+          num_layers: 1
+          num_heads: 4
+          feedforward_multiplier: 2
+          dropout: 0.0
+
+        loss:
+          horizon_weighting: uniform
+
+        graph_regularisation:
+          graph_reg_layer: -1
+          graph_reg_warmup_epochs: 0
+          graph_entropy_reg: 0.0
+          graph_target_entropy: null
+          graph_target_entropy_reg: 0.0
+          graph_temporal_smooth_reg: 0.0
+
+        backcast:
+          enabled: false
+          loss_weight: 0.0
+          num_channels: 5
+
+    training:
+      optimizer: adam
+      scheduler: modern_tcn_type3
+      learning_rate: 0.0001
+      graph_learning_rate: 0.0005
+      weight_decay: 0.0
+      batch_size: 2
+      num_workers: 0
+      max_epochs: 100
+      patience: 10
+      seed: 42
+      gradient_clip_norm: 1.0
+      mixed_precision: true
+      early_stopping_metric: decoded_cumulative_log_change_mae
+      early_stopping_horizons: [1, 5, 15, 30, 60]
+
+    decoding:
+      token_selection: argmax
+      temperature: 1.0
+      top_k: 0
+      top_p: 1.0
+      sample_count: 1
+
   structured_parallel_uniform:
     models:
       dynamic_graph:

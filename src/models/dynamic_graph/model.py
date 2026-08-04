@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Mapping
 
 import torch
@@ -17,6 +18,7 @@ from .future_predictor import (
     FutureTokenPrediction,
     TokenSelection,
     build_future_token_predictor,
+    select_token_ids,
 )
 from .graph_learners import (
     BaseDyGraphDynamicBaseGraphLearner,
@@ -34,6 +36,7 @@ from .modules import (
     SpatialMessagePassing,
     build_temporal_encoder,
 )
+from .modern_tcn_token import ModernTCNTokenEncoder
 
 
 @dataclass
@@ -99,6 +102,110 @@ class GeneratedTokenForecast:
         )
 
 
+@dataclass
+class SampledGeneratedTokenForecast:
+    """Multiple generated paths sharing one encoded context/graph.
+
+    ``token_ids`` has shape ``[S, B, P, N, 2]``. The forecast logits and
+    graph artefacts are shared because structured-parallel coarse logits are
+    deterministic given the observed context; only categorical selection is
+    repeated.
+    """
+
+    token_ids: Tensor
+    forecast: TokenForecastOutput
+
+    def validate(
+        self,
+        config: DynamicGraphModelConfig,
+        *,
+        sample_count: int,
+        batch_size: int,
+    ) -> None:
+        expected = (
+            int(sample_count),
+            int(batch_size),
+            config.prediction_length,
+            config.num_nodes,
+            2,
+        )
+        if tuple(self.token_ids.shape) != expected:
+            raise ValueError(
+                f"sampled token_ids has shape {tuple(self.token_ids.shape)}; "
+                f"expected {expected}."
+            )
+        if not config.heads.predicts_s2 and torch.any(
+            self.token_ids[..., 1] != 0
+        ):
+            raise ValueError(
+                "Coarse-only sampled paths must use zero fine placeholders."
+            )
+        self.forecast.validate(config, batch_size=batch_size)
+
+
+class TokenSpatialBranchGate(nn.Module):
+    """FP32 scalar blend between temporal and graph-aware token features."""
+
+    def __init__(self, *, gate_type: str, initial_beta: float) -> None:
+        super().__init__()
+        if gate_type not in {"none", "fixed", "learned_scalar"}:
+            raise ValueError(f"Unsupported spatial gate type {gate_type!r}.")
+        if not 0.0 <= float(initial_beta) <= 1.0:
+            raise ValueError("initial_beta must lie in [0, 1].")
+        self.gate_type = str(gate_type)
+        self.initial_beta = float(initial_beta)
+        if gate_type == "none":
+            self.register_parameter("raw_beta", None)
+            self.register_buffer("fixed_beta", None, persistent=False)
+        elif gate_type == "fixed":
+            self.register_parameter("raw_beta", None)
+            self.register_buffer(
+                "fixed_beta",
+                torch.tensor(self.initial_beta, dtype=torch.float32),
+                persistent=True,
+            )
+        else:
+            epsilon = 1.0e-6
+            clipped = min(max(self.initial_beta, epsilon), 1.0 - epsilon)
+            raw = math.log(clipped / (1.0 - clipped))
+            self.raw_beta = nn.Parameter(torch.tensor(raw, dtype=torch.float32))
+            self.register_buffer("fixed_beta", None, persistent=False)
+
+    def beta(self, *, device: torch.device | None = None) -> Tensor:
+        if self.gate_type == "none":
+            value = torch.tensor(1.0, dtype=torch.float32)
+        elif self.gate_type == "fixed":
+            if self.fixed_beta is None:
+                raise RuntimeError("Fixed spatial beta is missing.")
+            value = self.fixed_beta
+        else:
+            if self.raw_beta is None:
+                raise RuntimeError("Learned spatial beta is missing.")
+            value = torch.sigmoid(self.raw_beta)
+        if device is not None:
+            value = value.to(device=device, dtype=torch.float32)
+        return value
+
+    def forward(
+        self,
+        temporal_hidden: Tensor,
+        graph_hidden: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if temporal_hidden.shape != graph_hidden.shape:
+            raise ValueError(
+                "temporal_hidden and graph_hidden must have identical shapes."
+            )
+        beta = self.beta(device=temporal_hidden.device)
+        device_type = temporal_hidden.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            fused_float = torch.lerp(
+                temporal_hidden.float(),
+                graph_hidden.float(),
+                beta,
+            )
+        return fused_float.to(dtype=temporal_hidden.dtype), beta
+
+
 class DynamicGraphTokenForecaster(nn.Module):
     """Shared token forecaster for real and synthetic experiments.
 
@@ -140,6 +247,7 @@ class DynamicGraphTokenForecaster(nn.Module):
         correlation_threshold: float | None = None,
         correlation_empty_row_policy: EmptyCorrelationRowPolicy = "error",
         oracle_graph: Tensor | None = None,
+        modern_tcn_model_cls: type[nn.Module] | None = None,
     ) -> None:
         super().__init__()
         config.validate()
@@ -160,22 +268,31 @@ class DynamicGraphTokenForecaster(nn.Module):
         )
         self._stored_oracle_graph = oracle_graph
 
-        self.token_embedding = HierarchicalTokenEmbedding(
-            config
-        )
-
-        self.temporal_blocks = nn.ModuleList(
-            [
-                build_temporal_encoder(
-                    d_model=config.d_model,
-                    config=config.temporal,
+        if config.temporal.type == "modern_tcn":
+            self.token_embedding: HierarchicalTokenEmbedding | None = None
+            self.modern_tcn_encoder: ModernTCNTokenEncoder | None = (
+                ModernTCNTokenEncoder(
+                    config,
+                    official_model_cls=modern_tcn_model_cls,
                 )
-                for _ in range(config.num_st_blocks)
-            ]
-        )
+            )
+            self.temporal_blocks = nn.ModuleList()
+        else:
+            self.token_embedding = HierarchicalTokenEmbedding(config)
+            self.modern_tcn_encoder = None
+            self.temporal_blocks = nn.ModuleList(
+                [
+                    build_temporal_encoder(
+                        d_model=config.d_model,
+                        config=config.temporal,
+                    )
+                    for _ in range(config.num_st_blocks)
+                ]
+            )
 
         self.graph_learners = nn.ModuleList()
         self.spatial_blocks = nn.ModuleList()
+        self.spatial_gates = nn.ModuleList()
 
         for _ in range(config.num_st_blocks):
             graph_learner, spatial_module = (
@@ -186,6 +303,17 @@ class DynamicGraphTokenForecaster(nn.Module):
             )
             self.spatial_blocks.append(
                 spatial_module
+            )
+            gate_type = (
+                "none"
+                if config.graph.type == "none"
+                else config.spatial.gate_type
+            )
+            self.spatial_gates.append(
+                TokenSpatialBranchGate(
+                    gate_type=gate_type,
+                    initial_beta=config.spatial.initial_beta,
+                )
             )
 
         self.future_predictor = (
@@ -212,6 +340,7 @@ class DynamicGraphTokenForecaster(nn.Module):
         correlation_threshold: float | None = None,
         correlation_empty_row_policy: EmptyCorrelationRowPolicy = "error",
         oracle_graph: Tensor | None = None,
+        modern_tcn_model_cls: type[nn.Module] | None = None,
     ) -> "DynamicGraphTokenForecaster":
         """Build the model from a resolved dynamic-graph config."""
         return cls(
@@ -225,6 +354,7 @@ class DynamicGraphTokenForecaster(nn.Module):
                 correlation_empty_row_policy
             ),
             oracle_graph=oracle_graph,
+            modern_tcn_model_cls=modern_tcn_model_cls,
         )
 
     def _validate_graph_resources(
@@ -317,11 +447,11 @@ class DynamicGraphTokenForecaster(nn.Module):
             spatial_module = SpatialMessagePassing(
                 d_model=config.d_model,
                 num_heads=config.graph.num_heads,
-                num_layers=1,
+                num_layers=config.spatial.num_layers,
                 feedforward_multiplier=(
-                    config.temporal.feedforward_multiplier
+                    config.spatial.feedforward_multiplier
                 ),
-                dropout=config.temporal.dropout,
+                dropout=config.spatial.dropout,
             )
 
         return graph_learner, spatial_module
@@ -374,7 +504,7 @@ class DynamicGraphTokenForecaster(nn.Module):
         token_ids: Tensor,
         *,
         oracle_graph: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, GraphOutput]:
+    ) -> tuple[Tensor, Tensor, GraphOutput, Tensor | None]:
         """Encode observed tokens and expose the graphs used by the model.
 
         Returns:
@@ -387,48 +517,61 @@ class DynamicGraphTokenForecaster(nn.Module):
             graph_output:
                 Final selected graph plus every block-level selected graph.
         """
-        hidden = self.token_embedding(
-            token_ids
-        )
+        if self.modern_tcn_encoder is not None:
+            hidden = self.modern_tcn_encoder(token_ids)
+            temporal_sequence = (hidden,)
+        else:
+            if self.token_embedding is None:
+                raise RuntimeError("Hierarchical token embedding is missing.")
+            hidden = self.token_embedding(token_ids)
+            temporal_sequence = tuple(self.temporal_blocks)
 
         per_layer_graphs: list[Tensor | None] = []
-        final_graph_output = GraphOutput(
-            selected=None,
-        )
+        final_graph_output = GraphOutput(selected=None)
+        final_spatial_beta: Tensor | None = None
 
-        for (
-            temporal_block,
-            graph_learner,
-            spatial_block,
-        ) in zip(
-            self.temporal_blocks,
-            self.graph_learners,
-            self.spatial_blocks,
-            strict=True,
-        ):
-            temporal_hidden = temporal_block(
-                hidden
+        for layer_index, (graph_learner, spatial_block, spatial_gate) in enumerate(
+            zip(
+                self.graph_learners,
+                self.spatial_blocks,
+                self.spatial_gates,
+                strict=True,
             )
+        ):
+            if self.modern_tcn_encoder is not None:
+                if layer_index != 0:
+                    raise RuntimeError(
+                        "The token ModernTCN architecture supports one ST block."
+                    )
+                temporal_hidden = hidden
+            else:
+                temporal_block = temporal_sequence[layer_index]
+                temporal_hidden = temporal_block(hidden)
 
             block_graph = self._run_graph_learner(
                 graph_learner,
                 temporal_hidden,
                 oracle_graph=oracle_graph,
             )
-
-            per_layer_graphs.append(
-                block_graph.selected
-            )
+            per_layer_graphs.append(block_graph.selected)
 
             if block_graph.selected is None:
-                hidden = spatial_block(
-                    temporal_hidden,
-                    None,
-                )
+                graph_hidden = spatial_block(temporal_hidden, None)
+                hidden = graph_hidden
+                final_spatial_beta = None
             else:
-                hidden = spatial_block(
+                graph_hidden = spatial_block(
                     temporal_hidden,
                     block_graph.selected,
+                )
+                hidden, beta_value = spatial_gate(
+                    temporal_hidden,
+                    graph_hidden,
+                )
+                final_spatial_beta = (
+                    None
+                    if spatial_gate.gate_type == "none"
+                    else beta_value
                 )
 
             final_graph_output = block_graph
@@ -465,6 +608,7 @@ class DynamicGraphTokenForecaster(nn.Module):
             hidden,
             context_hidden,
             graph_output,
+            final_spatial_beta,
         )
 
     def _build_forecast_output(
@@ -474,6 +618,7 @@ class DynamicGraphTokenForecaster(nn.Module):
         context_memory: Tensor,
         context_hidden: Tensor,
         graph_output: GraphOutput,
+        spatial_beta: Tensor | None,
     ) -> TokenForecastOutput:
         backcast = (
             None
@@ -493,6 +638,7 @@ class DynamicGraphTokenForecaster(nn.Module):
             # retains its historical ``temporal_hidden`` name.
             temporal_hidden=context_memory,
             future_hidden=prediction.future_hidden,
+            spatial_beta=spatial_beta,
             backcast=backcast,
         )
 
@@ -534,6 +680,7 @@ class DynamicGraphTokenForecaster(nn.Module):
             context_memory,
             context_hidden,
             graph_output,
+            spatial_beta,
         ) = self._encode_context(
             token_ids,
             oracle_graph=oracle_graph,
@@ -542,10 +689,14 @@ class DynamicGraphTokenForecaster(nn.Module):
         prediction = self.future_predictor(
             context_memory,
             s1_embedding=(
-                self.token_embedding.s1_embedding
+                None
+                if self.token_embedding is None
+                else self.token_embedding.s1_embedding
             ),
             s2_embedding=(
-                self.token_embedding.s2_embedding
+                None
+                if self.token_embedding is None
+                else self.token_embedding.s2_embedding
             ),
             target_s1=target_s1,
             target_s2=target_s2,
@@ -560,7 +711,100 @@ class DynamicGraphTokenForecaster(nn.Module):
             context_memory=context_memory,
             context_hidden=context_hidden,
             graph_output=graph_output,
+            spatial_beta=spatial_beta,
         )
+
+    def spatial_mixing_beta(self) -> Tensor | None:
+        """Return the final spatial branch gate value, when active."""
+        if not self.spatial_gates:
+            return None
+        gate = self.spatial_gates[-1]
+        if gate.gate_type == "none":
+            return None
+        return gate.beta()
+
+    def generate_samples(
+        self,
+        token_ids: Tensor,
+        *,
+        sample_count: int,
+        oracle_graph: Tensor | None = None,
+        token_selection: TokenSelection = "sample",
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ) -> SampledGeneratedTokenForecast:
+        """Generate multiple complete future paths for decoded averaging.
+
+        The efficient shared-logit path is intentionally restricted to the
+        final experiment contract: structured-parallel, coarse-only output.
+        All 60 categorical positions are sampled for every path; prices are
+        averaged only after the frozen coarse decoder.
+        """
+        if int(sample_count) <= 0:
+            raise ValueError("sample_count must be positive.")
+        if token_selection == "argmax" and int(sample_count) != 1:
+            raise ValueError("argmax generation requires sample_count=1.")
+        if self.config.future_predictor.type != "structured_parallel":
+            raise ValueError(
+                "Efficient multi-path generation currently requires the "
+                "structured-parallel predictor."
+            )
+        if self.config.heads.predicts_s2:
+            raise ValueError(
+                "The final Monte Carlo path is coarse-only; s2 sampling is "
+                "deliberately unsupported."
+            )
+
+        (
+            context_memory,
+            context_hidden,
+            graph_output,
+            spatial_beta,
+        ) = self._encode_context(token_ids, oracle_graph=oracle_graph)
+
+        prediction = self.future_predictor.generate(
+            context_memory,
+            s1_embedding=None,
+            s2_embedding=None,
+            token_selection="argmax",
+            temperature=1.0,
+            top_k=0,
+            top_p=1.0,
+        )
+        forecast = self._build_forecast_output(
+            prediction=prediction,
+            context_memory=context_memory,
+            context_hidden=context_hidden,
+            graph_output=graph_output,
+            spatial_beta=spatial_beta,
+        )
+
+        samples = []
+        for _ in range(int(sample_count)):
+            selected_s1 = select_token_ids(
+                prediction.s1_logits,
+                mode=token_selection,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+            samples.append(
+                torch.stack(
+                    (selected_s1, torch.zeros_like(selected_s1)),
+                    dim=-1,
+                )
+            )
+        result = SampledGeneratedTokenForecast(
+            token_ids=torch.stack(samples, dim=0),
+            forecast=forecast,
+        )
+        result.validate(
+            self.config,
+            sample_count=int(sample_count),
+            batch_size=int(token_ids.shape[0]),
+        )
+        return result
 
     def generate(
         self,
@@ -577,6 +821,7 @@ class DynamicGraphTokenForecaster(nn.Module):
             context_memory,
             context_hidden,
             graph_output,
+            spatial_beta,
         ) = self._encode_context(
             token_ids,
             oracle_graph=oracle_graph,
@@ -585,10 +830,14 @@ class DynamicGraphTokenForecaster(nn.Module):
         prediction = self.future_predictor.generate(
             context_memory,
             s1_embedding=(
-                self.token_embedding.s1_embedding
+                None
+                if self.token_embedding is None
+                else self.token_embedding.s1_embedding
             ),
             s2_embedding=(
-                self.token_embedding.s2_embedding
+                None
+                if self.token_embedding is None
+                else self.token_embedding.s2_embedding
             ),
             token_selection=token_selection,
             temperature=temperature,
@@ -601,6 +850,7 @@ class DynamicGraphTokenForecaster(nn.Module):
             context_memory=context_memory,
             context_hidden=context_hidden,
             graph_output=graph_output,
+            spatial_beta=spatial_beta,
         )
 
         selected_s2 = (
