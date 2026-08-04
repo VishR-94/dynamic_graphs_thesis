@@ -3392,16 +3392,10 @@ def main() -> None:
             f"Observed {early_stopping_metric!r}."
         )
 
-    if (
-        early_stopping_metric
-        == "validation_token_loss"
-        and args.validation_decode_every != 1
-    ):
-        raise ValueError(
-            "validation_token_loss early stopping currently requires "
-            "--validation-decode-every=1 so that the selected "
-            "checkpoint also has matching decoded validation artefacts."
-        )
+    # Validation-token-loss selection is evaluated every epoch and is
+    # deliberately decoupled from the much more expensive frozen-decoder
+    # validation pass.  The selected CE checkpoint is decoded once after
+    # training so its saved price-space artefacts match best_checkpoint.pt.
 
     if (
         data_mode == "synthetic"
@@ -3437,9 +3431,10 @@ def main() -> None:
     )
     if checkpoint_token_selection != "argmax" or checkpoint_sample_count != 1:
         raise ValueError(
-            "Training/checkpoint selection must use deterministic argmax "
-            "decoding with decoding.sample_count=1. Temperature sampling is "
-            "an inference-only sweep after the checkpoint is frozen."
+            "Training-time decoded validation diagnostics must use "
+            "deterministic argmax decoding with decoding.sample_count=1. "
+            "Temperature sampling is an inference-only sweep after the "
+            "checkpoint is frozen."
         )
 
     device = resolve_device(args.device)
@@ -3774,8 +3769,10 @@ def main() -> None:
     atomic_json_save(run_metadata, metadata_path)
 
     # best_checkpoint.pt is controlled by the configured early-stopping
-    # metric and horizon set. The final tokenized ModernTCN preset uses the
-    # deterministic argmax-decoded all-five-horizon CLG-MAE.
+    # metric.  The final tokenized ModernTCN preset selects the lowest
+    # teacher-forced validation coarse-token cross-entropy.  Deterministic
+    # argmax decoding remains a diagnostic and is regenerated once from the
+    # selected checkpoint after training.
     best_checkpoint_path = run_dir / "best_checkpoint.pt"
 
     # Secondary checkpoints do not control patience. They preserve
@@ -4075,6 +4072,38 @@ def main() -> None:
                 ),
             )
 
+            validation_ce_score = float(
+                validation_teacher.token_loss
+            )
+
+            if not math.isfinite(validation_ce_score):
+                raise ValueError(
+                    "Validation token CE is non-finite."
+                )
+
+            validation_ce_best_score = float(
+                secondary_selection_state[
+                    "validation_ce"
+                ][
+                    "best_score"
+                ]
+            )
+
+            validation_ce_improved = (
+                validation_ce_score
+                < validation_ce_best_score
+            )
+
+            if validation_ce_improved:
+                secondary_selection_state[
+                    "validation_ce"
+                ] = {
+                    "best_score": float(
+                        validation_ce_score
+                    ),
+                    "best_epoch": int(epoch),
+                }
+
             should_decode = (
                 epoch == 1
                 or epoch == max_epochs
@@ -4082,14 +4111,21 @@ def main() -> None:
             )
 
             bundle: ValidationBundle | None = None
-            primary_score: float | None = None
+            primary_score: float | None = (
+                validation_ce_score
+                if early_stopping_metric
+                == "validation_token_loss"
+                else None
+            )
 
             all_horizons_score: float | None = None
-            validation_ce_score: float | None = None
 
             improved = False
             all_horizons_improved = False
-            validation_ce_improved = False
+            selection_was_evaluated = (
+                early_stopping_metric
+                == "validation_token_loss"
+            )
 
             if should_decode:
                 bundle = generate_validation_artifacts(
@@ -4119,28 +4155,15 @@ def main() -> None:
                     primary_score = float(
                         bundle.primary_score
                     )
+                    selection_was_evaluated = True
 
                 elif (
                     early_stopping_metric
-                    == "validation_token_loss"
+                    != "validation_token_loss"
                 ):
-                    primary_score = float(
-                        validation_teacher.token_loss
-                    )
-
-                else:
                     raise AssertionError(
                         "Unsupported early-stopping metric passed "
                         "configuration validation."
-                    )
-
-                validation_ce_score = float(
-                    validation_teacher.token_loss
-                )
-
-                if not math.isfinite(validation_ce_score):
-                    raise ValueError(
-                        "Validation token CE is non-finite."
                     )
 
                 if data_mode == "real":
@@ -4185,30 +4208,19 @@ def main() -> None:
                             "best_epoch": int(epoch),
                         }
 
-                validation_ce_best_score = float(
-                    secondary_selection_state[
-                        "validation_ce"
-                    ][
-                        "best_score"
-                    ]
-                )
+            if selection_was_evaluated:
+                if primary_score is None or not math.isfinite(
+                    primary_score
+                ):
+                    raise ValueError(
+                        "The configured primary validation score is "
+                        "unavailable or non-finite."
+                    )
 
-                validation_ce_improved = (
-                    validation_ce_score
-                    < validation_ce_best_score
+                improved = (
+                    primary_score
+                    < (best_score - args.min_delta)
                 )
-
-                if validation_ce_improved:
-                    secondary_selection_state[
-                        "validation_ce"
-                    ] = {
-                        "best_score": float(
-                            validation_ce_score
-                        ),
-                        "best_epoch": int(epoch),
-                    }
-                
-                improved = primary_score < (best_score - args.min_delta)
 
                 if improved:
                     best_score = primary_score
@@ -4233,110 +4245,138 @@ def main() -> None:
                         resolved_config=resolved_config,
                         run_metadata=run_metadata,
                     )
-                    atomic_torch_save(checkpoint, best_checkpoint_path)
-                    _save_best_validation_artifacts(
-                        run_dir=run_dir,
-                        epoch=epoch,
-                        bundle=bundle,
-                        teacher_forced=validation_teacher,
-                        model=model,
+                    checkpoint[
+                        "checkpoint_selection"
+                    ] = {
+                        "name": "primary",
+                        "metric": early_stopping_metric,
+                        "horizons": (
+                            [
+                                int(horizon)
+                                for horizon in (
+                                    early_stopping_horizons
+                                )
+                            ]
+                            if early_stopping_metric
+                            == "decoded_cumulative_log_change_mae"
+                            else None
+                        ),
+                        "score": float(primary_score),
+                        "epoch": int(epoch),
+                    }
+                    atomic_torch_save(
+                        checkpoint,
+                        best_checkpoint_path,
                     )
+
+                    # A decoded bundle exists only on scheduled decoder
+                    # validation epochs.  CE-selected checkpoints that do
+                    # not coincide with one are decoded exactly once after
+                    # training, from best_checkpoint.pt.
+                    if bundle is not None:
+                        _save_best_validation_artifacts(
+                            run_dir=run_dir,
+                            epoch=epoch,
+                            bundle=bundle,
+                            teacher_forced=validation_teacher,
+                            model=model,
+                        )
                 else:
                     evaluations_without_improvement += 1
 
-                if all_horizons_improved:
-                    if all_horizons_score is None:
-                        raise AssertionError(
-                            "all_horizons_improved is True but "
-                            "all_horizons_score is unavailable."
+            if all_horizons_improved:
+                if all_horizons_score is None:
+                    raise AssertionError(
+                        "all_horizons_improved is True but "
+                        "all_horizons_score is unavailable."
+                    )
+
+                all_horizons_checkpoint = build_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    best_score=best_score,
+                    best_epoch=best_epoch,
+                    evaluations_without_improvement=(
+                        evaluations_without_improvement
+                    ),
+                    history=history,
+                    secondary_selection_state=(
+                        secondary_selection_state
+                    ),
+                    run_signature=run_signature,
+                    resolved_config=resolved_config,
+                    run_metadata=run_metadata,
+                )
+
+                all_horizons_checkpoint[
+                    "checkpoint_selection"
+                ] = {
+                    "name": "all_horizons",
+                    "metric": (
+                        "mean_validation_"
+                        "cumulative_log_change_mae"
+                    ),
+                    "horizons": [
+                        int(horizon)
+                        for horizon in (
+                            available_evaluation_horizons
                         )
+                    ],
+                    "score": float(
+                        all_horizons_score
+                    ),
+                    "epoch": int(epoch),
+                }
 
-                    all_horizons_checkpoint = build_checkpoint(
-                        model=model,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                        epoch=epoch,
-                        best_score=best_score,
-                        best_epoch=best_epoch,
-                        evaluations_without_improvement=(
-                            evaluations_without_improvement
-                        ),
-                        history=history,
-                        secondary_selection_state=(
-                            secondary_selection_state
-                        ),
-                        run_signature=run_signature,
-                        resolved_config=resolved_config,
-                        run_metadata=run_metadata,
-                    )
+                atomic_torch_save(
+                    all_horizons_checkpoint,
+                    best_all_horizons_checkpoint_path,
+                )
 
-                    all_horizons_checkpoint[
-                        "checkpoint_selection"
-                    ] = {
-                        "name": "all_horizons",
-                        "metric": (
-                            "mean_validation_"
-                            "cumulative_log_change_mae"
-                        ),
-                        "horizons": [
-                            int(horizon)
-                            for horizon in (
-                                available_evaluation_horizons
-                            )
-                        ],
-                        "score": float(
-                            all_horizons_score
-                        ),
-                        "epoch": int(epoch),
-                    }
+            # Preserve the CE view as a secondary checkpoint only when it
+            # is not already the primary selection criterion.
+            if (
+                validation_ce_improved
+                and early_stopping_metric
+                != "validation_token_loss"
+            ):
+                validation_ce_checkpoint = build_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    best_score=best_score,
+                    best_epoch=best_epoch,
+                    evaluations_without_improvement=(
+                        evaluations_without_improvement
+                    ),
+                    history=history,
+                    secondary_selection_state=(
+                        secondary_selection_state
+                    ),
+                    run_signature=run_signature,
+                    resolved_config=resolved_config,
+                    run_metadata=run_metadata,
+                )
 
-                    atomic_torch_save(
-                        all_horizons_checkpoint,
-                        best_all_horizons_checkpoint_path,
-                    )
+                validation_ce_checkpoint[
+                    "checkpoint_selection"
+                ] = {
+                    "name": "validation_ce",
+                    "metric": "validation_token_loss",
+                    "horizons": None,
+                    "score": float(
+                        validation_ce_score
+                    ),
+                    "epoch": int(epoch),
+                }
 
-                if validation_ce_improved:
-                    if validation_ce_score is None:
-                        raise AssertionError(
-                            "validation_ce_improved is True but "
-                            "validation_ce_score is unavailable."
-                        )
-
-                    validation_ce_checkpoint = build_checkpoint(
-                        model=model,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                        epoch=epoch,
-                        best_score=best_score,
-                        best_epoch=best_epoch,
-                        evaluations_without_improvement=(
-                            evaluations_without_improvement
-                        ),
-                        history=history,
-                        secondary_selection_state=(
-                            secondary_selection_state
-                        ),
-                        run_signature=run_signature,
-                        resolved_config=resolved_config,
-                        run_metadata=run_metadata,
-                    )
-
-                    validation_ce_checkpoint[
-                        "checkpoint_selection"
-                    ] = {
-                        "name": "validation_ce",
-                        "metric": "validation_token_loss",
-                        "horizons": None,
-                        "score": float(
-                            validation_ce_score
-                        ),
-                        "epoch": int(epoch),
-                    }
-
-                    atomic_torch_save(
-                        validation_ce_checkpoint,
-                        best_validation_ce_checkpoint_path,
-                    )
+                atomic_torch_save(
+                    validation_ce_checkpoint,
+                    best_validation_ce_checkpoint_path,
+                )
 
             epoch_record: dict[str, Any] = {
                 "epoch": epoch,
@@ -4564,17 +4604,107 @@ def main() -> None:
             )
 
             if (
-                should_decode
+                selection_was_evaluated
                 and evaluations_without_improvement >= patience
             ):
+                evaluation_unit = (
+                    "validation epochs"
+                    if early_stopping_metric
+                    == "validation_token_loss"
+                    else "decoded validations"
+                )
                 print(
                     "Early stopping: no primary-metric improvement across "
-                    f"{evaluations_without_improvement} decoded validations."
+                    f"{evaluations_without_improvement} "
+                    f"{evaluation_unit}."
                 )
                 break
 
         if best_epoch <= 0 or not best_checkpoint_path.is_file():
             raise RuntimeError("Training finished without a best checkpoint.")
+
+        if early_stopping_metric == "validation_token_loss":
+            # The CE-selected epoch may not coincide with a scheduled
+            # frozen-decoder validation.  Regenerate deterministic argmax
+            # price-space artefacts once from the exact selected checkpoint
+            # so best_validation_*.pt/csv and the subsequent temperature
+            # sweep all refer to the same model weights.
+            selected_checkpoint = torch.load(
+                best_checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            if selected_checkpoint.get("run_signature") != run_signature:
+                raise ValueError(
+                    "Best checkpoint run signature differs while "
+                    "regenerating selected validation artefacts."
+                )
+            model.load_state_dict(
+                selected_checkpoint["model_state_dict"],
+                strict=True,
+            )
+            model.to(device)
+
+            selected_teacher_forced = run_teacher_forced_epoch(
+                model=model,
+                loader=validation_loader,
+                device=device,
+                optimizer=None,
+                scaler=scaler,
+                use_amp=use_amp,
+                gradient_clip_norm=gradient_clip_norm,
+                description=(
+                    "selected CE checkpoint validation supervised "
+                    "token loss"
+                ),
+                graph_regularisation_config=(
+                    graph_regularisation_config
+                ),
+                current_epoch=max(0, best_epoch - 1),
+                expected_origin_delta=(
+                    expected_origin_delta
+                ),
+            )
+
+            selected_bundle = generate_validation_artifacts(
+                model=model,
+                loader=validation_loader,
+                dataset=validation_dataset_full,
+                device=device,
+                use_amp=use_amp,
+                decoding_config=decoding_config,
+                tokenizer=tokenizer,
+                raw_train_split=raw_train_split,
+                decode_series_batch_size=(
+                    args.decode_series_batch_size
+                ),
+                early_stopping_horizons=(
+                    early_stopping_horizons
+                ),
+            )
+
+            _save_best_validation_artifacts(
+                run_dir=run_dir,
+                epoch=best_epoch,
+                bundle=selected_bundle,
+                teacher_forced=(
+                    selected_teacher_forced
+                ),
+                model=model,
+            )
+
+            if selected_bundle.primary_score is not None:
+                run_metadata[
+                    "selected_checkpoint_argmax_decoded_score"
+                ] = float(
+                    selected_bundle.primary_score
+                )
+            run_metadata[
+                "selected_checkpoint_artifacts_regenerated"
+            ] = True
+            run_metadata[
+                "selected_checkpoint_artifacts_epoch"
+            ] = int(best_epoch)
 
         run_metadata.update(
             {

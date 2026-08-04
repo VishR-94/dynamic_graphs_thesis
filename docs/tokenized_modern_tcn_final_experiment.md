@@ -79,19 +79,24 @@ training target: target_s1 [B, 60, N]
 training output: s1 logits [B, 60, N, 1024]
 ```
 
-Temperature does not enter the training loss. The training and checkpoint
-policy is deterministic:
+Temperature does not enter the training loss. `best_checkpoint.pt` is
+selected by the lowest teacher-forced September validation coarse-token
+cross-entropy:
 
 ```text
-token selection: argmax
-sample count: 1
-decoder: frozen Kronos coarse decoder
-selection metric: decoded cumulative-log-change MAE
-selection horizons: [1, 5, 15, 30, 60]
+selection metric: validation_token_loss
+coarse-only interpretation: validation s1 cross-entropy
+selection positions: all 60 future minutes
+selection assets: all 93 assets
+patience unit: validation epochs
 ```
 
-Thus `best_checkpoint.pt` is selected by the all-five-horizon mean September
-validation Log MAE produced by one deterministic argmax-decoded path.
+Cross-entropy is evaluated every epoch and scores the complete categorical
+distribution that is later sampled. Frozen-decoder argmax validation is no
+longer required on every epoch. It may be run periodically as a diagnostic,
+and after training the runner reloads the exact CE-selected checkpoint and
+regenerates its deterministic argmax price-space metrics and saved artefacts.
+Temperature remains an inference-only calibration parameter.
 
 ## Inference-only temperature sweep
 

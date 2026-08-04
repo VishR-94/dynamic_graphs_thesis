@@ -261,7 +261,11 @@ presets:
       seed: 42
       gradient_clip_norm: 1.0
       mixed_precision: true
-      early_stopping_metric: decoded_cumulative_log_change_mae
+      # Coarse-token cross-entropy is a proper scoring rule for the full
+      # categorical predictive distribution used by Monte Carlo sampling.
+      # In coarse-only mode, validation_token_loss is exactly validation
+      # s1 cross-entropy over all 60 future positions and all assets.
+      early_stopping_metric: validation_token_loss
       early_stopping_horizons: [1, 5, 15, 30, 60]
 
     decoding:

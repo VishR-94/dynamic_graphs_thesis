@@ -2,9 +2,11 @@ from __future__ import annotations
 
 """CPU contracts for the final coarse-token ModernTCN graph experiment."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import yaml
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -131,6 +133,42 @@ def _config() -> DynamicGraphModelConfig:
         ),
     )
 
+
+
+def test_final_preset_uses_validation_ce_selection() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = repo_root / "configs" / "dynamic_graph.yaml"
+    payload = yaml.safe_load(
+        config_path.read_text(encoding="utf-8")
+    )
+    preset = payload["presets"][
+        "modern_tcn_dynamic_coarse_mc10"
+    ]
+    training = preset["training"]
+    decoding = preset["decoding"]
+    temperature_sweep = payload["temperature_sweep"]
+
+    assert training["early_stopping_metric"] == (
+        "validation_token_loss"
+    )
+    assert decoding["token_selection"] == "argmax"
+    assert int(decoding["sample_count"]) == 1
+    assert int(temperature_sweep["sample_count"]) == 10
+
+    runner_source = (
+        repo_root
+        / "src"
+        / "training"
+        / "run_dynamic_graph.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        "validation_token_loss early stopping currently requires"
+        not in runner_source
+    )
+    assert (
+        "selected_checkpoint_artifacts_regenerated"
+        in runner_source
+    )
 
 def test_post_bsq_code_contract() -> None:
     token_ids = torch.tensor(
@@ -420,6 +458,7 @@ def test_ten_path_decode_then_average_contract() -> None:
     assert tuple(bundle.graph_artifacts["spatial_beta"].shape) == (2, 1)
 
 def main() -> None:
+    test_final_preset_uses_validation_ce_selection()
     test_post_bsq_code_contract()
     test_model_shapes_gradients_and_sampling()
     test_decoded_continuous_average()
