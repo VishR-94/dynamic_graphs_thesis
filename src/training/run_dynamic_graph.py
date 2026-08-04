@@ -687,6 +687,23 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serialisable.")
 
 
+def load_json(path: Path) -> dict[str, Any]:
+    """Load one JSON object from disk."""
+
+    path = Path(path)
+
+    with path.open("r", encoding="utf-8") as file:
+        values = json.load(file)
+
+    if not isinstance(values, dict):
+        raise TypeError(
+            f"Expected a JSON object in {path}; "
+            f"received {type(values).__name__}."
+        )
+
+    return values
+
+
 def atomic_json_save(values: Mapping[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")

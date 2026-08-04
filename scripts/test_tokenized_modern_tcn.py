@@ -3,6 +3,7 @@ from __future__ import annotations
 """CPU contracts for the final coarse-token ModernTCN graph experiment."""
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import torch
@@ -133,6 +134,31 @@ def _config() -> DynamicGraphModelConfig:
         ),
     )
 
+
+
+def test_runner_json_loader_contract() -> None:
+    """Inference-only modes can reload an existing run metadata file."""
+
+    with TemporaryDirectory() as directory:
+        metadata_path = (
+            Path(directory)
+            / "run_metadata.json"
+        )
+        expected = {
+            "status": "completed",
+            "run_signature": "test-signature",
+        }
+
+        token_runner.atomic_json_save(
+            expected,
+            metadata_path,
+        )
+
+        observed = token_runner.load_json(
+            metadata_path
+        )
+
+        assert observed == expected
 
 
 def test_final_preset_uses_validation_ce_selection() -> None:
@@ -458,6 +484,7 @@ def test_ten_path_decode_then_average_contract() -> None:
     assert tuple(bundle.graph_artifacts["spatial_beta"].shape) == (2, 1)
 
 def main() -> None:
+    test_runner_json_loader_contract()
     test_final_preset_uses_validation_ce_selection()
     test_post_bsq_code_contract()
     test_model_shapes_gradients_and_sampling()
