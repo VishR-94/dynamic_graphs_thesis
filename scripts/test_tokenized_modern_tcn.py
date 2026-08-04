@@ -161,6 +161,170 @@ def test_runner_json_loader_contract() -> None:
         assert observed == expected
 
 
+def test_evaluation_signature_allows_code_only_commit_change() -> None:
+    """Legacy checkpoints remain evaluable after a code-only bug fix."""
+
+    resolved_config = {
+        "training": {"learning_rate": 1.0e-4},
+        "models": {"dynamic_graph": {"d_model": 32}},
+        "temperature_sweep": {"temperatures": [0.6]},
+    }
+    payload = token_runner._evaluation_compatibility_payload(
+        resolved_config=resolved_config,
+        train_cache="/cache/train.pt",
+        validation_cache="/cache/val.pt",
+        data_mode="real",
+        asset_cols=("A", "B"),
+        train_windows=3,
+        validation_windows=2,
+        fixed_graph_resource_hash=None,
+        s1_id_space="kronos_original",
+        s1_vocabulary_size=1024,
+        s1_remapping_resource_hash=None,
+    )
+    expected = token_runner._config_signature(payload)
+
+    with TemporaryDirectory() as directory:
+        run_dir = Path(directory)
+        token_runner.atomic_json_save(
+            resolved_config,
+            run_dir / "resolved_config.json",
+        )
+        metadata = {
+            "run_signature": "legacy-signature-containing-old-commit",
+            "project_git_commit": "old-commit",
+            "train_cache_path": "/cache/train.pt",
+            "validation_cache_path": "/cache/val.pt",
+            "data_mode": "real",
+            "asset_cols": ["A", "B"],
+            "train_windows": 3,
+            "validation_windows": 2,
+            "fixed_graph_resource": None,
+            "s1_token_space": {
+                "id_space": "kronos_original",
+                "vocabulary_size": 1024,
+                "resource_hash": None,
+            },
+        }
+        observed = token_runner._saved_evaluation_compatibility_signature(
+            run_dir=run_dir,
+            existing_metadata=metadata,
+        )
+        assert observed == expected
+
+        changed_temperature_config = {
+            **resolved_config,
+            "temperature_sweep": {"temperatures": [0.3, 0.8]},
+        }
+        changed_payload = token_runner._evaluation_compatibility_payload(
+            resolved_config=changed_temperature_config,
+            train_cache="/cache/train.pt",
+            validation_cache="/cache/val.pt",
+            data_mode="real",
+            asset_cols=("A", "B"),
+            train_windows=3,
+            validation_windows=2,
+            fixed_graph_resource_hash=None,
+            s1_id_space="kronos_original",
+            s1_vocabulary_size=1024,
+            s1_remapping_resource_hash=None,
+        )
+        assert token_runner._config_signature(changed_payload) == expected
+
+        incompatible_payload = token_runner._evaluation_compatibility_payload(
+            resolved_config={
+                **resolved_config,
+                "models": {"dynamic_graph": {"d_model": 64}},
+            },
+            train_cache="/cache/train.pt",
+            validation_cache="/cache/val.pt",
+            data_mode="real",
+            asset_cols=("A", "B"),
+            train_windows=3,
+            validation_windows=2,
+            fixed_graph_resource_hash=None,
+            s1_id_space="kronos_original",
+            s1_vocabulary_size=1024,
+            s1_remapping_resource_hash=None,
+        )
+        assert token_runner._config_signature(incompatible_payload) != expected
+
+
+def test_temperature_policy_resume_record_contract() -> None:
+    """A completed policy is reused only for an identical request."""
+
+    with TemporaryDirectory() as directory:
+        output_dir = Path(directory)
+        label = "temperature_0p6"
+        policy_dir = output_dir / label
+        policy_dir.mkdir(parents=True)
+
+        for filename in (
+            "validation_predictions.pt",
+            "validation_graphs.pt",
+            "validation_tokens.pt",
+            "validation_metric_table.csv",
+            "validation_diagnostics.json",
+            "validation_sampled_price_paths.pt",
+        ):
+            (policy_dir / filename).write_bytes(b"test")
+
+        expected_result = {
+            "Policy": label,
+            "Temperature": 0.6,
+            "Sample count": 10,
+            "Mean Log MAE": 0.001,
+        }
+        token_runner._save_temperature_result_record(
+            output_dir=output_dir,
+            label=label,
+            temperature=0.6,
+            sample_count=10,
+            top_k=0,
+            top_p=0.9,
+            sampling_seed=42,
+            checkpoint_epoch=7,
+            result=expected_result,
+        )
+
+        observed = token_runner._load_reusable_temperature_result(
+            output_dir=output_dir,
+            label=label,
+            temperature=0.6,
+            sample_count=10,
+            top_k=0,
+            top_p=0.9,
+            sampling_seed=42,
+            checkpoint_epoch=7,
+        )
+        assert observed == expected_result
+
+        changed_temperature = token_runner._load_reusable_temperature_result(
+            output_dir=output_dir,
+            label=label,
+            temperature=0.8,
+            sample_count=10,
+            top_k=0,
+            top_p=0.9,
+            sampling_seed=42,
+            checkpoint_epoch=7,
+        )
+        assert changed_temperature is None
+
+        (policy_dir / "validation_sampled_price_paths.pt").unlink()
+        incomplete = token_runner._load_reusable_temperature_result(
+            output_dir=output_dir,
+            label=label,
+            temperature=0.6,
+            sample_count=10,
+            top_k=0,
+            top_p=0.9,
+            sampling_seed=42,
+            checkpoint_epoch=7,
+        )
+        assert incomplete is None
+
+
 def test_final_preset_uses_validation_ce_selection() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     config_path = repo_root / "configs" / "dynamic_graph.yaml"
@@ -485,6 +649,8 @@ def test_ten_path_decode_then_average_contract() -> None:
 
 def main() -> None:
     test_runner_json_loader_contract()
+    test_evaluation_signature_allows_code_only_commit_change()
+    test_temperature_policy_resume_record_contract()
     test_final_preset_uses_validation_ce_selection()
     test_post_bsq_code_contract()
     test_model_shapes_gradients_and_sampling()

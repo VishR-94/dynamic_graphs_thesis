@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -933,6 +934,131 @@ def _config_signature(values: Mapping[str, Any]) -> str:
         default=_json_default,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalise_evaluation_config(
+    resolved_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the learned-model config used for evaluation compatibility.
+
+    Temperature/sample-count settings are post-training inference policy. They
+    may change while evaluating one frozen checkpoint and therefore must not
+    alter model compatibility.
+    """
+
+    normalised = deepcopy(dict(resolved_config))
+    normalised.pop("temperature_sweep", None)
+    return normalised
+
+
+def _evaluation_compatibility_payload(
+    *,
+    resolved_config: Mapping[str, Any],
+    train_cache: str,
+    validation_cache: str,
+    data_mode: str,
+    asset_cols: Sequence[str],
+    train_windows: int,
+    validation_windows: int,
+    fixed_graph_resource_hash: str | None,
+    s1_id_space: str,
+    s1_vocabulary_size: int,
+    s1_remapping_resource_hash: str | None,
+) -> dict[str, Any]:
+    """Build the code-version-independent checkpoint compatibility payload.
+
+    The project commit is provenance, not a learned-model hyperparameter. A
+    post-training bug fix must not make an otherwise identical frozen
+    checkpoint impossible to evaluate. Training resume remains protected by the
+    stricter run signature, which still includes the project commit.
+    """
+
+    return {
+        "resolved_config": _normalise_evaluation_config(resolved_config),
+        "train_cache": str(train_cache),
+        "validation_cache": str(validation_cache),
+        "data_mode": str(data_mode),
+        "asset_cols": [str(value) for value in asset_cols],
+        "train_windows": int(train_windows),
+        "validation_windows": int(validation_windows),
+        "fixed_graph_resource_hash": fixed_graph_resource_hash,
+        "s1_id_space": str(s1_id_space),
+        "s1_vocabulary_size": int(s1_vocabulary_size),
+        "s1_remapping_resource_hash": s1_remapping_resource_hash,
+    }
+
+
+def _saved_evaluation_compatibility_signature(
+    *,
+    run_dir: Path,
+    existing_metadata: Mapping[str, Any],
+) -> str:
+    """Read or reconstruct compatibility for checkpoints made pre-fix."""
+
+    saved_signature = existing_metadata.get(
+        "evaluation_compatibility_signature"
+    )
+    if saved_signature is not None:
+        return str(saved_signature)
+
+    resolved_config_path = Path(run_dir) / "resolved_config.json"
+    if not resolved_config_path.is_file():
+        raise FileNotFoundError(
+            "Cannot verify evaluation compatibility because the original "
+            f"resolved config is missing: {resolved_config_path}."
+        )
+
+    saved_config = load_json(resolved_config_path)
+    token_space = existing_metadata.get("s1_token_space")
+    if not isinstance(token_space, Mapping):
+        raise ValueError(
+            "Cannot reconstruct evaluation compatibility: saved metadata "
+            "contains no s1_token_space mapping."
+        )
+    fixed_resource = existing_metadata.get("fixed_graph_resource")
+    fixed_hash = (
+        None
+        if not isinstance(fixed_resource, Mapping)
+        else fixed_resource.get("resource_hash")
+    )
+
+    required_metadata = {
+        "train_cache_path",
+        "validation_cache_path",
+        "data_mode",
+        "asset_cols",
+        "train_windows",
+        "validation_windows",
+    }
+    missing = sorted(
+        key for key in required_metadata if key not in existing_metadata
+    )
+    if missing:
+        raise ValueError(
+            "Cannot reconstruct evaluation compatibility; saved metadata is "
+            f"missing {missing}."
+        )
+
+    payload = _evaluation_compatibility_payload(
+        resolved_config=saved_config,
+        train_cache=str(existing_metadata["train_cache_path"]),
+        validation_cache=str(existing_metadata["validation_cache_path"]),
+        data_mode=str(existing_metadata["data_mode"]),
+        asset_cols=list(existing_metadata["asset_cols"]),
+        train_windows=int(existing_metadata["train_windows"]),
+        validation_windows=int(existing_metadata["validation_windows"]),
+        fixed_graph_resource_hash=(
+            None if fixed_hash is None else str(fixed_hash)
+        ),
+        s1_id_space=str(token_space.get("id_space", "kronos_original")),
+        s1_vocabulary_size=int(token_space.get("vocabulary_size", 1024)),
+        s1_remapping_resource_hash=(
+            None
+            if token_space.get("resource_hash") is None
+            else str(token_space.get("resource_hash"))
+        ),
+    )
+    return _config_signature(payload)
 
 
 def _worker_seed(_: int) -> None:
@@ -2816,6 +2942,139 @@ def _save_inference_bundle(
     )
 
 
+def _temperature_policy_required_paths(
+    policy_dir: Path,
+    *,
+    require_sampled_paths: bool,
+) -> tuple[Path, ...]:
+    paths = [
+        policy_dir / "validation_predictions.pt",
+        policy_dir / "validation_graphs.pt",
+        policy_dir / "validation_tokens.pt",
+        policy_dir / "validation_metric_table.csv",
+        policy_dir / "validation_diagnostics.json",
+        policy_dir / "temperature_result.json",
+    ]
+    if require_sampled_paths:
+        paths.append(
+            policy_dir / "validation_sampled_price_paths.pt"
+        )
+    return tuple(paths)
+
+
+def _load_reusable_temperature_result(
+    *,
+    output_dir: Path,
+    label: str,
+    temperature: float | None,
+    sample_count: int,
+    top_k: int,
+    top_p: float,
+    sampling_seed: int,
+    checkpoint_epoch: int,
+) -> dict[str, Any] | None:
+    """Load one fully written policy result when its request matches."""
+
+    policy_dir = output_dir / label
+    required_paths = _temperature_policy_required_paths(
+        policy_dir,
+        require_sampled_paths=sample_count > 1,
+    )
+    if not all(path.is_file() for path in required_paths):
+        return None
+
+    record = load_json(
+        policy_dir / "temperature_result.json"
+    )
+    request = record.get("request")
+    result = record.get("result")
+    if not isinstance(request, Mapping) or not isinstance(result, Mapping):
+        return None
+
+    expected_temperature = (
+        None if temperature is None else float(temperature)
+    )
+    observed_temperature = request.get("temperature")
+    temperature_matches = (
+        observed_temperature is None
+        if expected_temperature is None
+        else (
+            observed_temperature is not None
+            and math.isclose(
+                float(observed_temperature),
+                expected_temperature,
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            )
+        )
+    )
+    request_matches = (
+        str(request.get("label")) == str(label)
+        and temperature_matches
+        and int(request.get("sample_count", -1)) == int(sample_count)
+        and int(request.get("top_k", -1)) == int(top_k)
+        and math.isclose(
+            float(request.get("top_p", float("nan"))),
+            float(top_p),
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+        and int(request.get("sampling_seed", -1))
+        == int(sampling_seed)
+        and int(request.get("checkpoint_epoch", -1))
+        == int(checkpoint_epoch)
+    )
+    if not request_matches:
+        return None
+
+    return dict(result)
+
+
+def _save_temperature_result_record(
+    *,
+    output_dir: Path,
+    label: str,
+    temperature: float | None,
+    sample_count: int,
+    top_k: int,
+    top_p: float,
+    sampling_seed: int,
+    checkpoint_epoch: int,
+    result: Mapping[str, Any],
+) -> None:
+    policy_dir = output_dir / label
+    atomic_json_save(
+        {
+            "request": {
+                "label": str(label),
+                "temperature": (
+                    None if temperature is None else float(temperature)
+                ),
+                "sample_count": int(sample_count),
+                "top_k": int(top_k),
+                "top_p": float(top_p),
+                "sampling_seed": int(sampling_seed),
+                "checkpoint_epoch": int(checkpoint_epoch),
+            },
+            "result": dict(result),
+        },
+        policy_dir / "temperature_result.json",
+    )
+
+
+def _save_temperature_progress(
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> None:
+    if not rows:
+        return
+    atomic_csv_save(
+        pd.DataFrame([dict(row) for row in rows]),
+        output_dir / "temperature_sweep_progress.csv",
+    )
+
+
 def _temperature_result_row(
     *,
     label: str,
@@ -2900,44 +3159,34 @@ def run_temperature_sweep(
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
 
-    # Argmax is a deterministic reference and is not eligible to define the
-    # selected stochastic temperature.
-    set_seed(sampling_seed)
-    argmax_bundle = generate_validation_artifacts(
-        model=model,
-        loader=loader,
-        dataset=dataset,
-        device=device,
-        use_amp=use_amp,
-        decoding_config={
-            "token_selection": "argmax",
-            "temperature": 1.0,
-            "top_k": 0,
-            "top_p": 1.0,
-            "sample_count": 1,
-        },
-        tokenizer=tokenizer,
-        raw_train_split=raw_train_split,
-        decode_series_batch_size=decode_series_batch_size,
-        early_stopping_horizons=evaluation_horizons,
-    )
-    _save_inference_bundle(
-        output_dir=output_dir,
-        label="argmax",
-        epoch=checkpoint_epoch,
-        bundle=argmax_bundle,
-    )
-    rows.append(
-        _temperature_result_row(
-            label="argmax",
-            temperature=None,
-            sample_count=1,
-            bundle=argmax_bundle,
-            horizons=evaluation_horizons,
+    def evaluate_or_reuse_policy(
+        *,
+        label: str,
+        temperature: float | None,
+        policy_sample_count: int,
+        policy_top_k: int,
+        policy_top_p: float,
+        token_selection: str,
+    ) -> None:
+        reusable = _load_reusable_temperature_result(
+            output_dir=output_dir,
+            label=label,
+            temperature=temperature,
+            sample_count=policy_sample_count,
+            top_k=policy_top_k,
+            top_p=policy_top_p,
+            sampling_seed=sampling_seed,
+            checkpoint_epoch=checkpoint_epoch,
         )
-    )
+        if reusable is not None:
+            print(
+                f"Temperature policy {label} is complete and matches the "
+                "current request; skipping regeneration."
+            )
+            rows.append(reusable)
+            _save_temperature_progress(rows=rows, output_dir=output_dir)
+            return
 
-    for temperature in temperatures:
         # Resetting the same seed gives every temperature the same RNG stream,
         # reducing Monte Carlo noise in the validation comparison.
         set_seed(sampling_seed)
@@ -2948,32 +3197,72 @@ def run_temperature_sweep(
             device=device,
             use_amp=use_amp,
             decoding_config={
-                "token_selection": "sample",
-                "temperature": float(temperature),
-                "top_k": top_k,
-                "top_p": top_p,
-                "sample_count": sample_count,
+                "token_selection": token_selection,
+                "temperature": (
+                    1.0 if temperature is None else float(temperature)
+                ),
+                "top_k": int(policy_top_k),
+                "top_p": float(policy_top_p),
+                "sample_count": int(policy_sample_count),
             },
             tokenizer=tokenizer,
             raw_train_split=raw_train_split,
             decode_series_batch_size=decode_series_batch_size,
             early_stopping_horizons=evaluation_horizons,
         )
-        label = f"temperature_{_temperature_tag(temperature)}"
         _save_inference_bundle(
             output_dir=output_dir,
             label=label,
             epoch=checkpoint_epoch,
             bundle=bundle,
         )
-        rows.append(
-            _temperature_result_row(
-                label=label,
-                temperature=float(temperature),
-                sample_count=sample_count,
-                bundle=bundle,
-                horizons=evaluation_horizons,
-            )
+        row = _temperature_result_row(
+            label=label,
+            temperature=temperature,
+            sample_count=policy_sample_count,
+            bundle=bundle,
+            horizons=evaluation_horizons,
+        )
+        _save_temperature_result_record(
+            output_dir=output_dir,
+            label=label,
+            temperature=temperature,
+            sample_count=policy_sample_count,
+            top_k=policy_top_k,
+            top_p=policy_top_p,
+            sampling_seed=sampling_seed,
+            checkpoint_epoch=checkpoint_epoch,
+            result=row,
+        )
+        rows.append(row)
+        _save_temperature_progress(rows=rows, output_dir=output_dir)
+
+        # Each stochastic policy retains a large CPU path tensor. Release the
+        # completed bundle before moving to the next temperature.
+        del bundle
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Argmax is a deterministic reference and is not eligible to define the
+    # selected stochastic temperature.
+    evaluate_or_reuse_policy(
+        label="argmax",
+        temperature=None,
+        policy_sample_count=1,
+        policy_top_k=0,
+        policy_top_p=1.0,
+        token_selection="argmax",
+    )
+
+    for temperature in temperatures:
+        evaluate_or_reuse_policy(
+            label=f"temperature_{_temperature_tag(temperature)}",
+            temperature=float(temperature),
+            policy_sample_count=sample_count,
+            policy_top_k=top_k,
+            policy_top_p=top_p,
+            token_selection="sample",
         )
 
     results = pd.DataFrame(rows)
@@ -3727,46 +4016,87 @@ def main() -> None:
         },
     }
 
-    signature_config = deepcopy(resolved_config)
-    # Temperature/sample-count choices are post-training inference policy,
-    # not learned-model hyperparameters. Excluding this mapping allows a
-    # frozen checkpoint to be evaluated at a different temperature grid.
-    signature_config.pop("temperature_sweep", None)
-
-    signature_values = {
-        "resolved_config": signature_config,
-        "train_cache": str(train_cache_path),
-        "validation_cache": str(val_cache_path),
-        "data_mode": data_mode,
-        "asset_cols": list(train_dataset_full.asset_cols),
-        "train_windows": len(train_dataset),
-        "validation_windows": len(validation_dataset),
-        "project_git_commit": project_commit,
-        "fixed_graph_resource_hash": (
+    compatibility_payload = _evaluation_compatibility_payload(
+        resolved_config=resolved_config,
+        train_cache=str(train_cache_path),
+        validation_cache=str(val_cache_path),
+        data_mode=data_mode,
+        asset_cols=list(train_dataset_full.asset_cols),
+        train_windows=len(train_dataset),
+        validation_windows=len(validation_dataset),
+        fixed_graph_resource_hash=(
             None
             if fixed_graph_resource is None
             else fixed_graph_resource.resource_hash
         ),
-        "s1_id_space": train_dataset_full.s1_id_space,
-        "s1_vocabulary_size": train_dataset_full.s1_vocabulary_size,
-        "s1_remapping_resource_hash": (
+        s1_id_space=train_dataset_full.s1_id_space,
+        s1_vocabulary_size=train_dataset_full.s1_vocabulary_size,
+        s1_remapping_resource_hash=(
             train_dataset_full.s1_remapping_resource_hash
         ),
+    )
+    evaluation_compatibility_signature = _config_signature(
+        compatibility_payload
+    )
+    # Training/resume identity remains deliberately strict and includes the
+    # exact project commit. Evaluation compatibility is separate so a frozen
+    # checkpoint can be decoded after a non-architectural bug fix.
+    signature_values = {
+        **compatibility_payload,
+        "project_git_commit": project_commit,
     }
-    run_signature = _config_signature(signature_values)
+    requested_run_signature = _config_signature(signature_values)
+    run_signature = requested_run_signature
     run_metadata["run_signature"] = run_signature
+    run_metadata["evaluation_compatibility_signature"] = (
+        evaluation_compatibility_signature
+    )
 
     metadata_path = run_dir / "run_metadata.json"
     if (args.evaluate_only or args.temperature_sweep) and metadata_path.is_file():
         existing_metadata = load_json(metadata_path)
-        existing_signature = existing_metadata.get("run_signature")
-        if existing_signature is not None and existing_signature != run_signature:
-            raise ValueError(
-                "Saved run metadata signature differs from the requested "
-                "evaluation configuration."
+        saved_compatibility_signature = (
+            _saved_evaluation_compatibility_signature(
+                run_dir=run_dir,
+                existing_metadata=existing_metadata,
             )
+        )
+        if saved_compatibility_signature != evaluation_compatibility_signature:
+            raise ValueError(
+                "Saved run configuration is genuinely incompatible with the "
+                "requested evaluation. The model/data/config contract differs; "
+                "this is not merely a project-commit change."
+            )
+
+        existing_signature = existing_metadata.get("run_signature")
+        if existing_signature is not None:
+            # Checkpoints created before this compatibility field was added
+            # retain their original strict signature. Use that signature for
+            # checkpoint integrity checks after compatibility has been proven.
+            run_signature = str(existing_signature)
+
         run_metadata = deepcopy(existing_metadata)
         run_metadata["run_signature"] = run_signature
+        run_metadata["evaluation_compatibility_signature"] = (
+            evaluation_compatibility_signature
+        )
+        run_metadata["last_evaluation_request_signature"] = (
+            requested_run_signature
+        )
+        run_metadata["last_evaluation_project_git_commit"] = project_commit
+        commit_differs = (
+            existing_metadata.get("project_git_commit") != project_commit
+        )
+        run_metadata["evaluation_code_commit_differs_from_training"] = (
+            commit_differs
+        )
+        if commit_differs:
+            print(
+                "Evaluation compatibility verified across a project-code "
+                "commit change: training commit "
+                f"{existing_metadata.get('project_git_commit')} -> "
+                f"evaluation commit {project_commit}."
+            )
         run_metadata["last_evaluated_at_utc"] = (
             datetime.now(timezone.utc).isoformat()
         )
