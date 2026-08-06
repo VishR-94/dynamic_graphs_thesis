@@ -6,8 +6,9 @@ The external BaseDyGraph source remains unmodified.  This module reuses its
 causal per-node Transformer, graph scorers, interlaced ST blocks, spatial
 message passing, residuals and normalisation.  Only task adapters are added:
 
-* a 60-position coarse-token future-query head; and
-* a five-horizon continuous Close head.
+* a 60-position coarse-token future-query head;
+* an official teacher-forced one-step coarse-token head; and
+* direct one- or multi-horizon continuous Close heads.
 
 All graph tensors follow ``A[target, source]``.  Internally, the official
 per-timestep dynamic graph has shape ``[B,T,G,N,N]``.  The optional per-window
@@ -15,7 +16,7 @@ adaptation computes one graph from the final observed context state and
 broadcasts it over the observed sequence for spatial message passing.
 """
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
 import torch
@@ -115,6 +116,9 @@ class BaseDyGraphFinancialConfig:
     add_self_loops: bool = False
     symmetric_graph: bool = False
     graph_activation: str = "softmax"
+    # Optional per-ST-block activations. An empty tuple preserves the legacy
+    # behaviour and repeats ``graph_activation`` for every block.
+    graph_activations: tuple[str, ...] = ()
     spatial_value: str = "hidden"
     st_block_post_norm: bool = True
     future_predictor_layers: int = 1
@@ -124,9 +128,24 @@ class BaseDyGraphFinancialConfig:
         default_factory=BaseDyGraphGraphRegularisationConfig
     )
 
+    @property
+    def resolved_graph_activations(self) -> tuple[str, ...]:
+        """Return one graph activation for every interlaced ST block."""
+        if self.graph_activations:
+            return tuple(str(value) for value in self.graph_activations)
+        return tuple(str(self.graph_activation) for _ in range(self.num_st_blocks))
+
     def to_dict(self) -> dict[str, Any]:
-        """Serialise the exact task adapter and graph contract."""
-        return asdict(self)
+        """Serialise the exact task adapter and graph contract.
+
+        ``graph_activations`` is omitted when empty so checkpoints produced
+        before layer-specific activations were added retain the same run
+        signature and remain resumable.
+        """
+        values = asdict(self)
+        if not self.graph_activations:
+            values.pop("graph_activations", None)
+        return values
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "BaseDyGraphFinancialConfig":
@@ -138,6 +157,10 @@ class BaseDyGraphFinancialConfig:
         if "evaluation_horizons" in payload:
             payload["evaluation_horizons"] = tuple(
                 int(value) for value in payload["evaluation_horizons"]
+            )
+        if "graph_activations" in payload:
+            payload["graph_activations"] = tuple(
+                str(value) for value in payload["graph_activations"]
             )
         config = cls(**payload)
         config.validate()
@@ -168,6 +191,22 @@ class BaseDyGraphFinancialConfig:
             raise ValueError("graph_hidden_dim must be divisible by graph_heads.")
         if self.num_st_blocks <= 0:
             raise ValueError("num_st_blocks must be positive.")
+        allowed_activations = {"softmax", "sparsemax", "entmax15", "gated"}
+        activations = self.resolved_graph_activations
+        if len(activations) != self.num_st_blocks:
+            raise ValueError(
+                "graph_activations must contain exactly one value per ST block."
+            )
+        unsupported = [value for value in activations if value not in allowed_activations]
+        if unsupported:
+            raise ValueError(f"Unsupported graph activations: {unsupported}.")
+        if self.graph_type == "static_graph" and any(
+            value != "softmax" for value in activations
+        ):
+            raise ValueError(
+                "The pinned official StaticGraphScorer is softmax-only; "
+                "layer-specific sparse activations require dynamic_graph."
+            )
         if self.future_predictor_layers < 0:
             raise ValueError("future_predictor_layers cannot be negative.")
         if self.d_model % self.future_predictor_heads != 0:
@@ -191,7 +230,7 @@ class BaseDyGraphFinancialConfig:
             spatial_dropout=self.spatial_dropout,
             spatial_module_type=self.graph_type,
             spatial_value=self.spatial_value,
-            graph_activation=self.graph_activation,
+            graph_activation=self.resolved_graph_activations[0],
             use_node_embedding=self.use_node_embedding,
             use_state_pair_bias=self.use_state_pair_bias,
             add_self_loops=self.add_self_loops,
@@ -225,7 +264,7 @@ class BaseDyGraphFinancialConfig:
                 type=graph_type,
                 num_heads=self.graph_heads,
                 hidden_dim=self.graph_hidden_dim,
-                activation="softmax",
+                activation=self.resolved_graph_activations[-1],
                 add_self_loops=self.add_self_loops,
             ),
             spatial=SpatialConfig(
@@ -271,6 +310,15 @@ class BaseDyGraphTokenTrainingOutput:
     forecast: TokenForecastOutput
     prediction: FutureTokenPrediction
     graph_sequences: tuple[Tensor | None, ...]
+
+
+@dataclass
+class BaseDyGraphTeacherForcedTokenOutput:
+    """Teacher-forced next-token outputs over all context transitions."""
+
+    s1_logits: Tensor  # [B,T,N,1024]
+    forecast: TokenForecastOutput  # final unseen one-step forecast
+    graph_sequences: tuple[Tensor | None, ...]  # [B,T,G,N,N]
 
 
 @dataclass
@@ -382,6 +430,54 @@ class _OfficialContextEncoderBase(nn.Module):
             external_source_dir=external_source_dir,
         )
 
+    def _apply_layer_graph_activations(self, backbone: nn.Module) -> None:
+        """Assign one activation to each official interlaced graph scorer.
+
+        The pinned BaseDyGraph configuration exposes one global activation.
+        For the financial diagnostics we preserve the official scorer classes
+        and only replace each scorer's immutable config object after the
+        backbone is constructed. No external source file is modified.
+
+        Legacy configurations leave ``graph_activations`` empty. In that case
+        the official backbone already received the single global activation,
+        so no post-construction mutation is required. This also preserves old
+        checkpoints and test doubles that do not expose a scorer ``cfg``.
+        """
+        financial_config = getattr(self, "financial_config", self.config)
+        if not financial_config.graph_activations:
+            return
+
+        blocks = getattr(backbone, "st_blocks", None)
+        if blocks is None:
+            raise RuntimeError(
+                "Layer-specific graph activations require interlaced ST blocks."
+            )
+        activations = financial_config.resolved_graph_activations
+        if len(blocks) != len(activations):
+            raise AssertionError(
+                "Official ST-block count differs from graph_activations."
+            )
+        for block_index, (block, activation) in enumerate(
+            zip(blocks, activations, strict=True)
+        ):
+            scorer = getattr(block, "graph_scorer", None)
+            if scorer is None:
+                continue
+            scorer_config = getattr(scorer, "cfg", None)
+            if scorer_config is None:
+                raise RuntimeError(
+                    f"ST block {block_index} graph scorer exposes no cfg."
+                )
+            try:
+                scorer.cfg = replace(
+                    scorer_config,
+                    graph_activation=str(activation),
+                )
+            except (TypeError, ValueError):
+                # Fallback for a non-dataclass configuration implementation.
+                setattr(scorer_config, "graph_activation", str(activation))
+                scorer.cfg = scorer_config
+
     @staticmethod
     def _final_context_graph(values: Tensor | None) -> Tensor | None:
         if values is None:
@@ -401,6 +497,7 @@ class _OfficialContextEncoderBase(nn.Module):
     ) -> tuple[Tensor, tuple[Tensor | None, ...]]:
         if getattr(backbone, "st_blocks", None) is None:
             raise RuntimeError("The financial adapter requires interlaced ST blocks.")
+        financial_config = getattr(self, "financial_config", self.config)
         hidden = initial_hidden
         graph_sequences: list[Tensor | None] = []
 
@@ -415,8 +512,8 @@ class _OfficialContextEncoderBase(nn.Module):
                 spatial = block.spatial_module(temporal, None, e=value_embedding)
             else:
                 if (
-                    self.config.graph_type == "dynamic_graph"
-                    and self.config.graph_scope == "per_window"
+                    financial_config.graph_type == "dynamic_graph"
+                    and financial_config.graph_scope == "per_window"
                 ):
                     final_hidden = temporal[:, -1:, :, :]
                     final_state = state_ids[:, :, -1:]
@@ -441,14 +538,14 @@ class _OfficialContextEncoderBase(nn.Module):
         context_memory: Tensor,
         graph_sequences: tuple[Tensor | None, ...],
     ) -> BaseDyGraphContextEncoding:
+        financial_config = getattr(self, "financial_config", self.config)
         per_layer = tuple(self._final_context_graph(value) for value in graph_sequences)
         selected = next((value for value in reversed(per_layer) if value is not None), None)
-        graph_type = "free_static" if self.config.graph_type == "static_graph" else "dynamic"
         graph_output = GraphOutput(selected=selected, per_layer=per_layer)
         graph_output.validate(
             batch_size=int(context_memory.shape[0]),
-            num_heads=self.config.graph_heads,
-            num_nodes=self.config.num_nodes,
+            num_heads=financial_config.graph_heads,
+            num_nodes=financial_config.num_nodes,
         )
         return BaseDyGraphContextEncoding(
             context_memory=context_memory,
@@ -468,6 +565,7 @@ class OfficialBaseDyGraphTokenContextEncoder(_OfficialContextEncoderBase):
         self.backbone = self.official_modules.model.DiscreteSTGraphBackbone(
             self.official_config
         )
+        self._apply_layer_graph_activations(self.backbone)
 
     def forward(self, context_s1: Tensor) -> BaseDyGraphContextEncoding:
         values = torch.as_tensor(context_s1).long()
@@ -645,6 +743,234 @@ class OfficialBaseDyGraphCoarsePathForecaster(nn.Module):
         return result
 
 
+class OfficialBaseDyGraphTeacherForcedOneStepForecaster(
+    _OfficialContextEncoderBase
+):
+    """Official one-step BaseDyGraph objective over a 60-minute token context.
+
+    During training the first future coarse token is appended to the observed
+    context. The official causal backbone then predicts each next token from
+    the preceding position, giving 60 teacher-forced transitions:
+
+    ``context[0] -> context[1]``, ..., ``context[59] -> future[0]``.
+
+    The appended future token is never visible to the representation used for
+    the final context-to-future prediction. Graph regularisation is likewise
+    applied only to the 60 predictor positions and excludes the appended token.
+    """
+
+    def __init__(
+        self,
+        config: BaseDyGraphFinancialConfig,
+        *,
+        external_source_dir: str | None = None,
+    ) -> None:
+        if config.mode != "token":
+            raise ValueError("Teacher-forced one-step forecaster needs token mode.")
+        if config.prediction_length != 1 or config.evaluation_horizons != (1,):
+            raise ValueError(
+                "Teacher-forced one-step token mode requires prediction_length=1 "
+                "and evaluation_horizons=(1,)."
+            )
+        super().__init__(config, external_source_dir=external_source_dir)
+        self.financial_config = config
+        self.config = config.token_contract()
+        self.backbone = self.official_modules.model.DiscreteSTGraphBackbone(
+            self.official_config
+        )
+        self._apply_layer_graph_activations(self.backbone)
+        self.next_state_head = self.official_modules.model.NextStateHead(
+            config.d_model,
+            1024,
+        )
+
+    @property
+    def external_commit(self) -> str | None:
+        return self.official_modules.commit
+
+    def _encode_sequence(
+        self,
+        sequence_s1: Tensor,
+    ) -> tuple[Tensor, tuple[Tensor | None, ...]]:
+        values = torch.as_tensor(sequence_s1).long()
+        if values.ndim != 3 or int(values.shape[2]) != self.financial_config.num_nodes:
+            raise ValueError("sequence_s1 must have shape [B,T,N].")
+        if values.numel() and (values.min() < 0 or values.max() >= 1024):
+            raise ValueError("sequence_s1 contains an invalid Kronos s1 ID.")
+        state_ids = values.permute(0, 2, 1).contiguous()
+        output = self.backbone(state_ids)
+        memory = torch.as_tensor(output["spatial_repr"])
+        raw_layers = output.get("block_graph_attns")
+        if raw_layers is None:
+            raw_layers = (output.get("graph_attn"),)
+        graph_sequences = tuple(
+            None if value is None else torch.as_tensor(value)
+            for value in raw_layers
+        )
+        return memory, graph_sequences
+
+    @staticmethod
+    def teacher_targets(token_ids: Tensor, target_s1: Tensor) -> Tensor:
+        pairs = torch.as_tensor(token_ids)
+        future = torch.as_tensor(target_s1).long()
+        if pairs.ndim != 4 or int(pairs.shape[-1]) != 2:
+            raise ValueError("token_ids must have shape [B,T,N,2].")
+        if future.ndim != 3 or int(future.shape[1]) < 1:
+            raise ValueError("target_s1 must have shape [B,P,N] with P>=1.")
+        context_s1 = pairs[..., 0].long()
+        return torch.cat(
+            (context_s1[:, 1:], future[:, :1]),
+            dim=1,
+        ).contiguous()
+
+    def _one_step_forecast(
+        self,
+        encoding: BaseDyGraphContextEncoding,
+        logits: Tensor,
+    ) -> TokenForecastOutput:
+        output = TokenForecastOutput(
+            s1_logits=logits,
+            s2_logits=None,
+            graph=encoding.graph,
+            context_hidden=encoding.context_hidden,
+            temporal_hidden=encoding.context_memory,
+            future_hidden=encoding.context_hidden.unsqueeze(1),
+            spatial_beta=None,
+            backcast=None,
+        )
+        output.validate(
+            self.config,
+            batch_size=int(encoding.context_memory.shape[0]),
+        )
+        return output
+
+    def forward(
+        self,
+        token_ids: Tensor,
+        *,
+        target_s1: Tensor,
+        target_s2: Tensor | None = None,
+        context_mean: Tensor | None = None,
+        context_std: Tensor | None = None,
+        **_: Any,
+    ) -> BaseDyGraphTeacherForcedTokenOutput:
+        del target_s2, context_mean, context_std
+        pairs = torch.as_tensor(token_ids)
+        targets = torch.as_tensor(target_s1).long()
+        if pairs.ndim != 4 or int(pairs.shape[-1]) != 2:
+            raise ValueError("token_ids must have shape [B,T,N,2].")
+        if int(pairs.shape[1]) != self.financial_config.context_length:
+            raise ValueError("Token context length differs from the model contract.")
+        if targets.ndim != 3 or int(targets.shape[1]) < 1:
+            raise ValueError("target_s1 must contain the first future token.")
+
+        teacher_sequence = torch.cat(
+            (pairs[..., 0].long(), targets[:, :1]),
+            dim=1,
+        )
+        full_memory, full_graphs = self._encode_sequence(teacher_sequence)
+        logits = self.next_state_head(full_memory)
+        logits = logits.permute(0, 2, 1, 3).contiguous()
+        expected = (
+            int(pairs.shape[0]),
+            self.financial_config.context_length,
+            self.financial_config.num_nodes,
+            1024,
+        )
+        if tuple(logits.shape) != expected:
+            raise RuntimeError(
+                f"Unexpected teacher-forced logit shape {tuple(logits.shape)}; "
+                f"expected {expected}."
+            )
+
+        predictor_memory = full_memory[:, :-1].contiguous()
+        predictor_graphs = tuple(
+            None if graph is None else graph[:, :-1].contiguous()
+            for graph in full_graphs
+        )
+        encoding = self._build_encoding(predictor_memory, predictor_graphs)
+        forecast = self._one_step_forecast(
+            encoding,
+            logits[:, -1:].contiguous(),
+        )
+        return BaseDyGraphTeacherForcedTokenOutput(
+            s1_logits=logits,
+            forecast=forecast,
+            graph_sequences=predictor_graphs,
+        )
+
+    def predict_next(self, token_ids: Tensor) -> TokenForecastOutput:
+        pairs = torch.as_tensor(token_ids)
+        if pairs.ndim != 4 or int(pairs.shape[-1]) != 2:
+            raise ValueError("token_ids must have shape [B,T,N,2].")
+        if int(pairs.shape[1]) != self.financial_config.context_length:
+            raise ValueError("Token context length differs from the model contract.")
+        memory, graph_sequences = self._encode_sequence(pairs[..., 0])
+        encoding = self._build_encoding(memory, graph_sequences)
+        logits = self.next_state_head.proj(encoding.context_hidden).unsqueeze(1)
+        return self._one_step_forecast(encoding, logits)
+
+    def generate(
+        self,
+        token_ids: Tensor,
+        *,
+        token_selection: TokenSelection = "argmax",
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        **_: Any,
+    ) -> GeneratedTokenForecast:
+        forecast = self.predict_next(token_ids)
+        selected = select_token_ids(
+            forecast.s1_logits,
+            mode=token_selection,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+        token_path = torch.stack((selected, torch.zeros_like(selected)), dim=-1)
+        result = GeneratedTokenForecast(token_ids=token_path, forecast=forecast)
+        result.validate(self.config, batch_size=int(token_ids.shape[0]))
+        return result
+
+    def generate_samples(
+        self,
+        token_ids: Tensor,
+        *,
+        sample_count: int,
+        token_selection: TokenSelection = "sample",
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        **_: Any,
+    ) -> SampledGeneratedTokenForecast:
+        if sample_count <= 0:
+            raise ValueError("sample_count must be positive.")
+        forecast = self.predict_next(token_ids)
+        samples = []
+        for _ in range(int(sample_count)):
+            selected = select_token_ids(
+                forecast.s1_logits,
+                mode=token_selection,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+            samples.append(
+                torch.stack((selected, torch.zeros_like(selected)), dim=-1)
+            )
+        result = SampledGeneratedTokenForecast(
+            token_ids=torch.stack(samples, dim=0),
+            forecast=forecast,
+        )
+        result.validate(
+            self.config,
+            sample_count=int(sample_count),
+            batch_size=int(token_ids.shape[0]),
+        )
+        return result
+
+
 class OfficialBaseDyGraphContinuousForecaster(_OfficialContextEncoderBase):
     """Continuous OHLCV adapter around the exact official interlaced blocks."""
 
@@ -655,6 +981,7 @@ class OfficialBaseDyGraphContinuousForecaster(_OfficialContextEncoderBase):
         self.backbone = self.official_modules.model.DiscreteSTGraphBackbone(
             self.official_config
         )
+        self._apply_layer_graph_activations(self.backbone)
         # The discrete state embedding is not part of the continuous adapter.
         # Replace it so no unused trainable token table is carried by the model.
         self.backbone.state_embedding = nn.Identity()
@@ -723,4 +1050,5 @@ def financial_graph_artifact_metadata(config: BaseDyGraphFinancialConfig) -> dic
         "graph_time_reduction": "final_observed_context_position",
         "num_st_blocks": config.num_st_blocks,
         "num_graph_heads": config.graph_heads,
+        "graph_activations_by_layer": list(config.resolved_graph_activations),
     }

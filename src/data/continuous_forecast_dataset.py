@@ -140,6 +140,11 @@ class CumulativeLogChangeTargetAdapter:
             dtype=torch.float32,
         )
         output = dict(output)
+        # Preserve the complete observed raw input context for causal
+        # autoregressive rollouts. This tensor contains only the 60 observed
+        # rows and therefore introduces no future information.
+        output["context_unnormalised"] = raw_context
+
         # Preserve the observed raw target-channel context for deterministic
         # window-conditioned graph resources such as dynamic correlation.
         # This tensor contains no future observations.
