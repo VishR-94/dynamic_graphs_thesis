@@ -743,6 +743,65 @@ class OfficialBaseDyGraphCoarsePathForecaster(nn.Module):
         return result
 
 
+class OfficialBaseDyGraphTokenToPriceForecaster(nn.Module):
+    """Use the s1-token BaseDyGraph context backbone for direct Close prediction.
+
+    The graph/temporal/spatial pathway is identical to the token-input
+    BaseDyGraph context encoder.  Only the task head changes: the final context
+    state is projected to one or more context-normalised Close levels.  The
+    runner applies the causal context Close mean/std stored in the token cache
+    to recover raw prices before computing cumulative-log-change MAE.
+    """
+
+    def __init__(
+        self,
+        config: BaseDyGraphFinancialConfig,
+        *,
+        external_source_dir: str | None = None,
+    ) -> None:
+        super().__init__()
+        if config.mode != "token":
+            raise ValueError("Token-to-price forecaster requires token mode.")
+        if config.prediction_length != 1 or config.evaluation_horizons != (1,):
+            raise ValueError(
+                "The current token-to-price diagnostic predicts only horizon 1."
+            )
+        self.financial_config = config
+        self.config = config
+        self.context_encoder = OfficialBaseDyGraphTokenContextEncoder(
+            config,
+            external_source_dir=external_source_dir,
+        )
+        self.output_head = nn.Linear(
+            config.d_model,
+            len(config.evaluation_horizons),
+        )
+
+    @property
+    def external_commit(self) -> str | None:
+        return self.context_encoder.official_modules.commit
+
+    def forward(self, token_ids: Tensor) -> BaseDyGraphContinuousOutput:
+        pairs = torch.as_tensor(token_ids)
+        if pairs.ndim != 4 or int(pairs.shape[-1]) != 2:
+            raise ValueError("token_ids must have shape [B,T,N,2].")
+        if int(pairs.shape[1]) != self.config.context_length:
+            raise ValueError("Token context length differs from the model contract.")
+
+        # This diagnostic deliberately retains only the native Kronos coarse
+        # token, exactly like the teacher-forced token run.  s2 is not used.
+        encoding = self.context_encoder(pairs[..., 0])
+        predictions = self.output_head(encoding.context_hidden)
+        predictions = predictions.permute(0, 2, 1).unsqueeze(-1).contiguous()
+        return BaseDyGraphContinuousOutput(
+            predictions=predictions,
+            context_memory=encoding.context_memory,
+            context_hidden=encoding.context_hidden,
+            graph=encoding.graph,
+            graph_sequences=encoding.graph_sequences,
+        )
+
+
 class OfficialBaseDyGraphTeacherForcedOneStepForecaster(
     _OfficialContextEncoderBase
 ):

@@ -17,10 +17,12 @@ from src.models.basedygraph_financial import (
     BaseDyGraphGraphRegularisationConfig,
     OfficialBaseDyGraphContinuousForecaster,
     OfficialBaseDyGraphTeacherForcedOneStepForecaster,
+    OfficialBaseDyGraphTokenToPriceForecaster,
     graph_regularisation_loss,
 )
 from src.training.run_basedygraph_sparsemax_diagnostic import (
     EXPERIMENT_SPECS,
+    HYBRID_EXPERIMENTS,
     LAYER_ACTIVATIONS,
     PHASE1_EXPERIMENTS,
     PHASE2_EXPERIMENTS,
@@ -280,22 +282,29 @@ def test_raw_training_split_call_contract() -> None:
         if isinstance(function, ast.Name) and function.id == "_load_raw_training_split":
             matching_calls.append(node)
 
-    assert len(matching_calls) == 1
-    call = matching_calls[0]
-    keyword_names = {keyword.arg for keyword in call.keywords}
-    assert "expected_asset_cols" in keyword_names
+    assert len(matching_calls) == 2
+    for call in matching_calls:
+        keyword_names = {keyword.arg for keyword in call.keywords}
+        assert "expected_asset_cols" in keyword_names
 
 
 def test_spec_contract() -> None:
-    assert len(EXPERIMENT_SPECS) == 4
+    assert len(EXPERIMENT_SPECS) == 5
     assert PHASE1_EXPERIMENTS == (
         "continuous_one_minute",
         "token_teacher_forced_one_minute",
+    )
+    assert HYBRID_EXPERIMENTS == (
+        "token_to_price_one_minute",
     )
     assert PHASE2_EXPERIMENTS == (
         "continuous_parallel_sixty_minute",
         "continuous_autoregressive_sixty_minute",
     )
+    hybrid = next(spec for spec in EXPERIMENT_SPECS if spec.mode == "hybrid")
+    assert hybrid.config.mode == "token"
+    assert hybrid.forecast_strategy == "token_to_price_direct_one_step"
+    assert hybrid.config.regularisation.target_entropy_weight == 1.0
     for spec in EXPERIMENT_SPECS:
         assert spec.run_name.startswith("DO_NOT_REPORT")
         assert spec.config.d_model == 96
@@ -381,6 +390,50 @@ def test_teacher_forced_one_step_contract() -> None:
             top_p=0.9,
         )
         assert tuple(generated.token_ids.shape) == (10, 2, 1, 5, 2)
+
+
+def test_token_to_price_one_minute_contract() -> None:
+    patch_load, patch_config = _patch_official()
+    with patch_load, patch_config:
+        config = _small_config(mode="token", horizons=(1,))
+        model = OfficialBaseDyGraphTokenToPriceForecaster(config)
+        token_ids = torch.randint(0, 1024, (2, 6, 5, 2))
+        changed_s2 = token_ids.clone()
+        changed_s2[..., 1] = (changed_s2[..., 1] + 101) % 1024
+
+        output = model(token_ids)
+        output_changed_s2 = model(changed_s2)
+        assert tuple(output.predictions.shape) == (2, 1, 5, 1)
+        assert torch.allclose(
+            output.predictions,
+            output_changed_s2.predictions,
+            atol=0.0,
+            rtol=0.0,
+        )
+        assert len(output.graph_sequences) == 4
+        for layer, graph in enumerate(output.graph_sequences):
+            assert graph is not None
+            assert tuple(graph.shape) == (2, 6, 1, 5, 5)
+            _assert_graph_rows(graph)
+            if layer < 3:
+                assert bool((graph > 0).all())
+            else:
+                assert bool((graph == 0).any())
+
+        regularisation = graph_regularisation_loss(
+            output.graph_sequences,
+            config.regularisation,
+            epoch=5,
+        )
+        (output.predictions.square().mean() + regularisation.total).backward()
+        graph_gradient = sum(
+            float(parameter.grad.abs().sum())
+            for name, parameter in model.named_parameters()
+            if (".q." in name or ".k." in name)
+            and parameter.grad is not None
+        )
+        assert graph_gradient > 0.0
+
 
 
 def test_continuous_one_and_multi_horizon_contracts() -> None:
@@ -507,6 +560,13 @@ def test_real_official_integration_if_available() -> None:
         assert graph is not None
         _assert_graph_rows(graph)
 
+    hybrid_model = OfficialBaseDyGraphTokenToPriceForecaster(
+        token_config,
+        external_source_dir=str(source_dir),
+    )
+    hybrid_output = hybrid_model(tokens)
+    assert tuple(hybrid_output.predictions.shape) == (2, 1, 5, 1)
+
     continuous_payload = token_config.to_dict()
     continuous_payload["mode"] = "continuous"
     continuous_payload["input_channels"] = 5
@@ -529,6 +589,7 @@ def main() -> None:
     test_spec_contract()
     test_serialisation_compatibility()
     test_teacher_forced_one_step_contract()
+    test_token_to_price_one_minute_contract()
     test_continuous_one_and_multi_horizon_contracts()
     test_autoregressive_candle_bridge()
     test_real_official_integration_if_available()

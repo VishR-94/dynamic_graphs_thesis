@@ -4582,6 +4582,7 @@ class UnifiedRunInfo:
     graph_type: str
     num_nodes: int
     num_heads: int
+    num_heads_per_layer: tuple[int, ...] | None
     add_self_loops: bool
     selection_metric: str | None
 
@@ -4740,6 +4741,27 @@ def load_unified_run_info(run_dir: str | Path) -> UnifiedRunInfo:
     if not horizons or any(value <= 0 for value in horizons):
         raise ValueError("Evaluation horizons must be positive integers.")
 
+    per_layer_head_values = graph_values.get("num_heads_per_block")
+    if per_layer_head_values is None:
+        per_layer_head_values = graph_values.get("num_heads_per_layer")
+    if per_layer_head_values is None:
+        per_block_values = resolved.get("per_block")
+        if isinstance(per_block_values, Mapping):
+            per_layer_head_values = per_block_values.get("num_edge_heads")
+    num_heads_per_layer = (
+        None
+        if per_layer_head_values is None
+        else tuple(int(value) for value in per_layer_head_values)
+    )
+    if num_heads_per_layer is not None:
+        if not num_heads_per_layer or any(value <= 0 for value in num_heads_per_layer):
+            raise ValueError("Per-layer graph-head counts must be positive integers.")
+        if int(num_heads_per_layer[-1]) != int(graph_values["num_heads"]):
+            raise ValueError(
+                "The final per-layer graph-head count does not match graph.num_heads: "
+                f"{num_heads_per_layer[-1]} vs {graph_values['num_heads']}."
+            )
+
     return UnifiedRunInfo(
         run_dir=run_path,
         run_kind=run_kind,
@@ -4750,6 +4772,7 @@ def load_unified_run_info(run_dir: str | Path) -> UnifiedRunInfo:
         graph_type=str(graph_values["type"]),
         num_nodes=num_nodes,
         num_heads=int(graph_values["num_heads"]),
+        num_heads_per_layer=num_heads_per_layer,
         add_self_loops=bool(graph_values.get("add_self_loops", False)),
         selection_metric=selection_metric,
     )
@@ -6726,6 +6749,15 @@ def _normalise_graph_payload(
 
     per_layer = graph.get("per_layer")
     if isinstance(per_layer, Sequence) and not isinstance(per_layer, (str, bytes)):
+        if (
+            info.num_heads_per_layer is not None
+            and len(per_layer) != len(info.num_heads_per_layer)
+        ):
+            raise ValueError(
+                "Saved per-layer graph count does not match the configured "
+                f"head-count schedule: {len(per_layer)} vs "
+                f"{len(info.num_heads_per_layer)}."
+            )
         graph["per_layer"] = tuple(
             None
             if values is None
@@ -6733,7 +6765,11 @@ def _normalise_graph_payload(
                 values,
                 windows=windows,
                 nodes=info.num_nodes,
-                expected_heads=info.num_heads,
+                expected_heads=(
+                    info.num_heads
+                    if info.num_heads_per_layer is None
+                    else info.num_heads_per_layer[index]
+                ),
                 name=f"per_layer[{index}]",
             )
             for index, values in enumerate(per_layer)
@@ -8737,18 +8773,41 @@ def plot_selected_graph(
     *,
     cluster: bool = False,
     cluster_method: str = "average",
+    company_profiles_path: str | Path | None = None,
     figsize: tuple[float, float] = (13.0, 11.0),
     tick_fontsize: float = 8.0,
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes, pd.DataFrame]:
-    """Plot actual adjacency weights; clustering is off by default."""
+    """Plot actual adjacency weights, optionally grouped by company sector.
 
+    ``cluster=False`` preserves the saved model asset order. ``cluster=True``
+    no longer performs unsupervised hierarchical clustering: it reads column 1
+    (ticker) and column 6 (sector) from ``company_profiles.csv``, orders sectors
+    alphabetically, and orders tickers alphabetically within each sector. This
+    fixed economic ordering makes graphs directly comparable across windows.
+
+    ``cluster_method`` is retained only for backward call compatibility and is
+    ignored when sector grouping is requested.
+    """
+
+    del cluster_method
     matrix = graph.adjacency.to_numpy(dtype=np.float64, copy=True)
     labels = np.asarray(graph.adjacency.index, dtype=object)
+    ordered_sectors: np.ndarray | None = None
     if cluster:
-        order = _cluster_graph_order(matrix, method=cluster_method)
+        mapping = _asset_sector_mapping(
+            tuple(str(value) for value in labels),
+            company_profiles_path=company_profiles_path,
+        ).copy()
+        mapping["Original position"] = np.arange(len(mapping), dtype=np.int64)
+        mapping = mapping.sort_values(
+            ["Sector", "Ticker"],
+            kind="stable",
+        ).reset_index(drop=True)
+        order = mapping["Original position"].to_numpy(dtype=np.int64)
         matrix = matrix[np.ix_(order, order)]
         labels = labels[order]
+        ordered_sectors = mapping["Sector"].astype(str).to_numpy()
     plotted_values = matrix.copy()
     if not graph.add_self_loops:
         np.fill_diagonal(plotted_values, np.nan)
@@ -8778,12 +8837,21 @@ def plot_selected_graph(
     axes.set_yticklabels(labels, fontsize=tick_fontsize)
     axes.set_xlabel("Source asset (influences target)")
     axes.set_ylabel("Target asset (receives influence)")
+    if ordered_sectors is not None and len(ordered_sectors):
+        boundaries = (
+            np.flatnonzero(ordered_sectors[1:] != ordered_sectors[:-1]) + 1
+        )
+        for boundary in boundaries:
+            coordinate = float(boundary) - 0.5
+            axes.axhline(coordinate, color="black", linewidth=0.8, alpha=0.65)
+            axes.axvline(coordinate, color="black", linewidth=0.8, alpha=0.65)
     time_text = (
         f" — {graph.time_window_description}" if graph.time_window_description else ""
     )
     axes.set_title(
         f"{graph.run_name} — {graph.split} / {graph.policy}\n"
-        f"{graph.selection_description}{time_text}\n"
+        f"{graph.selection_description}{time_text}"
+        f"{' — sector-grouped' if cluster else ''}\n"
         f"entropy of displayed adjacency={graph.displayed_mean_row_entropy:.4f}; "
         f"mean window entropy={graph.mean_window_row_entropy:.4f}"
     )
@@ -8847,6 +8915,7 @@ def analyse_graph(
     top_n: int = 5,
     direction: NeighbourDirection = "impacted_by",
     cluster: bool = False,
+    company_profiles_path: str | Path | None = None,
     random_seed: int = 42,
     models_root: str | Path | None = None,
 ) -> GraphAnalysisReport:
@@ -8870,6 +8939,7 @@ def analyse_graph(
     adjacency_figure, adjacency_axes, plotted = plot_selected_graph(
         graph,
         cluster=cluster,
+        company_profiles_path=company_profiles_path,
     )
     frequency_figure, frequency_axes = plot_top_source_frequency(
         frequency,

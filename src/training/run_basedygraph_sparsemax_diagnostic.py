@@ -46,6 +46,7 @@ from src.models.basedygraph_financial import (
     BaseDyGraphTeacherForcedTokenOutput,
     OfficialBaseDyGraphContinuousForecaster,
     OfficialBaseDyGraphTeacherForcedOneStepForecaster,
+    OfficialBaseDyGraphTokenToPriceForecaster,
     financial_graph_artifact_metadata,
     graph_regularisation_loss,
 )
@@ -93,6 +94,8 @@ ONE_MINUTE_HORIZONS = (1,)
 MULTI_HORIZONS = (1, 5, 15, 30, 60)
 ROLLOUT_LENGTH = 60
 S1_VOCABULARY_SIZE = 1024
+TOKENIZER_CLOSE_CHANNEL_INDEX = 3
+EVALUATION_CLOSE_CHANNEL_INDEX = 3
 GRAPH_ORIENTATION = "row=target,column=source"
 LAYER_ACTIVATIONS = ("softmax", "softmax", "softmax", "sparsemax")
 
@@ -210,6 +213,37 @@ def make_experiment_specs() -> tuple[SparsemaxDiagnosticSpec, ...]:
             tags=("basedygraph", "token", "teacher-forced", "sparsemax"),
         ),
         SparsemaxDiagnosticSpec(
+            name="token_to_price_one_minute",
+            run_name=(
+                "DO_NOT_REPORT_basedygraph_token_in_price_out_1m_dynamic_d96_"
+                "st4_g1_final_sparsemax_h3_lam1_smooth0p01"
+            ),
+            label=(
+                "Kronos-s1-input BaseDyGraph with direct 1-minute Close output, "
+                "four ST blocks, one graph head, final sparsemax"
+            ),
+            mode="hybrid",
+            forecast_strategy="token_to_price_direct_one_step",
+            config=BaseDyGraphFinancialConfig(
+                mode="token",
+                prediction_length=1,
+                evaluation_horizons=ONE_MINUTE_HORIZONS,
+                # Match the continuous price-output run's regularisation scale.
+                # This makes the input representation the controlled change.
+                regularisation=_regularisation(1.0),
+                **shared,
+            ),
+            selection_metric="test_1m_cumulative_log_change_mae",
+            tags=(
+                "basedygraph",
+                "hybrid",
+                "token-input",
+                "price-output",
+                "one-minute",
+                "sparsemax",
+            ),
+        ),
+        SparsemaxDiagnosticSpec(
             name="continuous_parallel_sixty_minute",
             run_name=(
                 "DO_NOT_REPORT_basedygraph_continuous_60m_parallel_d96_st4_g1_"
@@ -268,6 +302,9 @@ EXPERIMENT_BY_NAME = {spec.name: spec for spec in EXPERIMENT_SPECS}
 PHASE1_EXPERIMENTS = (
     "continuous_one_minute",
     "token_teacher_forced_one_minute",
+)
+HYBRID_EXPERIMENTS = (
+    "token_to_price_one_minute",
 )
 PHASE2_EXPERIMENTS = (
     "continuous_parallel_sixty_minute",
@@ -612,6 +649,285 @@ def _token_postselection_exports(
         if bundle.primary_score is not None:
             scores[split] = float(bundle.primary_score)
     return scores
+
+
+# ---------------------------------------------------------------------------
+# Hybrid s1-token input -> direct one-minute Close output
+# ---------------------------------------------------------------------------
+
+
+def _token_price_raw_prediction(
+    predictions: Tensor,
+    batch: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> Tensor:
+    """Invert the token-cache Close normalisation for a direct price head."""
+    values = torch.as_tensor(predictions).float()
+    if values.ndim != 4 or tuple(values.shape[1:]) != (1, NUM_NODES, 1):
+        raise ValueError(
+            "Hybrid predictions must have shape [B,1,N,1]; "
+            f"observed {tuple(values.shape)}."
+        )
+    context_mean = torch.as_tensor(batch["context_mean"]).to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=True,
+    )
+    context_std = torch.as_tensor(batch["context_std"]).to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=True,
+    )
+    mean_close = context_mean[..., TOKENIZER_CLOSE_CHANNEL_INDEX]
+    std_close = context_std[..., TOKENIZER_CLOSE_CHANNEL_INDEX].clamp_min(1.0e-8)
+    return (
+        values * std_close[:, None, :, None]
+        + mean_close[:, None, :, None]
+    )
+
+
+def _token_price_targets(
+    batch: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    true = torch.as_tensor(batch["evaluation_true"]).to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=True,
+    )[..., EVALUATION_CLOSE_CHANNEL_INDEX:EVALUATION_CLOSE_CHANNEL_INDEX + 1]
+    last = torch.as_tensor(batch["last_context_target"]).to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=True,
+    )[..., EVALUATION_CLOSE_CHANNEL_INDEX:EVALUATION_CLOSE_CHANNEL_INDEX + 1]
+    if tuple(true.shape[1:]) != (1, NUM_NODES, 1):
+        raise ValueError(
+            "Hybrid evaluation_true must contain only horizon 1 Close; "
+            f"observed {tuple(true.shape)}."
+        )
+    if tuple(last.shape[1:]) != (NUM_NODES, 1):
+        raise ValueError(
+            "Hybrid last_context_target must have shape [B,N,1]."
+        )
+    return true, last
+
+
+def _token_price_log_mae(
+    predicted_raw: Tensor,
+    true_raw: Tensor,
+    last_raw: Tensor,
+    *,
+    eps: float = 1.0e-8,
+) -> Tensor:
+    predicted_change = (
+        predicted_raw.clamp_min(eps).log()
+        - last_raw.unsqueeze(1).clamp_min(eps).log()
+    )
+    true_change = (
+        true_raw.clamp_min(eps).log()
+        - last_raw.unsqueeze(1).clamp_min(eps).log()
+    )
+    return F.l1_loss(predicted_change, true_change)
+
+
+def _run_token_to_price_train_epoch(
+    *,
+    model: OfficialBaseDyGraphTokenToPriceForecaster,
+    loader: DataLoader[Any],
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    scaler: Any,
+    use_amp: bool,
+    epoch: int,
+    gradient_clip_norm: float,
+    description: str,
+) -> dict[str, Any]:
+    model.train()
+    native_sum = objective_sum = regularisation_sum = 0.0
+    target_penalty_sum = smooth_penalty_sum = 0.0
+    target_count = 0
+    entropy_sum = effective_sum = diagonal_sum = zero_fraction_sum = 0.0
+    graph_batches = 0
+    start = perf_counter()
+
+    for batch in tqdm(loader, desc=description, leave=False, dynamic_ncols=True):
+        context_tokens = torch.as_tensor(batch["context_tokens"]).to(
+            device=device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+        optimizer.zero_grad(set_to_none=True)
+        with _autocast_context(device, use_amp):
+            output = model(context_tokens)
+            predicted_raw = _token_price_raw_prediction(
+                output.predictions,
+                batch,
+                device=device,
+            )
+            true_raw, last_raw = _token_price_targets(batch, device=device)
+            native_loss = _token_price_log_mae(
+                predicted_raw,
+                true_raw,
+                last_raw,
+            )
+            forecast_optimisation = native_loss * 10000.0
+            regularisation = graph_regularisation_loss(
+                output.graph_sequences,
+                model.config.regularisation,
+                epoch=epoch,
+            )
+            objective = forecast_optimisation + regularisation.total
+
+        if not torch.isfinite(objective):
+            raise FloatingPointError("Non-finite token-to-price objective.")
+        scaler.scale(objective).backward()
+        scaler.unscale_(optimizer)
+        if gradient_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+        scaler.step(optimizer)
+        scaler.update()
+
+        count = int(true_raw.numel())
+        native_sum += float(native_loss.detach().item()) * count
+        objective_sum += float(objective.detach().item()) * count
+        regularisation_sum += float(regularisation.total.detach().item()) * count
+        target_penalty_sum += (
+            float(regularisation.target_entropy_penalty.detach().item()) * count
+        )
+        smooth_penalty_sum += (
+            float(regularisation.temporal_smoothness_penalty.detach().item()) * count
+        )
+        target_count += count
+        entropy, effective, diagonal, zero_fraction = _graph_diagnostics(
+            output.graph_sequences
+        )
+        if entropy is not None:
+            entropy_sum += entropy
+            effective_sum += float(effective)
+            diagonal_sum += float(diagonal)
+            zero_fraction_sum += float(zero_fraction)
+            graph_batches += 1
+
+    return {
+        "forecast_native_loss": _mean(native_sum, target_count),
+        "objective_loss": _mean(objective_sum, target_count),
+        "graph_regularisation_loss": _mean(regularisation_sum, target_count),
+        "target_entropy_penalty": _mean(target_penalty_sum, target_count),
+        "temporal_smoothness_penalty": _mean(smooth_penalty_sum, target_count),
+        "graph_mean_row_entropy": entropy_sum / graph_batches if graph_batches else None,
+        "graph_mean_effective_neighbours": effective_sum / graph_batches if graph_batches else None,
+        "graph_mean_diagonal_weight": diagonal_sum / graph_batches if graph_batches else None,
+        "graph_zero_fraction": zero_fraction_sum / graph_batches if graph_batches else None,
+        "seconds": perf_counter() - start,
+    }
+
+
+def _evaluate_token_to_price(
+    *,
+    model: OfficialBaseDyGraphTokenToPriceForecaster,
+    loader: DataLoader[Any],
+    device: torch.device,
+    use_amp: bool,
+    train_split: Mapping[str, Any],
+    asset_cols: Sequence[str],
+    description: str,
+    retain_graphs: bool = True,
+) -> dict[str, Any]:
+    model.eval()
+    predictions: list[Tensor] = []
+    targets: list[Tensor] = []
+    last_values: list[Tensor] = []
+    sample_indices: list[Tensor] = []
+    origin_indices: list[Tensor] = []
+    target_indices: list[Tensor] = []
+    graph_accumulator = (
+        GraphArtifactAccumulator(
+            asset_cols=asset_cols,
+            graph_type="dynamic",
+            num_layers=model.config.num_st_blocks,
+            num_heads=model.config.graph_heads,
+        )
+        if retain_graphs
+        else None
+    )
+    entropy_sum = effective_sum = diagonal_sum = zero_fraction_sum = 0.0
+    graph_batches = 0
+    start = perf_counter()
+
+    with torch.inference_mode():
+        for batch in tqdm(loader, desc=description, leave=False, dynamic_ncols=True):
+            context_tokens = torch.as_tensor(batch["context_tokens"]).to(
+                device=device,
+                dtype=torch.long,
+                non_blocking=True,
+            )
+            with _autocast_context(device, use_amp):
+                output = model(context_tokens)
+            raw_prediction = _token_price_raw_prediction(
+                output.predictions,
+                batch,
+                device=device,
+            )
+            true_raw, last_raw = _token_price_targets(batch, device=device)
+            predictions.append(raw_prediction.detach().cpu().contiguous())
+            targets.append(true_raw.detach().cpu().contiguous())
+            last_values.append(last_raw.detach().cpu().contiguous())
+            sample_indices.append(torch.as_tensor(batch["sample_idx"]).long().cpu())
+            origin_indices.append(torch.as_tensor(batch["origin_idx"]).long().cpu())
+            target_indices.append(torch.as_tensor(batch["target_indices"]).long().cpu())
+
+            entropy, effective, diagonal, zero_fraction = _graph_diagnostics(
+                output.graph_sequences
+            )
+            if entropy is not None:
+                entropy_sum += entropy
+                effective_sum += float(effective)
+                diagonal_sum += float(diagonal)
+                zero_fraction_sum += float(zero_fraction)
+                graph_batches += 1
+            if graph_accumulator is not None:
+                graph_accumulator.add(
+                    output.graph,
+                    _batch_for_graph(batch),
+                    batch_size=int(raw_prediction.shape[0]),
+                    spatial_beta=None,
+                )
+
+    if graph_accumulator is not None:
+        graphs = graph_accumulator.finalise()
+        graphs.update(financial_graph_artifact_metadata(model.config))
+        graphs["input_representation"] = "kronos_s1_tokens"
+        graphs["output_representation"] = "normalised_close"
+        graph_diagnostics = graph_summary(graphs)
+        graph_diagnostics["mean_zero_fraction"] = (
+            zero_fraction_sum / graph_batches if graph_batches else None
+        )
+    else:
+        graphs = None
+        graph_diagnostics = {
+            "graph_present": graph_batches > 0,
+            "mean_row_entropy": entropy_sum / graph_batches if graph_batches else None,
+            "mean_effective_neighbours": effective_sum / graph_batches if graph_batches else None,
+            "mean_diagonal_weight": diagonal_sum / graph_batches if graph_batches else None,
+            "mean_zero_fraction": zero_fraction_sum / graph_batches if graph_batches else None,
+        }
+
+    return _finalise_continuous_bundle(
+        predictions=predictions,
+        targets=targets,
+        last_values=last_values,
+        sample_indices=sample_indices,
+        origin_indices=origin_indices,
+        target_indices=target_indices,
+        horizons=ONE_MINUTE_HORIZONS,
+        asset_cols=asset_cols,
+        train_split=train_split,
+        graphs=graphs,
+        graph_diagnostics=graph_diagnostics,
+        seconds=perf_counter() - start,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1091,6 +1407,11 @@ def _resolved_config_payload(
             "orientation": GRAPH_ORIENTATION,
         },
     }
+    if spec.mode == "hybrid":
+        payload["data"]["input_channels"] = ["s1"]
+        payload["data"]["input_representation"] = "native_kronos_s1_tokens"
+        payload["data"]["target_representation"] = "raw_close_via_context_normalisation"
+
     if spec.mode == "token":
         payload["models"] = {
             "dynamic_graph": {
@@ -1127,6 +1448,11 @@ def _resolved_config_payload(
         }
     else:
         payload["model"] = {
+            "input_representation": (
+                "native_kronos_s1_tokens"
+                if spec.mode == "hybrid"
+                else "context_normalised_ohlcv"
+            ),
             "output_representation": "normalised_close",
             "num_st_blocks": 4,
             "graph": {
@@ -1447,6 +1773,261 @@ def _run_token_experiment(
         atomic_json_save(metadata, run_dir / "run_metadata.json")
     except Exception:
         metadata.update({"status": "failed", "failed_at_utc": _utc_now(), "best_epoch": best_epoch, "best_score": best_score})
+        atomic_json_save(metadata, run_dir / "run_metadata.json")
+        raise
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+
+
+
+def _run_hybrid_experiment(
+    *,
+    spec: SparsemaxDiagnosticSpec,
+    args: argparse.Namespace,
+    run_dir: Path,
+    device: torch.device,
+    use_amp: bool,
+    run_signature: str,
+    metadata: dict[str, Any],
+) -> None:
+    """Train the controlled s1-token-input/direct-Price-output ablation."""
+    for name, path in (
+        ("train", args.train_cache),
+        ("validation", args.validation_cache),
+        ("test", args.test_cache),
+    ):
+        if path is None or not Path(path).is_file():
+            raise FileNotFoundError(f"Missing {name} token cache: {path}")
+
+    base_datasets = {
+        "train": CachedTokenGraphDataset.from_path(args.train_cache),
+        "validation": CachedTokenGraphDataset.from_path(args.validation_cache),
+        "test": CachedTokenGraphDataset.from_path(args.test_cache),
+    }
+    datasets = {
+        name: OneStepTokenDataset(value)
+        for name, value in base_datasets.items()
+    }
+    if not (
+        datasets["train"].asset_cols
+        == datasets["validation"].asset_cols
+        == datasets["test"].asset_cols
+    ):
+        raise ValueError("Token-cache asset orders differ.")
+
+    raw_train_split = _load_raw_training_split(
+        args.data_dir,
+        expected_asset_cols=datasets["train"].asset_cols,
+    )
+    train_dataset = _limit_dataset(datasets["train"], args.max_train_windows)
+    test_dataset = _limit_dataset(datasets["test"], args.max_selection_windows)
+    pin_memory = device.type == "cuda"
+    train_loader = _build_loader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        pin_memory=pin_memory,
+    )
+    test_loader = _build_loader(
+        test_dataset,
+        batch_size=args.selection_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        pin_memory=pin_memory,
+    )
+
+    model = OfficialBaseDyGraphTokenToPriceForecaster(spec.config).to(device)
+    total_parameters, trainable_parameters = _model_parameter_count(model)
+    optimizer = _optimizer(
+        model,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    scaler = _new_grad_scaler(enabled=use_amp)
+    start_epoch = 1
+    best_score = math.inf
+    best_epoch = 0
+    without_improvement = 0
+    history: list[dict[str, Any]] = []
+    if args.resume:
+        checkpoint = _load_checkpoint(
+            run_dir / "last_checkpoint.pt",
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            expected_signature=run_signature,
+            restore_rng=True,
+        )
+        start_epoch = int(checkpoint["epoch"]) + 1
+        best_score = float(checkpoint["best_score"])
+        best_epoch = int(checkpoint["best_epoch"])
+        without_improvement = int(checkpoint["evaluations_without_improvement"])
+        history = [dict(row) for row in checkpoint["history"]]
+
+    metadata.update(
+        {
+            "parameter_count": total_parameters,
+            "trainable_parameter_count": trainable_parameters,
+            "asset_cols": list(datasets["train"].asset_cols),
+            "train_windows": len(datasets["train"]),
+            "test_selection_windows": len(datasets["test"]),
+            "validation_windows": len(datasets["validation"]),
+            "basedygraph_observed_commit": model.external_commit,
+            "input_representation": "native_kronos_s1_tokens",
+            "output_representation": "context_normalised_close",
+            "price_inverse_transform": (
+                "raw_close = predicted_normalised_close * "
+                "context_close_std + context_close_mean"
+            ),
+            "s2_used": False,
+        }
+    )
+    atomic_json_save(metadata, run_dir / "run_metadata.json")
+    wandb_run = _init_wandb(args, spec)
+
+    try:
+        for epoch in range(start_epoch, int(args.max_epochs) + 1):
+            train_metrics = _run_token_to_price_train_epoch(
+                model=model,
+                loader=train_loader,
+                device=device,
+                optimizer=optimizer,
+                scaler=scaler,
+                use_amp=use_amp,
+                epoch=epoch,
+                gradient_clip_norm=args.gradient_clip_norm,
+                description=f"token-to-price train epoch {epoch}",
+            )
+            test_bundle = _evaluate_token_to_price(
+                model=model,
+                loader=test_loader,
+                device=device,
+                use_amp=use_amp,
+                train_split=raw_train_split,
+                asset_cols=datasets["train"].asset_cols,
+                description=f"TEST token-to-price selection epoch {epoch}",
+                retain_graphs=False,
+            )
+            score = float(test_bundle["selection_score"])
+            improved = score < best_score
+            if improved:
+                best_score = score
+                best_epoch = epoch
+                without_improvement = 0
+            else:
+                without_improvement += 1
+
+            history.append(
+                _continuous_history_record(
+                    epoch=epoch,
+                    train=train_metrics,
+                    test=test_bundle,
+                    best_score=best_score,
+                    best_epoch=best_epoch,
+                    horizons=ONE_MINUTE_HORIZONS,
+                )
+            )
+            atomic_csv_save(pd.DataFrame(history), run_dir / "history.csv")
+            checkpoint = _checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                best_score=best_score,
+                best_epoch=best_epoch,
+                without_improvement=without_improvement,
+                history=history,
+                run_signature=run_signature,
+                spec=spec,
+            )
+            atomic_torch_save(checkpoint, run_dir / "last_checkpoint.pt")
+            if improved:
+                atomic_torch_save(checkpoint, run_dir / "best_checkpoint.pt")
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "epoch": epoch,
+                        "train/log_mae": train_metrics["forecast_native_loss"],
+                        "test_selection/log_mae": score,
+                        "train/graph_entropy": train_metrics[
+                            "graph_mean_row_entropy"
+                        ],
+                        "train/graph_zero_fraction": train_metrics[
+                            "graph_zero_fraction"
+                        ],
+                    },
+                    step=epoch,
+                )
+            if without_improvement >= int(args.patience):
+                break
+
+        best_checkpoint = _load_checkpoint(
+            run_dir / "best_checkpoint.pt",
+            model=model,
+            optimizer=None,
+            scaler=None,
+            device=device,
+            expected_signature=run_signature,
+            restore_rng=False,
+        )
+        export_loaders = {
+            split: _build_loader(
+                dataset,
+                batch_size=args.export_batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                seed=args.seed,
+                pin_memory=pin_memory,
+            )
+            for split, dataset in datasets.items()
+        }
+        export_scores: dict[str, float] = {}
+        for split in ("train", "test", "validation"):
+            bundle = _evaluate_token_to_price(
+                model=model,
+                loader=export_loaders[split],
+                device=device,
+                use_amp=use_amp,
+                train_split=raw_train_split,
+                asset_cols=datasets["train"].asset_cols,
+                description=f"selected checkpoint {split} token-to-price export",
+                retain_graphs=True,
+            )
+            _save_continuous_bundle(
+                run_dir=run_dir,
+                split=split,
+                epoch=int(best_checkpoint["epoch"]),
+                bundle=bundle,
+            )
+            export_scores[split] = float(bundle["selection_score"])
+
+        metadata.update(
+            {
+                "status": "completed",
+                "completed_at_utc": _utc_now(),
+                "epochs_completed": int(history[-1]["epoch"]),
+                "best_epoch": best_epoch,
+                "best_score": best_score,
+                "selection_split": "test",
+                "postselection_price_scores": export_scores,
+                "analysis_splits_saved": ["train", "validation", "test"],
+            }
+        )
+        atomic_json_save(metadata, run_dir / "run_metadata.json")
+    except Exception:
+        metadata.update(
+            {
+                "status": "failed",
+                "failed_at_utc": _utc_now(),
+                "best_epoch": best_epoch,
+                "best_score": best_score,
+            }
+        )
         atomic_json_save(metadata, run_dir / "run_metadata.json")
         raise
     finally:
@@ -1800,6 +2381,16 @@ def main() -> None:
             run_signature=run_signature,
             metadata=metadata,
             forecasting_config=forecasting_config,
+        )
+    elif spec.mode == "hybrid":
+        _run_hybrid_experiment(
+            spec=spec,
+            args=args,
+            run_dir=run_dir,
+            device=device,
+            use_amp=use_amp,
+            run_signature=run_signature,
+            metadata=metadata,
         )
     else:
         _run_continuous_experiment(

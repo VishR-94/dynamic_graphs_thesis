@@ -647,6 +647,23 @@ def main() -> None:
         all_graph.adjacency_figure.clf()
         all_graph.frequency_figure.clf()
 
+        sector_grouped_graph = analyse_graph(
+            dynamic,
+            split="validation",
+            day=None,
+            window=None,
+            cluster=True,
+            company_profiles_path=profiles_path,
+        )
+        assert list(sector_grouped_graph.plotted_adjacency.index) == [
+            "BBB",
+            "AAA",
+            "CCC",
+        ]
+        assert "sector-grouped" in sector_grouped_graph.adjacency_axes.get_title()
+        sector_grouped_graph.adjacency_figure.clf()
+        sector_grouped_graph.frequency_figure.clf()
+
         day_graph = analyse_graph(
             dynamic, split="validation", day="2024-09-03", window=None, cluster=False
         )
