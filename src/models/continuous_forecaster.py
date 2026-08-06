@@ -13,12 +13,13 @@ Before the graph stage, assets are independent: the asset axis is folded into
 the batch dimension by both temporal backbones.  No node embedding is used.
 """
 
+import json
 import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Any, Literal, Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -134,6 +135,16 @@ class ContinuousForecasterConfig:
     output_head_initialisation: OutputHeadInitialisation = "default"
     temporal: ContinuousTemporalConfig = ContinuousTemporalConfig()
     graph: GraphConfig = GraphConfig(type="none", num_heads=2)
+
+    # Deterministic context-window absolute Close-return correlation graph.
+    # ``None`` retains every non-self absolute correlation.
+    dynamic_correlation_threshold: float | None = None
+    dynamic_correlation_empty_row_policy: Literal[
+        "error",
+        "strongest",
+    ] = "strongest"
+    dynamic_correlation_eps: float = 1.0e-8
+
     spatial_num_layers: int = 1
     spatial_feedforward_multiplier: int = 2
     spatial_dropout: float = 0.0
@@ -182,13 +193,46 @@ class ContinuousForecasterConfig:
             "fixed",
             "free_static",
             "dynamic",
+            "dynamic_correlation",
             "dynamic_base",
         }:
             raise ValueError(
                 "Continuous forecasting supports graph.type in "
                 "{'none','fixed','free_static','dynamic',"
-                "'dynamic_base'} only."
+                "'dynamic_correlation','dynamic_base'} only."
             )
+        if self.graph.type == "dynamic_correlation":
+            if self.graph.activation != "softmax":
+                raise ValueError(
+                    "dynamic_correlation requires graph.activation='softmax' "
+                    "because it uses direct row normalisation."
+                )
+            if (
+                self.dynamic_correlation_threshold is not None
+                and not 0.0
+                <= float(self.dynamic_correlation_threshold)
+                <= 1.0
+            ):
+                raise ValueError(
+                    "dynamic_correlation_threshold must be None or lie in "
+                    "[0,1]."
+                )
+            if self.dynamic_correlation_empty_row_policy not in {
+                "error",
+                "strongest",
+            }:
+                raise ValueError(
+                    "dynamic_correlation_empty_row_policy must be 'error' "
+                    "or 'strongest'."
+                )
+            if (
+                not math.isfinite(float(self.dynamic_correlation_eps))
+                or float(self.dynamic_correlation_eps) <= 0.0
+            ):
+                raise ValueError(
+                    "dynamic_correlation_eps must be finite and positive."
+                )
+
         if self.spatial_num_layers <= 0:
             raise ValueError("spatial_num_layers must be positive.")
         if self.spatial_feedforward_multiplier <= 0:
@@ -828,6 +872,13 @@ class ContinuousForecaster(nn.Module):
             num_nodes=config.num_nodes,
             d_model=config.temporal.d_model,
             fixed_adjacency=fixed_adjacency,
+            dynamic_correlation_threshold=(
+                config.dynamic_correlation_threshold
+            ),
+            dynamic_correlation_empty_row_policy=(
+                config.dynamic_correlation_empty_row_policy
+            ),
+            dynamic_correlation_eps=config.dynamic_correlation_eps,
         )
         if config.graph.type == "none":
             self.spatial_module: nn.Module = IdentitySpatialModule()
@@ -886,6 +937,7 @@ class ContinuousForecaster(nn.Module):
         *,
         context_start: Tensor,
         session_length: Tensor,
+        graph_context_values: Tensor | None = None,
     ) -> ContinuousForecastOutput:
         if x.ndim != 4:
             raise ValueError("x must have shape [B,T,N,C].")
@@ -903,7 +955,13 @@ class ContinuousForecaster(nn.Module):
             context_start=context_start,
             session_length=session_length,
         )
-        graph = self.graph_learner(temporal_hidden)
+        if self.config.graph.type == "dynamic_correlation":
+            graph = self.graph_learner(
+                temporal_hidden,
+                context_values=graph_context_values,
+            )
+        else:
+            graph = self.graph_learner(temporal_hidden)
         if graph.selected is None:
             graph_spatial_hidden = self.spatial_module(temporal_hidden)
             spatial_hidden = graph_spatial_hidden
@@ -942,6 +1000,406 @@ class ContinuousForecaster(nn.Module):
         output.validate(self.config)
         return output
 
+
+
+@dataclass
+class ContinuousRunEvaluation:
+    """Complete saved-run inference and evaluation result."""
+
+    run_dir: Path
+    split_name: str
+    checkpoint_epoch: int
+    prediction_path: Path
+    graph_path: Path | None
+    metric_path: Path
+    diagnostics_path: Path | None
+    prediction_result: dict[str, Any]
+    metric_results: dict[str, Any]
+    metric_table: Any
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        values = json.load(handle)
+    if not isinstance(values, dict):
+        raise TypeError(
+            f"Expected a JSON object in {path}; received "
+            f"{type(values).__name__}."
+        )
+    return values
+
+
+def _atomic_torch_save(value: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(value, temporary)
+    temporary.replace(path)
+
+
+def _atomic_json_save(value: Mapping[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(dict(value), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _resolve_saved_run_device(
+    device: str | torch.device,
+) -> torch.device:
+    if isinstance(device, torch.device):
+        resolved = device
+    else:
+        value = str(device).strip().lower()
+        if value == "auto":
+            if torch.cuda.is_available():
+                value = "cuda"
+            elif (
+                hasattr(torch.backends, "mps")
+                and torch.backends.mps.is_available()
+            ):
+                value = "mps"
+            else:
+                value = "cpu"
+        resolved = torch.device(value)
+
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested, but CUDA is unavailable.")
+    if resolved.type == "mps" and not (
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        raise RuntimeError("MPS was requested, but MPS is unavailable.")
+    return resolved
+
+
+def _normalise_saved_split_name(split_name: str) -> str:
+    value = str(split_name).strip().lower()
+    aliases = {
+        "train": "train",
+        "training": "train",
+        "val": "validation",
+        "validation": "validation",
+        "test": "test",
+    }
+    if value not in aliases:
+        raise ValueError(
+            "split_name must be train, validation/val, or test."
+        )
+    return aliases[value]
+
+
+def _unwrap_saved_prediction_result(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise TypeError("Saved prediction artefact must be a mapping.")
+    if "prediction_result" in payload:
+        result = payload["prediction_result"]
+    else:
+        result = payload
+    if not isinstance(result, Mapping):
+        raise TypeError("prediction_result must be a mapping.")
+    required = {
+        "y_pred",
+        "y_true",
+        "last_context_target",
+        "channels",
+        "horizons",
+        "sample_idx",
+        "origin_idx",
+        "target_indices",
+    }
+    missing = required.difference(result)
+    if missing:
+        raise KeyError(
+            "Saved continuous prediction result is missing fields: "
+            f"{sorted(missing)}"
+        )
+    return dict(result)
+
+
+def evaluate_saved_continuous_forecaster_run(
+    *,
+    run_dir: str | Path,
+    train_split: Mapping[str, Any],
+    evaluation_split: Mapping[str, Any],
+    split_name: str = "test",
+    run_inference: bool = False,
+    device: str | torch.device = "auto",
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+    mixed_precision: bool | None = None,
+    prediction_filename: str | None = None,
+    metrics: Sequence[str] | None = None,
+    bootstrap: bool = True,
+    n_bootstrap: int = 10_000,
+    confidence_level: float = 0.95,
+    bootstrap_seed: int = 42,
+) -> ContinuousRunEvaluation:
+    """Run or reload one saved continuous forecaster on a data split.
+
+    The run directory is authoritative. The helper loads its exact
+    ``resolved_config.json`` and ``best_checkpoint.pt``; it never rebuilds the
+    model from the current default YAML. When ``run_inference`` is true, the
+    selected checkpoint is evaluated once and the predictions and graph
+    artefacts are saved beside the checkpoint. When false, the saved prediction
+    artefact is loaded directly and only the common ForecastEvaluator is run.
+
+    No model fitting occurs in this function.
+    """
+    run_path = Path(run_dir).expanduser().resolve()
+    if not run_path.is_dir():
+        raise FileNotFoundError(run_path)
+
+    resolved_split = _normalise_saved_split_name(split_name)
+    metadata_path = run_path / "run_metadata.json"
+    config_path = run_path / "resolved_config.json"
+    checkpoint_path = run_path / "best_checkpoint.pt"
+    for path in (metadata_path, config_path, checkpoint_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+    metadata = _load_json_object(metadata_path)
+    if metadata.get("status") != "completed":
+        raise RuntimeError(
+            f"Continuous run is not marked completed: {run_path.name}"
+        )
+    resolved_config = _load_json_object(config_path)
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("Continuous best checkpoint must be a mapping.")
+    if "model_state_dict" not in checkpoint:
+        raise KeyError("Continuous checkpoint has no model_state_dict.")
+
+    checkpoint_epoch = int(checkpoint["epoch"])
+    checkpoint_best_epoch = int(
+        checkpoint.get("best_epoch", checkpoint_epoch)
+    )
+    metadata_best_epoch = int(metadata["best_epoch"])
+    if checkpoint_epoch != checkpoint_best_epoch:
+        raise AssertionError(
+            "best_checkpoint.pt does not represent its recorded best epoch: "
+            f"epoch={checkpoint_epoch}, best_epoch={checkpoint_best_epoch}."
+        )
+    if checkpoint_epoch != metadata_best_epoch:
+        raise AssertionError(
+            "best_checkpoint.pt epoch differs from run_metadata.json: "
+            f"checkpoint={checkpoint_epoch}, metadata={metadata_best_epoch}."
+        )
+    saved_checkpoint_config = checkpoint.get("resolved_config")
+    if (
+        saved_checkpoint_config is not None
+        and saved_checkpoint_config != resolved_config
+    ):
+        raise ValueError(
+            "best_checkpoint.pt and resolved_config.json describe different "
+            "continuous models."
+        )
+
+    train_assets = [str(value) for value in train_split["asset_cols"]]
+    evaluation_assets = [
+        str(value) for value in evaluation_split["asset_cols"]
+    ]
+    if evaluation_assets != train_assets:
+        raise ValueError(
+            "Training and evaluation asset order differs."
+        )
+    metadata_assets = [str(value) for value in metadata["asset_cols"]]
+    if metadata_assets != train_assets:
+        raise ValueError(
+            "Saved continuous model asset order differs from the supplied "
+            "training/evaluation splits."
+        )
+
+    filename = (
+        f"{resolved_split}_predictions.pt"
+        if prediction_filename is None
+        else str(prediction_filename)
+    )
+    if not filename.endswith(".pt"):
+        raise ValueError("prediction_filename must end in .pt.")
+    prediction_path = run_path / filename
+    graph_path = run_path / f"{resolved_split}_graphs.pt"
+    metric_path = run_path / f"{resolved_split}_metric_table.csv"
+    diagnostics_path = run_path / f"{resolved_split}_diagnostics.json"
+
+    if run_inference:
+        # Local imports avoid creating a model/training import cycle while
+        # reusing the production runner's exact dataset and decoding contract.
+        from src.data.continuous_forecast_dataset import (
+            build_continuous_dataset,
+        )
+        from src.models.dynamic_graph.fixed_graph_resource import (
+            FixedGraphResource,
+        )
+        from src.training import run_continuous_forecaster as runner
+
+        runner.validate_config(resolved_config)
+        dataset_config = runner._dataset_config(resolved_config)
+        dataset = build_continuous_dataset(
+            dict(evaluation_split),
+            config=dataset_config,
+        )
+        resolved_device = _resolve_saved_run_device(device)
+        training_config = resolved_config["training"]
+        loader = runner._build_loader(
+            dataset,
+            batch_size=(
+                int(training_config["validation_batch_size"])
+                if batch_size is None
+                else int(batch_size)
+            ),
+            shuffle=False,
+            num_workers=(
+                int(training_config["num_workers"])
+                if num_workers is None
+                else int(num_workers)
+            ),
+            seed=int(training_config["seed"]) + 2,
+            pin_memory=resolved_device.type == "cuda",
+        )
+
+        model_config = runner._model_config(
+            resolved_config,
+            num_nodes=len(train_assets),
+        )
+        fixed_adjacency = None
+        if model_config.graph.type == "fixed":
+            resource_path = run_path / "fixed_graph_resource.pt"
+            if not resource_path.is_file():
+                raise FileNotFoundError(resource_path)
+            resource_payload = torch.load(
+                resource_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            resource = FixedGraphResource.from_payload(resource_payload)
+            if list(resource.asset_cols) != train_assets:
+                raise ValueError(
+                    "Fixed graph asset order differs from the model split."
+                )
+            fixed_adjacency = resource.adjacency
+
+        model = ContinuousForecaster(
+            model_config,
+            fixed_adjacency=fixed_adjacency,
+        )
+        model.load_state_dict(
+            checkpoint["model_state_dict"],
+            strict=True,
+        )
+        model.to(resolved_device)
+        model.eval()
+
+        use_amp = (
+            bool(training_config["mixed_precision"])
+            if mixed_precision is None
+            else bool(mixed_precision)
+        ) and resolved_device.type == "cuda"
+        validation = runner._run_validation(
+            model=model,
+            loader=loader,
+            device=resolved_device,
+            use_amp=use_amp,
+            config=resolved_config,
+            train_split=dict(train_split),
+            asset_cols=train_assets,
+            description=(
+                f"{run_path.name} {resolved_split} selected-checkpoint inference"
+            ),
+        )
+        prediction_result = dict(validation["prediction_result"])
+        _atomic_torch_save(
+            {
+                "epoch": checkpoint_epoch,
+                "prediction_result": prediction_result,
+            },
+            prediction_path,
+        )
+        _atomic_torch_save(
+            {
+                "epoch": checkpoint_epoch,
+                "graph_artifacts": validation["graphs"],
+            },
+            graph_path,
+        )
+        _atomic_json_save(
+            {
+                "run_name": metadata.get("run_name", run_path.name),
+                "split": resolved_split,
+                "checkpoint_epoch": checkpoint_epoch,
+                "device": str(resolved_device),
+                "mixed_precision": use_amp,
+                "windows": int(prediction_result["y_pred"].shape[0]),
+                "prediction_path": str(prediction_path),
+                "graph_path": str(graph_path),
+                "inference_seconds": float(validation["seconds"]),
+                "spatial_beta": validation.get("spatial_beta"),
+                "dynamic_alpha": validation.get("dynamic_alpha"),
+                "graph_summary": validation.get("graph_summary"),
+            },
+            diagnostics_path,
+        )
+    else:
+        if not prediction_path.is_file():
+            raise FileNotFoundError(
+                "Saved continuous prediction artefact does not exist. "
+                f"Set run_inference=True once to create it: {prediction_path}"
+            )
+        prediction_result = _unwrap_saved_prediction_result(
+            torch.load(
+                prediction_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        )
+
+    from src.evaluation.metrics import ForecastEvaluator
+    from src.utils.metric_tables import make_evaluation_table
+
+    evaluator = ForecastEvaluator(
+        prediction_result=prediction_result,
+        train_split=dict(train_split),
+    )
+    requested_metrics = (
+        evaluator.available_metrics
+        if metrics is None
+        else tuple(str(value) for value in metrics)
+    )
+    metric_results = evaluator.evaluate(
+        metrics=requested_metrics,
+        reduce_dims=(0, 2),
+        bootstrap=bool(bootstrap),
+        n_bootstrap=int(n_bootstrap),
+        confidence_level=float(confidence_level),
+        bootstrap_seed=int(bootstrap_seed),
+    )
+    metric_table = make_evaluation_table(
+        metric_results=metric_results,
+        horizons=evaluator.horizons,
+        channels=evaluator.channels,
+    )
+    metric_table.to_csv(metric_path, index=False)
+
+    return ContinuousRunEvaluation(
+        run_dir=run_path,
+        split_name=resolved_split,
+        checkpoint_epoch=checkpoint_epoch,
+        prediction_path=prediction_path,
+        graph_path=(graph_path if graph_path.is_file() else None),
+        metric_path=metric_path,
+        diagnostics_path=(
+            diagnostics_path if diagnostics_path.is_file() else None
+        ),
+        prediction_result=prediction_result,
+        metric_results=metric_results,
+        metric_table=metric_table,
+    )
 
 def _cpu_smoke_test() -> None:
     torch.manual_seed(11)

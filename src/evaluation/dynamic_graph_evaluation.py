@@ -41,9 +41,10 @@ Current public API
 
 from __future__ import annotations
 
-EVALUATION_MODULE_VERSION = "2026-08-04-v9-unified-final-analysis"
+EVALUATION_MODULE_VERSION = "2026-08-05-v11-final-graph-hub"
 
 import json
+import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,8 @@ import torch.nn.functional as F
 from matplotlib.axes import Axes
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.figure import Figure
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Patch, Rectangle
 from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.spatial.distance import squareform
 from torch import Tensor
@@ -718,7 +721,7 @@ def _load_static_checkpoint_graph(
 
     graph_type = model_config.graph.type
 
-    if graph_type in {"dynamic", "oracle"}:
+    if graph_type in {"dynamic", "dynamic_correlation", "oracle"}:
         raise ValueError(
             f"graph.type={graph_type!r} has no single checkpoint graph. "
             "Use source='best_validation' to inspect saved validation graphs."
@@ -4848,8 +4851,7 @@ def _validate_graph_artifacts(
         "graph_orientation",
         graph_artifacts.get("orientation", "A[target, source]"),
     )
-    if str(orientation) != "A[target, source]":
-        raise ValueError(f"Unexpected graph orientation: {orientation!r}.")
+    _canonical_graph_orientation(orientation)
 
     artifact_assets = graph_artifacts.get("asset_cols")
     if artifact_assets is not None and tuple(map(str, artifact_assets)) != info.asset_cols:
@@ -4887,7 +4889,7 @@ def _validate_graph_artifacts(
             )
 
     dates = graph_artifacts.get("dates")
-    if dates and len(dates) != expected_windows:
+    if dates is not None and len(dates) != expected_windows:
         raise ValueError("Saved graph dates do not align with window count.")
 
 
@@ -5299,7 +5301,7 @@ def make_graph_snapshot_connections_table(
 def plot_graph_snapshot(
     snapshot: GraphSnapshot,
     *,
-    cluster: bool = True,
+    cluster: bool = False,
     cluster_method: str = "average",
     figsize: tuple[float, float] = (13.0, 11.0),
     tick_fontsize: float = 8.0,
@@ -6002,6 +6004,24 @@ def make_unified_model_summary_table(run_dir: str | Path) -> pd.DataFrame:
                 ("Graph learning rate", training.get("graph_learning_rate")),
             ]
         )
+        if str(graph.get("type")) == "dynamic_correlation":
+            dynamic_correlation = model.get("dynamic_correlation", {})
+            rows.extend(
+                [
+                    (
+                        "Dynamic-correlation threshold",
+                        dynamic_correlation.get("threshold"),
+                    ),
+                    (
+                        "Dynamic-correlation empty-row policy",
+                        dynamic_correlation.get("empty_row_policy"),
+                    ),
+                    (
+                        "Dynamic-correlation epsilon",
+                        dynamic_correlation.get("eps"),
+                    ),
+                ]
+            )
     else:
         model = resolved["models"]["dynamic_graph"]
         temporal = model["temporal"]
@@ -6041,3 +6061,3431 @@ def make_unified_model_summary_table(run_dir: str | Path) -> pd.DataFrame:
         ]
     )
     return pd.DataFrame(rows, columns=["Field", "Value"]).set_index("Field")
+
+# ============================================================================
+# Models-to-use analysis API
+# ============================================================================
+#
+# This API is intentionally path-driven rather than preset-driven.  Every
+# public function accepts a model directory, an evaluation split, and (where
+# relevant) an inference policy.  It supports the historical validation
+# artefact layout and the canonical split layout used for frozen test outputs.
+
+EvaluationSplit = Literal["train", "validation", "test"]
+EvaluationSplitInput = Literal["train", "training", "val", "validation", "test"]
+
+
+@dataclass(frozen=True)
+class EvaluationArtifactPaths:
+    """Resolved files for one model, split, and inference policy."""
+
+    run_dir: Path
+    split: EvaluationSplit
+    policy: str
+    policy_dir: Path
+    predictions: Path
+    graphs: Path | None
+    metrics: Path | None
+    sampled_paths: Path | None
+    tokens: Path | None
+
+
+@dataclass(frozen=True)
+class EvaluationArtifacts:
+    """Validated saved outputs for one model/split/policy combination."""
+
+    info: UnifiedRunInfo
+    split: EvaluationSplit
+    policy: str
+    epoch: int | None
+    prediction_result: dict[str, Any]
+    graph_artifacts: dict[str, Any] | None
+    metric_table: pd.DataFrame | None
+    sampled_price_paths: dict[str, Any] | None
+    token_artifacts: dict[str, Any] | None
+    paths: EvaluationArtifactPaths
+
+
+@dataclass(frozen=True)
+class GraphWindowReport:
+    """Graph plot and tables for one exact saved forecast window."""
+
+    snapshot: GraphSnapshot
+    summary: pd.DataFrame
+    connections: pd.DataFrame
+    window: pd.DataFrame
+    figure: Figure
+    axes: Axes
+    plotted_adjacency: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class PointForecastReport:
+    """Point-forecast comparison for one date/window/asset."""
+
+    figure: Figure
+    axes: Axes
+    values: pd.DataFrame
+    window: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class SamplePathWindowReport:
+    """Ten-path forecast plot and values for one date/window/asset."""
+
+    figure: Figure
+    axes: Axes
+    paths: pd.DataFrame
+    horizons: pd.DataFrame
+    window: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class PredictiveCoverageReport:
+    """Coverage, sharpness, CRPS, and finite-ensemble rank diagnostics."""
+
+    overall: pd.DataFrame
+    by_asset: pd.DataFrame
+    probabilistic_scores: pd.DataFrame
+    rank_histogram: pd.DataFrame
+    calibration_figure: Figure
+    calibration_axes: Axes
+
+
+def resolve_models_to_use_root(root: str | Path | None = None) -> Path:
+    """Resolve the single user-managed ``models_to_use`` directory.
+
+    The helper checks the local Google Drive mount used on the author's Mac and
+    the Colab mount.  Passing ``root`` bypasses auto-detection.
+    """
+
+    if root is not None:
+        path = Path(root).expanduser().resolve()
+        if not path.is_dir():
+            raise FileNotFoundError(f"models_to_use directory does not exist: {path}")
+        return path
+
+    candidates = (
+        Path(
+            "/Users/vishalruparelia/Library/CloudStorage/"
+            "GoogleDrive-vishal@autonomous-fox.ai/My Drive/"
+            "dissertation/models_to_use"
+        ),
+        Path("/content/drive/MyDrive/dissertation/models_to_use"),
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    raise FileNotFoundError(
+        "Could not locate dissertation/models_to_use. Checked:\n"
+        + "\n".join(f"  - {candidate}" for candidate in candidates)
+    )
+
+
+def resolve_model_folder(
+    model: str | Path,
+    *,
+    models_root: str | Path | None = None,
+) -> Path:
+    """Resolve a direct run path or a folder name under ``models_to_use``."""
+
+    direct = Path(model).expanduser()
+    if direct.is_dir():
+        return direct.resolve()
+
+    root = resolve_models_to_use_root(models_root)
+    candidate = root / str(model)
+    if not candidate.is_dir():
+        raise FileNotFoundError(
+            f"Model folder {model!r} was not found under {root}."
+        )
+    return candidate.resolve()
+
+
+def normalise_evaluation_split(split: EvaluationSplitInput | str) -> EvaluationSplit:
+    """Return the canonical saved-artifact split name.
+
+    Public Graph Hub functions accept ``"train"``, ``"val"``/``"validation"``
+    and ``"test"``.  The analysis layer never launches inference.  When the
+    requested split has not been saved, the loader raises a file error listing
+    the paths it checked.
+    """
+
+    value = str(split).strip().lower()
+    aliases = {
+        "train": "train",
+        "training": "train",
+        "val": "validation",
+        "validation": "validation",
+        "test": "test",
+    }
+    if value not in aliases:
+        raise ValueError(
+            "split must be one of 'train', 'val'/'validation', or 'test'."
+        )
+    return aliases[value]  # type: ignore[return-value]
+
+
+def discover_models(
+    *,
+    models_root: str | Path | None = None,
+) -> pd.DataFrame:
+    """List every direct child directory under ``models_to_use``.
+
+    No folder-name whitelist is used.  A folder is shown even when it is
+    incomplete, because the purpose of discovery is to expose what is present,
+    not to silently decide which experiments count as models.
+    """
+
+    root = resolve_models_to_use_root(models_root)
+    rows: list[dict[str, Any]] = []
+    for folder in sorted((path for path in root.iterdir() if path.is_dir()), key=lambda p: p.name):
+        metadata_path = folder / "run_metadata.json"
+        config_path = folder / "resolved_config.json"
+        history_path = folder / "history.csv"
+        row: dict[str, Any] = {
+            "Folder": folder.name,
+            "Path": str(folder.resolve()),
+            "Run metadata": metadata_path.is_file(),
+            "Resolved config": config_path.is_file(),
+            "History": history_path.is_file(),
+            "Best checkpoint": (folder / "best_checkpoint.pt").is_file(),
+            "Last checkpoint": (folder / "last_checkpoint.pt").is_file(),
+            "Saved train analysis": (folder / "analysis" / "train").is_dir(),
+            "Saved validation analysis": (folder / "analysis" / "validation").is_dir(),
+            "Saved test analysis": (folder / "analysis" / "test").is_dir(),
+            "Family": None,
+            "Status": None,
+            "Graph type": None,
+            "Issue": None,
+        }
+        try:
+            if metadata_path.is_file():
+                metadata = _load_json(metadata_path)
+                row["Status"] = metadata.get("status")
+            if metadata_path.is_file() and config_path.is_file():
+                info = load_unified_run_info(folder)
+                row["Family"] = info.run_kind
+                row["Graph type"] = info.graph_type
+        except Exception as error:
+            row["Issue"] = f"{type(error).__name__}: {error}"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _temperature_policy_name(temperature: float) -> str:
+    text = f"{float(temperature):g}".replace("-", "m").replace(".", "p")
+    return f"temperature_{text}"
+
+
+def _selected_policy_from_json(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    values = _load_json(path)
+    for key in ("selected_policy", "policy", "selected_policy_name"):
+        value = values.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    temperature = values.get("selected_temperature")
+    if temperature is not None:
+        return _temperature_policy_name(float(temperature))
+    return None
+
+
+def _selected_temperature_policy(run_dir: Path, split: EvaluationSplit) -> str | None:
+    candidates = (
+        run_dir / "analysis" / split / "temperature_selection.json",
+        run_dir / f"{split}_inference" / "temperature_selection.json",
+        run_dir / "temperature_sweep" / f"{split}_temperature_selection.json",
+        run_dir / "temperature_sweep" / "temperature_selection.json",
+        run_dir / "_experiment_control" / "temperature_selection.json",
+    )
+    for candidate in candidates:
+        resolved = _selected_policy_from_json(candidate)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _artifact_paths_in_directory(
+    directory: Path,
+    *,
+    split: EvaluationSplit,
+    policy: str,
+    prefix: str,
+) -> EvaluationArtifactPaths:
+    return EvaluationArtifactPaths(
+        run_dir=directory,
+        split=split,
+        policy=policy,
+        policy_dir=directory,
+        predictions=directory / f"{prefix}predictions.pt",
+        graphs=directory / f"{prefix}graphs.pt",
+        metrics=directory / f"{prefix}metric_table.csv",
+        sampled_paths=directory / f"{prefix}sampled_price_paths.pt",
+        tokens=directory / f"{prefix}tokens.pt",
+    )
+
+
+
+def _candidate_artifact_layouts(
+    run_dir: Path,
+    *,
+    split: EvaluationSplit,
+    policy: str,
+) -> list[EvaluationArtifactPaths]:
+    """Return supported saved-artifact layouts in priority order."""
+
+    candidates: list[EvaluationArtifactPaths] = []
+
+    # Canonical frozen-analysis layout.  The inference/baseline notebooks are
+    # expected to write one of these directories for train, validation and test.
+    canonical_direct = run_dir / "analysis" / split
+    candidates.append(
+        _artifact_paths_in_directory(
+            canonical_direct,
+            split=split,
+            policy=policy,
+            prefix="",
+        )
+    )
+    candidates.append(
+        _artifact_paths_in_directory(
+            canonical_direct / policy,
+            split=split,
+            policy=policy,
+            prefix="",
+        )
+    )
+
+    # Direct split-labelled files in the model root.
+    candidates.append(
+        _artifact_paths_in_directory(
+            run_dir,
+            split=split,
+            policy=policy,
+            prefix=f"{split}_",
+        )
+    )
+
+    # Historical best-checkpoint layouts.  Validation is the established
+    # production spelling; train/training are accepted for final-checkpoint
+    # inference saved later by the baselines notebook.
+    historical_prefixes: tuple[str, ...]
+    if split == "validation":
+        historical_prefixes = ("best_validation_",)
+    elif split == "train":
+        historical_prefixes = ("best_train_", "best_training_")
+    else:
+        historical_prefixes = ("best_test_",)
+
+    if policy in {"best", f"best_{split}", "default"}:
+        for prefix in historical_prefixes:
+            candidates.append(
+                _artifact_paths_in_directory(
+                    run_dir,
+                    split=split,
+                    policy="best",
+                    prefix=prefix,
+                )
+            )
+
+    # Temperature-policy layouts used by the tokenized runner and by frozen
+    # split inference.  The historical validation runner uses validation_*
+    # filenames under temperature_sweep/<policy>.
+    policy_directories = (
+        run_dir / "temperature_sweep" / policy,
+        run_dir / f"{split}_inference" / policy,
+        run_dir / "analysis" / split / policy,
+    )
+    for directory in policy_directories:
+        for prefix in (f"{split}_", ""):
+            candidates.append(
+                _artifact_paths_in_directory(
+                    directory,
+                    split=split,
+                    policy=policy,
+                    prefix=prefix,
+                )
+            )
+    if split == "validation":
+        candidates.append(
+            _artifact_paths_in_directory(
+                run_dir / "temperature_sweep" / policy,
+                split=split,
+                policy=policy,
+                prefix="validation_",
+            )
+        )
+
+    # Remove duplicate prediction paths while preserving priority.
+    unique: list[EvaluationArtifactPaths] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate.predictions in seen:
+            continue
+        seen.add(candidate.predictions)
+        unique.append(candidate)
+    return unique
+
+
+
+
+def _available_saved_policies(
+    run_dir: Path,
+    *,
+    split: EvaluationSplit,
+) -> tuple[str, ...]:
+    """Return policy directories that contain a prediction artefact."""
+
+    names: set[str] = set()
+    roots = (
+        run_dir / "temperature_sweep",
+        run_dir / f"{split}_inference",
+        run_dir / "analysis" / split,
+    )
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for directory in root.iterdir():
+            if not directory.is_dir():
+                continue
+            prefixes = ("", f"{split}_", "validation_" if split == "validation" else "")
+            if any(
+                prefix and (directory / f"{prefix}predictions.pt").is_file()
+                for prefix in prefixes
+            ) or (directory / "predictions.pt").is_file():
+                names.add(directory.name)
+    return tuple(sorted(names))
+
+
+def resolve_evaluation_artifact_paths(
+    run_dir: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+) -> EvaluationArtifactPaths:
+    """Resolve saved analysis files without depending on a folder name.
+
+    ``policy=None`` is the transparent automatic mode used by the final Graph
+    Hub.  A saved temperature-selection manifest is honoured.  Otherwise a
+    validation ``best_validation_*`` bundle or a direct train/test bundle is
+    used.  If several tokenized policies exist but no selection manifest says
+    which one is final, the function raises and lists the available policies.
+    """
+
+    run_path = _resolve_run_dir(run_dir)
+    resolved_split = normalise_evaluation_split(split)
+    requested = None if policy is None else str(policy).strip()
+    if requested == "":
+        raise ValueError("policy cannot be an empty string; use None for automatic selection.")
+
+    selected = _selected_temperature_policy(run_path, resolved_split)
+    if requested in {None, "auto", "selected_temperature"}:
+        if selected is not None:
+            requested = selected
+        elif resolved_split == "validation" and (
+            run_path / "best_validation_predictions.pt"
+        ).is_file():
+            requested = "best"
+        else:
+            available = _available_saved_policies(
+                run_path,
+                split=resolved_split,
+            )
+            if len(available) == 1:
+                requested = available[0]
+            elif len(available) > 1:
+                raise ValueError(
+                    "Several saved inference policies are available but no "
+                    "selection manifest identifies the final one. Pass policy="
+                    f" explicitly. Available policies: {list(available)}"
+                )
+            else:
+                requested = "default"
+
+    assert requested is not None
+    candidates = _candidate_artifact_layouts(
+        run_path,
+        split=resolved_split,
+        policy=requested,
+    )
+    for candidate in candidates:
+        if candidate.predictions.is_file():
+            return EvaluationArtifactPaths(
+                run_dir=run_path,
+                split=candidate.split,
+                policy=("best" if candidate.policy.startswith("best_") else candidate.policy),
+                policy_dir=candidate.policy_dir,
+                predictions=candidate.predictions,
+                graphs=(candidate.graphs if candidate.graphs and candidate.graphs.is_file() else None),
+                metrics=(candidate.metrics if candidate.metrics and candidate.metrics.is_file() else None),
+                sampled_paths=(
+                    candidate.sampled_paths
+                    if candidate.sampled_paths and candidate.sampled_paths.is_file()
+                    else None
+                ),
+                tokens=(candidate.tokens if candidate.tokens and candidate.tokens.is_file() else None),
+            )
+
+    checked = "\n".join(f"  - {candidate.predictions}" for candidate in candidates)
+    raise FileNotFoundError(
+        f"No saved {resolved_split} prediction artefact was found for policy "
+        f"{requested!r} in {run_path}. Graph Hub does not run inference. "
+        "Generate the missing split artefacts in the inference/baselines "
+        f"notebook, then retry. Checked:\n{checked}"
+    )
+
+
+
+def _canonical_graph_orientation(value: Any) -> str:
+    """Normalise historical spellings of the canonical graph orientation."""
+
+    if value is None:
+        return "A[target, source]"
+    text = re.sub(r"\s+", "", str(value).strip().lower())
+    text = text.replace("rows", "row").replace("columns", "column")
+    canonical_aliases = {
+        "a[target,source]",
+        "row=target,column=source",
+        "row:target,column:source",
+        "target,source",
+        "target_source",
+        "target-by-source",
+    }
+    reversed_aliases = {
+        "a[source,target]",
+        "row=source,column=target",
+        "row:source,column:target",
+        "source,target",
+        "source_target",
+        "source-by-target",
+    }
+    if text in canonical_aliases:
+        return "A[target, source]"
+    if text in reversed_aliases:
+        raise ValueError(
+            "Saved graph uses A[source, target], but this project requires "
+            "A[target, source]. Transpose explicitly at artifact creation; "
+            "the analysis code will not silently reverse it."
+        )
+    raise ValueError(f"Unexpected graph orientation: {value!r}.")
+
+
+def _normalise_saved_graph_tensor(
+    values: Any,
+    *,
+    windows: int,
+    nodes: int,
+    expected_heads: int,
+    name: str,
+) -> Tensor:
+    tensor = torch.as_tensor(values).detach().cpu().float()
+    if tensor.ndim == 2:
+        if tuple(tensor.shape) != (nodes, nodes):
+            raise ValueError(f"Graph component {name!r} has wrong node shape.")
+        tensor = tensor.unsqueeze(0).unsqueeze(0).expand(windows, 1, -1, -1)
+    elif tensor.ndim == 3:
+        if tuple(tensor.shape[-2:]) != (nodes, nodes):
+            raise ValueError(f"Graph component {name!r} has wrong node shape.")
+        if int(tensor.shape[0]) == windows and expected_heads == 1:
+            tensor = tensor.unsqueeze(1)
+        else:
+            tensor = tensor.unsqueeze(0).expand(windows, -1, -1, -1)
+    elif tensor.ndim == 4:
+        pass
+    else:
+        raise ValueError(
+            f"Graph component {name!r} must have shape [N,N], [G,N,N], "
+            "[W,N,N], or [W,G,N,N]."
+        )
+
+    if int(tensor.shape[0]) != windows:
+        raise ValueError(
+            f"Graph component {name!r} has {int(tensor.shape[0])} windows; "
+            f"expected {windows}."
+        )
+    if tuple(tensor.shape[-2:]) != (nodes, nodes):
+        raise ValueError(f"Graph component {name!r} has wrong node shape.")
+    if not torch.isfinite(tensor).all():
+        raise ValueError(f"Graph component {name!r} contains non-finite values.")
+    if (tensor < -1.0e-7).any():
+        raise ValueError(f"Graph component {name!r} contains negative weights.")
+    row_sums = tensor.sum(dim=-1)
+    if not torch.allclose(
+        row_sums,
+        torch.ones_like(row_sums),
+        atol=2.0e-4,
+        rtol=0.0,
+    ):
+        maximum_error = float((row_sums - 1.0).abs().max().item())
+        raise ValueError(
+            f"Graph component {name!r} is not row-stochastic; maximum "
+            f"row-sum error={maximum_error:.3e}."
+        )
+    return tensor.contiguous()
+
+
+def _normalise_graph_payload(
+    graph_artifacts: Mapping[str, Any],
+    *,
+    info: UnifiedRunInfo,
+    prediction_result: Mapping[str, Any],
+    windows: int,
+) -> dict[str, Any]:
+    graph = dict(graph_artifacts)
+    orientation = graph.get(
+        "graph_orientation",
+        graph.get("orientation", "A[target, source]"),
+    )
+    graph["graph_orientation"] = _canonical_graph_orientation(orientation)
+    graph["orientation"] = "A[target, source]"
+
+    artifact_assets = graph.get("asset_cols")
+    if artifact_assets is not None and tuple(map(str, artifact_assets)) != info.asset_cols:
+        raise ValueError("Saved graph asset order differs from run metadata.")
+    graph["asset_cols"] = list(info.asset_cols)
+
+    for key in ("selected", "base", "dynamic"):
+        if graph.get(key) is not None:
+            graph[key] = _normalise_saved_graph_tensor(
+                graph[key],
+                windows=windows,
+                nodes=info.num_nodes,
+                expected_heads=info.num_heads,
+                name=key,
+            )
+
+    per_layer = graph.get("per_layer")
+    if isinstance(per_layer, Sequence) and not isinstance(per_layer, (str, bytes)):
+        graph["per_layer"] = tuple(
+            None
+            if values is None
+            else _normalise_saved_graph_tensor(
+                values,
+                windows=windows,
+                nodes=info.num_nodes,
+                expected_heads=info.num_heads,
+                name=f"per_layer[{index}]",
+            )
+            for index, values in enumerate(per_layer)
+        )
+
+    # Continuous graph artefacts historically stored dates but not origin/sample
+    # indices.  The corresponding prediction artefact does store them.  Merge
+    # all window metadata here so every downstream function sees one contract.
+    metadata_aliases = {
+        "dates": ("dates", "date", "days", "day"),
+        "sample_idx": ("sample_idx",),
+        "origin_idx": ("origin_idx",),
+        "target_indices": ("target_indices",),
+        "window_idx": ("window_idx",),
+    }
+    for destination, aliases in metadata_aliases.items():
+        if graph.get(destination) is not None:
+            continue
+        for source in aliases:
+            if prediction_result.get(source) is not None:
+                graph[destination] = prediction_result[source]
+                break
+
+    dates = graph.get("dates")
+    if dates is not None:
+        if isinstance(dates, str):
+            dates = [dates]
+        dates = list(dates)
+        if len(dates) != windows:
+            raise ValueError("Saved graph dates do not align with window count.")
+        graph["dates"] = dates
+
+    for name in ("sample_idx", "origin_idx"):
+        values = graph.get(name)
+        if values is not None and int(torch.as_tensor(values).numel()) != windows:
+            raise ValueError(f"Saved graph {name} does not align with window count.")
+    return graph
+
+
+def _unwrap_token_artifacts(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise TypeError("Saved token artefact must be a mapping.")
+    nested = payload.get("token_artifacts")
+    return dict(nested if isinstance(nested, Mapping) else payload)
+
+
+def load_evaluation_artifacts(
+    run_dir: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    require_graph: bool = False,
+    require_metrics: bool = False,
+    require_sampled_paths: bool = False,
+) -> EvaluationArtifacts:
+    """Load one model's saved validation/test outputs under a common contract."""
+
+    info = load_unified_run_info(run_dir)
+    resolved_split = normalise_evaluation_split(split)
+    paths = resolve_evaluation_artifact_paths(
+        info.run_dir,
+        split=resolved_split,
+        policy=policy,
+    )
+    prediction_result, prediction_epoch = _unwrap_prediction_result(
+        _torch_load(paths.predictions)
+    )
+    windows = _validate_prediction_result(prediction_result, info)
+
+    graph: dict[str, Any] | None = None
+    graph_epoch: int | None = None
+    if paths.graphs is not None:
+        raw_graph, graph_epoch = _unwrap_graph_artifacts(_torch_load(paths.graphs))
+        graph = _normalise_graph_payload(
+            raw_graph,
+            info=info,
+            prediction_result=prediction_result,
+            windows=windows,
+        )
+    elif require_graph:
+        raise FileNotFoundError(
+            f"No {split} graph artefact was found for {info.run_dir}."
+        )
+
+    if prediction_epoch is not None and graph_epoch is not None:
+        if int(prediction_epoch) != int(graph_epoch):
+            raise ValueError(
+                "Prediction and graph artefacts come from different epochs: "
+                f"{prediction_epoch} vs {graph_epoch}."
+            )
+
+    selected_epoch = prediction_epoch if prediction_epoch is not None else graph_epoch
+    if paths.split == "train":
+        expected_epoch = info.run_metadata.get("best_epoch")
+        if expected_epoch is None:
+            raise ValueError(
+                "Training-split analysis requires run_metadata.best_epoch so "
+                "the final selected checkpoint can be verified."
+            )
+        if selected_epoch is None:
+            raise ValueError(
+                "Training-split artefacts must record their checkpoint epoch. "
+                "Save predictions/graphs inside an {'epoch': ..., ...} wrapper."
+            )
+        if int(selected_epoch) != int(expected_epoch):
+            raise ValueError(
+                "Training-split artefacts were not generated from the final "
+                f"selected checkpoint: saved epoch={selected_epoch}, "
+                f"run best_epoch={expected_epoch}."
+            )
+
+    metric_table = pd.read_csv(paths.metrics) if paths.metrics is not None else None
+    if require_metrics and metric_table is None:
+        raise FileNotFoundError(
+            f"No {split} metric table was found for {info.run_dir}."
+        )
+    if metric_table is not None:
+        required_columns = {"metric", "horizon", "channel", "value"}
+        missing = required_columns - set(metric_table.columns)
+        if missing:
+            raise ValueError(
+                f"Saved metric table is missing columns {sorted(missing)}."
+            )
+
+    sampled = (
+        _unwrap_sampled_price_paths(_torch_load(paths.sampled_paths))
+        if paths.sampled_paths is not None
+        else None
+    )
+    if require_sampled_paths and sampled is None:
+        raise FileNotFoundError(
+            f"No {split} sampled-price-path artefact was found for {info.run_dir}."
+        )
+
+    tokens = (
+        _unwrap_token_artifacts(_torch_load(paths.tokens))
+        if paths.tokens is not None
+        else None
+    )
+
+    return EvaluationArtifacts(
+        info=info,
+        split=paths.split,
+        policy=paths.policy,
+        epoch=(prediction_epoch if prediction_epoch is not None else graph_epoch),
+        prediction_result=prediction_result,
+        graph_artifacts=graph,
+        metric_table=metric_table,
+        sampled_price_paths=sampled,
+        token_artifacts=tokens,
+        paths=paths,
+    )
+
+
+
+
+def make_model_artifact_audit(
+    models: Mapping[str, str | Path],
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policies: Mapping[str, str | None] | None = None,
+) -> pd.DataFrame:
+    """Audit every model without allowing one missing artefact to hide the rest."""
+
+    rows: list[dict[str, Any]] = []
+    for label, model in models.items():
+        try:
+            run_dir = resolve_model_folder(model)
+            policy = None if policies is None else policies.get(label)
+            artifacts = load_evaluation_artifacts(
+                run_dir,
+                split=split,
+                policy=policy,
+            )
+            y_pred = torch.as_tensor(artifacts.prediction_result["y_pred"])
+            graph = artifacts.graph_artifacts
+            selected = None if graph is None else graph.get("selected")
+            temperature = None
+            sample_count = None
+            if artifacts.sampled_price_paths is not None:
+                temperature = artifacts.sampled_price_paths.get("temperature")
+                sample_count = artifacts.sampled_price_paths.get("sample_count")
+            rows.append(
+                {
+                    "Model": str(label),
+                    "Folder": run_dir.name,
+                    "Family": artifacts.info.run_kind,
+                    "Split": artifacts.split,
+                    "Policy": artifacts.policy,
+                    "Graph type": artifacts.info.graph_type,
+                    "Windows": int(y_pred.shape[0]),
+                    "Horizons": str(tuple(artifacts.info.horizons)),
+                    "Assets": artifacts.info.num_nodes,
+                    "Predictions": True,
+                    "Graphs": selected is not None,
+                    "Metrics": artifacts.metric_table is not None,
+                    "Sampled paths": artifacts.sampled_price_paths is not None,
+                    "Temperature": temperature,
+                    "Sample count": sample_count,
+                    "Ready": True,
+                    "Issue": None,
+                }
+            )
+        except Exception as error:  # audit should report rather than mask peers
+            rows.append(
+                {
+                    "Model": str(label),
+                    "Folder": str(model),
+                    "Family": None,
+                    "Split": split,
+                    "Policy": None,
+                    "Graph type": None,
+                    "Windows": None,
+                    "Horizons": None,
+                    "Assets": None,
+                    "Predictions": False,
+                    "Graphs": False,
+                    "Metrics": False,
+                    "Sampled paths": False,
+                    "Temperature": None,
+                    "Sample count": None,
+                    "Ready": False,
+                    "Issue": f"{type(error).__name__}: {error}",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def style_model_artifact_audit(
+    table: pd.DataFrame,
+    *,
+    caption: str = "Saved model artefact audit",
+) -> pd.io.formats.style.Styler:
+    formats = {
+        "Temperature": "{:.3f}",
+        "Sample count": "{:.0f}",
+        "Windows": "{:.0f}",
+        "Assets": "{:.0f}",
+    }
+    return table.style.format(
+        {key: value for key, value in formats.items() if key in table.columns},
+        na_rep="—",
+    ).set_caption(caption)
+
+
+def make_model_architecture_comparison(
+    models: Mapping[str, str | Path],
+) -> pd.DataFrame:
+    """Place the exact saved architecture settings side by side."""
+
+    columns: dict[str, pd.Series] = {}
+    for label, model in models.items():
+        run_dir = resolve_model_folder(model)
+        table = make_unified_model_summary_table(run_dir)
+        columns[str(label)] = table["Value"]
+    return pd.DataFrame(columns)
+
+
+def make_model_metric_comparison(
+    models: Mapping[str, str | Path],
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policies: Mapping[str, str | None] | None = None,
+    channel: str = "close",
+    metrics_to_display: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """Build one model-by-horizon table from the saved common evaluator metrics."""
+
+    metric_order = list(
+        DEFAULT_SUMMARY_METRICS
+        if metrics_to_display is None
+        else [str(value) for value in metrics_to_display]
+    )
+    frames: list[pd.DataFrame] = []
+    for label, model in models.items():
+        policy = None if policies is None else policies.get(label)
+        artifacts = load_evaluation_artifacts(
+            resolve_model_folder(model),
+            split=split,
+            policy=policy,
+            require_metrics=True,
+        )
+        assert artifacts.metric_table is not None
+        selected = artifacts.metric_table.loc[
+            artifacts.metric_table["channel"].astype(str).str.lower().eq(channel.lower()),
+            ["metric", "horizon", "value"],
+        ].copy()
+        selected["horizon"] = pd.to_numeric(selected["horizon"], errors="raise").astype(int)
+        if selected.duplicated(["metric", "horizon"]).any():
+            raise ValueError(f"Metric table for {label!r} has duplicate rows.")
+        wide = (
+            selected.pivot(index="horizon", columns="metric", values="value")
+            .reindex(index=artifacts.info.horizons, columns=metric_order)
+            .rename(
+                columns={
+                    name: DEFAULT_METRIC_DISPLAY_NAMES.get(name, name)
+                    for name in metric_order
+                }
+            )
+        )
+        wide.insert(0, "Model", str(label))
+        wide.insert(1, "Split", artifacts.split)
+        wide.insert(2, "Policy", artifacts.policy)
+        wide.insert(3, "Horizon", [f"{int(value)} min" for value in wide.index])
+        frames.append(wide.reset_index(drop=True))
+    if not frames:
+        raise ValueError("At least one model must be supplied.")
+    return pd.concat(frames, ignore_index=True).set_index(
+        ["Model", "Split", "Policy", "Horizon"]
+    )
+
+
+def style_model_metric_comparison(
+    table: pd.DataFrame,
+    *,
+    caption: str,
+) -> pd.io.formats.style.Styler:
+    """Format only numeric metric columns, avoiding mixed-type Styler errors."""
+
+    formatters: dict[str, str] = {}
+    for column in table.columns:
+        if not pd.api.types.is_numeric_dtype(table[column]):
+            continue
+        if column in {"Log MAE", "Log MedAE", "Log P95 AE"}:
+            formatters[column] = "{:.8f}"
+        elif column == "MASE":
+            formatters[column] = "{:.5f}"
+        else:
+            formatters[column] = "{:.6f}"
+    return table.style.format(formatters, na_rep="—").set_caption(caption)
+
+
+def style_numeric_table(
+    table: pd.DataFrame,
+    *,
+    caption: str | None = None,
+    precision: int = 6,
+) -> pd.io.formats.style.Styler:
+    """Safely format numeric columns in a mixed text/numeric table."""
+
+    formatter = f"{{:.{int(precision)}f}}"
+    formatters = {
+        column: formatter
+        for column in table.columns
+        if pd.api.types.is_numeric_dtype(table[column])
+    }
+    styler = table.style.format(formatters, na_rep="—")
+    return styler if caption is None else styler.set_caption(caption)
+
+
+def _first_existing_column(frame: pd.DataFrame, candidates: Sequence[str]) -> str | None:
+    return next((column for column in candidates if column in frame.columns), None)
+
+
+def plot_training_diagnostics(
+    run_dir: str | Path,
+    *,
+    figsize: tuple[float, float] = (12.0, 4.5),
+) -> tuple[Figure, np.ndarray, pd.DataFrame]:
+    """Plot the saved primary training/validation score and graph/gate trajectory."""
+
+    run_path = resolve_model_folder(run_dir)
+    history_path = run_path / "history.csv"
+    if not history_path.is_file():
+        raise FileNotFoundError(history_path)
+    history = pd.read_csv(history_path)
+    if history.empty:
+        raise ValueError(f"History is empty: {history_path}")
+    epoch_column = _first_existing_column(history, ("epoch", "Epoch"))
+    if epoch_column is None:
+        history = history.copy()
+        history["epoch"] = np.arange(1, len(history) + 1)
+        epoch_column = "epoch"
+
+    train_column = _first_existing_column(
+        history,
+        ("train_token_loss", "training_loss", "train_loss", "training_native_loss"),
+    )
+    validation_column = _first_existing_column(
+        history,
+        ("validation_token_loss", "selection_score", "validation_loss", "val_loss"),
+    )
+    entropy_column = _first_existing_column(
+        history,
+        ("validation_graph_mean_row_entropy", "graph_mean_row_entropy"),
+    )
+    beta_column = _first_existing_column(history, ("spatial_beta", "validation_spatial_beta"))
+
+    figure, axes = plt.subplots(1, 2, figsize=figsize)
+    if train_column is not None:
+        axes[0].plot(history[epoch_column], history[train_column], label=train_column)
+    if validation_column is not None:
+        axes[0].plot(history[epoch_column], history[validation_column], label=validation_column)
+    axes[0].set_title(f"{run_path.name} — predictive objective")
+    axes[0].set_xlabel("Epoch")
+    axes[0].grid(True, alpha=0.25)
+    if axes[0].lines:
+        axes[0].legend()
+
+    if entropy_column is not None:
+        axes[1].plot(history[epoch_column], history[entropy_column], label="Mean row entropy")
+    if beta_column is not None:
+        axes[1].plot(history[epoch_column], history[beta_column], label="Spatial beta")
+    axes[1].set_title("Graph concentration and learned graph exposure")
+    axes[1].set_xlabel("Epoch")
+    axes[1].grid(True, alpha=0.25)
+    if axes[1].lines:
+        axes[1].legend()
+    figure.tight_layout()
+
+    selected_columns = [epoch_column]
+    for column in (train_column, validation_column, entropy_column, beta_column):
+        if column is not None and column not in selected_columns:
+            selected_columns.append(column)
+    return figure, axes, history[selected_columns].copy()
+
+
+def _normalise_date_optional(value: Any) -> str | None:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    return _normalise_date(value)
+
+
+def _clock_time(clean_index: int) -> str:
+    timestamp = pd.Timestamp("2000-01-01 09:31") + pd.Timedelta(minutes=int(clean_index))
+    return timestamp.strftime("%H:%M")
+
+
+def _window_time_values(origin_idx: int | None, context_length: int, forecast_length: int) -> dict[str, Any]:
+    if origin_idx is None:
+        return {
+            "Context start time": None,
+            "Forecast origin time": None,
+            "Forecast start time": None,
+            "Forecast end time": None,
+            "Time window": None,
+        }
+    origin = int(origin_idx)
+    context_start = origin - int(context_length) + 1
+    forecast_start = origin + 1
+    forecast_end = origin + int(forecast_length)
+    return {
+        "Context start time": _clock_time(context_start),
+        "Forecast origin time": _clock_time(origin),
+        "Forecast start time": _clock_time(forecast_start),
+        "Forecast end time": _clock_time(forecast_end),
+        "Time window": (
+            f"context {_clock_time(context_start)}–{_clock_time(origin)}; "
+            f"forecast {_clock_time(forecast_start)}–{_clock_time(forecast_end)}"
+        ),
+    }
+
+
+def _context_and_prediction_lengths(info: UnifiedRunInfo) -> tuple[int, int]:
+    if info.run_kind == "continuous":
+        data = info.resolved_config.get("data", {})
+        return int(data.get("context_length", 60)), max(info.horizons)
+    model = info.resolved_config["models"]["dynamic_graph"]
+    return int(model.get("context_length", 60)), int(
+        model.get("heads", {}).get("prediction_length", max(info.horizons))
+    )
+
+
+def make_evaluation_window_table(
+    run_dir: str | Path,
+    *,
+    split: EvaluationSplit = "validation",
+    policy: str = "auto",
+) -> pd.DataFrame:
+    """List exact saved forecast windows, dates, origins, and clock times."""
+
+    artifacts = load_evaluation_artifacts(
+        resolve_model_folder(run_dir),
+        split=split,
+        policy=policy,
+    )
+    windows = int(torch.as_tensor(artifacts.prediction_result["y_pred"]).shape[0])
+    graph = artifacts.graph_artifacts or {}
+
+    raw_dates = graph.get("dates", artifacts.prediction_result.get("dates"))
+    if raw_dates is None:
+        dates: list[str | None] = [None] * windows
+    else:
+        if isinstance(raw_dates, str):
+            raw_dates = [raw_dates]
+        if len(raw_dates) != windows:
+            raise ValueError("Saved date metadata does not match window count.")
+        dates = [_normalise_date_optional(value) for value in raw_dates]
+
+    def optional_vector(name: str) -> list[int | None]:
+        values = graph.get(name, artifacts.prediction_result.get(name))
+        if values is None:
+            return [None] * windows
+        tensor = torch.as_tensor(values).reshape(-1)
+        if int(tensor.numel()) != windows:
+            raise ValueError(f"Saved {name} does not match window count.")
+        return [int(value) for value in tensor.tolist()]
+
+    origins = optional_vector("origin_idx")
+    samples = optional_vector("sample_idx")
+    context_length, forecast_length = _context_and_prediction_lengths(artifacts.info)
+    records: list[dict[str, Any]] = []
+    for index in range(windows):
+        record = {
+            "Global window index": index,
+            "Date": dates[index],
+            "Sample index": samples[index],
+            "Origin index": origins[index],
+        }
+        record.update(
+            _window_time_values(origins[index], context_length, forecast_length)
+        )
+        records.append(record)
+    table = pd.DataFrame(records)
+    if table["Date"].notna().any():
+        table["Window within date"] = table.groupby("Date", dropna=False).cumcount() + 1
+    else:
+        table["Window within date"] = np.arange(1, windows + 1)
+    return table[
+        [
+            "Global window index",
+            "Date",
+            "Window within date",
+            "Sample index",
+            "Origin index",
+            "Context start time",
+            "Forecast origin time",
+            "Forecast start time",
+            "Forecast end time",
+            "Time window",
+        ]
+    ]
+
+
+def _resolve_evaluation_window(
+    table: pd.DataFrame,
+    *,
+    date: str | None,
+    window_within_date: int | None,
+    global_window_index: int | None,
+    origin_idx: int | None = None,
+) -> pd.Series:
+    return _resolve_saved_window(
+        table,
+        date=date,
+        window_within_date=window_within_date,
+        global_window_index=global_window_index,
+        origin_idx=origin_idx,
+    )
+
+
+def select_model_graph_snapshot(
+    run_dir: str | Path,
+    *,
+    split: EvaluationSplit = "validation",
+    policy: str = "auto",
+    component: GraphComponent = "selected",
+    layer: int = -1,
+    head: HeadSelection = "mean",
+    date: str | None = None,
+    window_within_date: int | None = None,
+    global_window_index: int | None = None,
+    origin_idx: int | None = None,
+) -> GraphSnapshot:
+    """Select the actual adjacency used for one exact saved forecast window."""
+
+    artifacts = load_evaluation_artifacts(
+        resolve_model_folder(run_dir),
+        split=split,
+        policy=policy,
+        require_graph=True,
+    )
+    assert artifacts.graph_artifacts is not None
+    table = make_evaluation_window_table(
+        artifacts.info.run_dir,
+        split=split,
+        policy=policy,
+    )
+    row = _resolve_evaluation_window(
+        table,
+        date=date,
+        window_within_date=window_within_date,
+        global_window_index=global_window_index,
+        origin_idx=origin_idx,
+    )
+    absolute_index = int(row["Global window index"])
+    graph = artifacts.graph_artifacts
+
+    if component == "selected" and layer != -1:
+        per_layer = graph.get("per_layer")
+        if not isinstance(per_layer, Sequence):
+            raise ValueError("Saved graph artefact does not contain per_layer.")
+        layer_index = _normalise_layer_index(layer, len(per_layer))
+        values = per_layer[layer_index]
+    else:
+        values = graph.get(component)
+    if values is None:
+        raise ValueError(f"Graph component {component!r} is unavailable.")
+
+    tensor = torch.as_tensor(values).detach().cpu().double()
+    if tensor.ndim != 4:
+        raise ValueError("Normalised saved graph must have shape [W,G,N,N].")
+    adjacency = _select_graph_head(tensor[absolute_index], head)
+    row_entropy = -(
+        adjacency.clamp_min(1.0e-12) * adjacency.clamp_min(1.0e-12).log()
+    ).sum(dim=-1)
+    available_neighbours = adjacency.shape[-1] - (0 if artifacts.info.add_self_loops else 1)
+    top_k = max(1, min(5, available_neighbours))
+    top5_mass = adjacency.topk(top_k, dim=-1).values.sum(dim=-1)
+
+    frame = pd.DataFrame(
+        adjacency.numpy(),
+        index=artifacts.info.asset_cols,
+        columns=artifacts.info.asset_cols,
+    )
+    frame.index.name = "Target"
+    frame.columns.name = "Source"
+
+    snapshot = GraphSnapshot(
+        adjacency=frame,
+        run_name=artifacts.info.run_dir.name,
+        run_kind=artifacts.info.run_kind,
+        policy=artifacts.policy,
+        component=component,
+        head=head,
+        global_window_index=absolute_index,
+        date=(None if pd.isna(row["Date"]) else str(row["Date"])),
+        window_within_date=int(row["Window within date"]),
+        sample_idx=(None if pd.isna(row["Sample index"]) else int(row["Sample index"])),
+        origin_idx=(None if pd.isna(row["Origin index"]) else int(row["Origin index"])),
+        mean_row_entropy=float(row_entropy.mean().item()),
+        mean_effective_neighbours=float(row_entropy.exp().mean().item()),
+        median_effective_neighbours=float(row_entropy.exp().median().item()),
+        maximum_edge_weight=float(adjacency.max().item()),
+        mean_top5_row_mass=float(top5_mass.mean().item()),
+        graph_type=artifacts.info.graph_type,
+        add_self_loops=artifacts.info.add_self_loops,
+    )
+    # Store the split/time metadata in attrs without changing the historical
+    # GraphSnapshot constructor used by older notebooks.
+    snapshot.adjacency.attrs["split"] = artifacts.split
+    snapshot.adjacency.attrs["time_window"] = row["Time window"]
+    snapshot.adjacency.attrs["forecast_origin_time"] = row["Forecast origin time"]
+    return snapshot
+
+
+def make_model_graph_snapshot_summary(snapshot: GraphSnapshot) -> pd.DataFrame:
+    """Return concentration and window provenance for one exact adjacency."""
+
+    return pd.DataFrame(
+        [
+            {
+                "Run": snapshot.run_name,
+                "Family": snapshot.run_kind,
+                "Split": snapshot.adjacency.attrs.get("split"),
+                "Policy": snapshot.policy,
+                "Graph type": snapshot.graph_type,
+                "Component": snapshot.component,
+                "Head": snapshot.head,
+                "Date": snapshot.date,
+                "Window within date": snapshot.window_within_date,
+                "Time window": snapshot.adjacency.attrs.get("time_window"),
+                "Global window index": snapshot.global_window_index,
+                "Origin index": snapshot.origin_idx,
+                "Mean row entropy": snapshot.mean_row_entropy,
+                "Mean effective neighbours": snapshot.mean_effective_neighbours,
+                "Median effective neighbours": snapshot.median_effective_neighbours,
+                "Maximum edge weight": snapshot.maximum_edge_weight,
+                "Mean top-5 row mass": snapshot.mean_top5_row_mass,
+            }
+        ]
+    )
+
+
+def plot_model_graph_snapshot(
+    snapshot: GraphSnapshot,
+    *,
+    cluster: bool = False,
+    cluster_method: str = "average",
+    figsize: tuple[float, float] = (13.0, 11.0),
+    tick_fontsize: float = 8.0,
+    ax: Axes | None = None,
+) -> tuple[Figure, Axes, pd.DataFrame]:
+    """Plot actual adjacency weights with exact date and clock-time provenance."""
+
+    matrix = snapshot.adjacency.to_numpy(dtype=np.float64, copy=True)
+    labels = np.asarray(snapshot.adjacency.index, dtype=object)
+    if cluster:
+        order = _cluster_graph_order(matrix, method=cluster_method)
+        matrix = matrix[np.ix_(order, order)]
+        labels = labels[order]
+
+    plotted_values = matrix.copy()
+    if not snapshot.add_self_loops:
+        np.fill_diagonal(plotted_values, np.nan)
+    finite = plotted_values[np.isfinite(plotted_values)]
+    maximum = float(np.max(finite)) if finite.size else 1.0
+    if not np.isfinite(maximum) or maximum <= 0.0:
+        maximum = 1.0
+
+    if ax is None:
+        figure, axes = plt.subplots(figsize=figsize)
+    else:
+        axes = ax
+        figure = axes.figure
+    cmap = plt.get_cmap("Reds").copy()
+    cmap.set_bad("white")
+    image = axes.imshow(
+        plotted_values,
+        cmap=cmap,
+        vmin=0.0,
+        vmax=maximum,
+        interpolation="nearest",
+        aspect="equal",
+    )
+    axes.set_xticks(np.arange(len(labels)))
+    axes.set_yticks(np.arange(len(labels)))
+    axes.set_xticklabels(labels, rotation=90, fontsize=tick_fontsize)
+    axes.set_yticklabels(labels, fontsize=tick_fontsize)
+    axes.set_xlabel("Source asset (influences target)")
+    axes.set_ylabel("Target asset (receives influence)")
+    date_label = snapshot.date or "date unavailable"
+    window_label = snapshot.window_within_date or "?"
+    time_label = snapshot.adjacency.attrs.get("time_window") or "clock time unavailable"
+    axes.set_title(
+        f"{snapshot.run_name} — {snapshot.policy}\n"
+        f"{date_label}, window {window_label} — {time_label}\n"
+        f"mean row entropy={snapshot.mean_row_entropy:.4f}; "
+        f"effective neighbours={snapshot.mean_effective_neighbours:.2f}"
+    )
+    colourbar = figure.colorbar(image, ax=axes, fraction=0.046, pad=0.03)
+    colourbar.set_label("Adjacency weight")
+    figure.tight_layout()
+    plotted = pd.DataFrame(matrix, index=labels, columns=labels)
+    plotted.index.name = "Target"
+    plotted.columns.name = "Source"
+    return figure, axes, plotted
+
+
+def analyse_graph_window(
+    run_dir: str | Path,
+    *,
+    split: EvaluationSplit = "validation",
+    policy: str = "auto",
+    date: str | None = None,
+    window_within_date: int | None = None,
+    global_window_index: int | None = None,
+    origin_idx: int | None = None,
+    component: GraphComponent = "selected",
+    layer: int = -1,
+    head: HeadSelection = "mean",
+    top_n: int = 5,
+    direction: NeighbourDirection = "impacted_by",
+    cluster: bool = False,
+) -> GraphWindowReport:
+    """Create the plot, summary, and connections table for one graph window."""
+
+    snapshot = select_model_graph_snapshot(
+        run_dir,
+        split=split,
+        policy=policy,
+        component=component,
+        layer=layer,
+        head=head,
+        date=date,
+        window_within_date=window_within_date,
+        global_window_index=global_window_index,
+        origin_idx=origin_idx,
+    )
+    summary = make_model_graph_snapshot_summary(snapshot)
+    connections = make_graph_snapshot_connections_table(
+        snapshot,
+        top_n=top_n,
+        direction=direction,
+    )
+    figure, axes, plotted = plot_model_graph_snapshot(snapshot, cluster=cluster)
+    window = make_evaluation_window_table(
+        run_dir,
+        split=split,
+        policy=policy,
+    ).loc[
+        lambda frame: frame["Global window index"] == snapshot.global_window_index
+    ]
+    return GraphWindowReport(
+        snapshot=snapshot,
+        summary=summary,
+        connections=connections,
+        window=window,
+        figure=figure,
+        axes=axes,
+        plotted_adjacency=plotted,
+    )
+
+
+def plot_point_forecast_comparison(
+    models: Mapping[str, str | Path],
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policies: Mapping[str, str | None] | None = None,
+    asset: str,
+    date: str,
+    window_within_date: int,
+    figsize: tuple[float, float] = (10.0, 6.0),
+) -> PointForecastReport:
+    """Overlay all model point forecasts against one common realised path."""
+
+    figure, axes = plt.subplots(figsize=figsize)
+    records: list[dict[str, Any]] = []
+    reference_truth: Tensor | None = None
+    reference_last: float | None = None
+    reference_window: pd.DataFrame | None = None
+    reference_horizons: tuple[int, ...] | None = None
+
+    for label, model in models.items():
+        policy = None if policies is None else policies.get(label)
+        artifacts = load_evaluation_artifacts(
+            resolve_model_folder(model),
+            split=split,
+            policy=policy,
+        )
+        table = make_evaluation_window_table(
+            artifacts.info.run_dir,
+            split=split,
+            policy=policy,
+        )
+        row = _resolve_evaluation_window(
+            table,
+            date=date,
+            window_within_date=window_within_date,
+            global_window_index=None,
+        )
+        window_index = int(row["Global window index"])
+        if asset not in artifacts.info.asset_cols:
+            raise ValueError(f"Asset {asset!r} is absent from {label!r}.")
+        asset_index = artifacts.info.asset_cols.index(asset)
+        prediction = torch.as_tensor(artifacts.prediction_result["y_pred"])[
+            window_index, :, asset_index, 0
+        ].float()
+        truth = torch.as_tensor(artifacts.prediction_result["y_true"])[
+            window_index, :, asset_index, 0
+        ].float()
+        last = float(
+            torch.as_tensor(artifacts.prediction_result["last_context_target"])[
+                window_index, asset_index, 0
+            ].item()
+        )
+        if reference_truth is None:
+            reference_truth = truth
+            reference_last = last
+            reference_window = table.loc[[row.name]].copy()
+            reference_horizons = artifacts.info.horizons
+        else:
+            torch.testing.assert_close(truth, reference_truth, atol=1.0e-6, rtol=0.0)
+            if abs(last - float(reference_last)) > 1.0e-6:
+                raise ValueError("Models do not share the same last observed Close.")
+
+        horizons = np.asarray(artifacts.info.horizons, dtype=int)
+        axes.plot(horizons, prediction.numpy(), marker="o", label=str(label))
+        for horizon, pred, actual in zip(horizons, prediction, truth, strict=True):
+            records.append(
+                {
+                    "Model": str(label),
+                    "Split": artifacts.split,
+                    "Policy": artifacts.policy,
+                    "Date": row["Date"],
+                    "Window within date": int(row["Window within date"]),
+                    "Time window": row["Time window"],
+                    "Asset": asset,
+                    "Horizon": int(horizon),
+                    "Prediction": float(pred.item()),
+                    "Truth": float(actual.item()),
+                    "Absolute error": float(abs(pred.item() - actual.item())),
+                }
+            )
+
+    assert (
+        reference_truth is not None
+        and reference_last is not None
+        and reference_window is not None
+        and reference_horizons is not None
+    )
+    horizons = np.asarray(reference_horizons, dtype=int)
+    axes.plot(horizons, reference_truth.numpy(), marker="o", linewidth=2.5, label="Truth")
+    axes.scatter([0], [reference_last], color="black", label="Last observed Close")
+    time_label = str(reference_window.iloc[0]["Time window"])
+    axes.set_title(
+        f"{asset} — {date}, window {window_within_date} — {time_label}"
+    )
+    axes.set_xlabel("Forecast horizon (minutes)")
+    axes.set_ylabel("Raw Close price")
+    axes.grid(True, alpha=0.25)
+    axes.legend()
+    figure.tight_layout()
+    return PointForecastReport(
+        figure=figure,
+        axes=axes,
+        values=pd.DataFrame(records),
+        window=reference_window,
+    )
+
+
+def load_model_sampled_path_bundle(
+    run_dir: str | Path,
+    *,
+    split: EvaluationSplit = "validation",
+    policy: str = "auto",
+) -> SampledPathBundle:
+    """Load saved decoded paths from validation or frozen test inference."""
+
+    artifacts = load_evaluation_artifacts(
+        resolve_model_folder(run_dir),
+        split=split,
+        policy=policy,
+        require_sampled_paths=True,
+    )
+    assert artifacts.sampled_price_paths is not None
+    values = artifacts.sampled_price_paths
+    required = {
+        "sampled_close_paths",
+        "sampled_close_paths_at_evaluation_horizons",
+        "ensemble_mean_close_path",
+        "evaluation_true",
+        "last_context_target",
+        "asset_cols",
+        "future_steps",
+        "evaluation_horizons",
+        "sample_count",
+    }
+    missing = required - set(values)
+    if missing:
+        raise KeyError(f"Sampled-path artefact is missing {sorted(missing)}.")
+
+    sampled = torch.as_tensor(values["sampled_close_paths"]).float()
+    sampled_eval = torch.as_tensor(values["sampled_close_paths_at_evaluation_horizons"]).float()
+    ensemble = torch.as_tensor(values["ensemble_mean_close_path"]).float()
+    true = torch.as_tensor(values["evaluation_true"]).float()
+    last = torch.as_tensor(values["last_context_target"]).float()
+    if sampled.ndim != 5 or sampled.shape[-1] != 1:
+        raise ValueError("sampled_close_paths must have shape [S,W,P,N,1].")
+    sample_count, windows, steps, nodes, _ = map(int, sampled.shape)
+    horizons = tuple(int(value) for value in values["evaluation_horizons"])
+    if sample_count != int(values["sample_count"]):
+        raise ValueError("Saved sample count differs from path tensor.")
+    if nodes != artifacts.info.num_nodes:
+        raise ValueError("Sampled path node count differs from metadata.")
+    if tuple(sampled_eval.shape) != (sample_count, windows, len(horizons), nodes, 1):
+        raise ValueError("Evaluation sampled-path tensor has inconsistent shape.")
+    if tuple(ensemble.shape) != (windows, steps, nodes, 1):
+        raise ValueError("Ensemble-mean tensor has inconsistent shape.")
+    if tuple(true.shape) != (windows, len(horizons), nodes, 1):
+        raise ValueError("Sampled-path truth tensor has inconsistent shape.")
+    if tuple(last.shape) != (windows, nodes, 1):
+        raise ValueError("Sampled-path last-context tensor has inconsistent shape.")
+    if not all(torch.isfinite(tensor).all() for tensor in (sampled, sampled_eval, ensemble, true, last)):
+        raise ValueError("Sampled-price-path artefact contains non-finite values.")
+    torch.testing.assert_close(ensemble, sampled.mean(dim=0), atol=2.0e-5, rtol=2.0e-5)
+
+    def optional_long(name: str) -> Tensor | None:
+        value = values.get(name)
+        return None if value is None else torch.as_tensor(value).long()
+
+    raw_dates = values.get("dates") or []
+    dates = tuple(_normalise_date(value) for value in raw_dates)
+    if dates and len(dates) != windows:
+        raise ValueError("Sampled-path dates do not align with windows.")
+    return SampledPathBundle(
+        run_dir=artifacts.info.run_dir,
+        policy=artifacts.policy,
+        sampled_close_paths=sampled,
+        sampled_close_paths_at_evaluation_horizons=sampled_eval,
+        ensemble_mean_close_path=ensemble,
+        evaluation_true=true,
+        last_context_target=last,
+        sample_idx=optional_long("sample_idx"),
+        origin_idx=optional_long("origin_idx"),
+        dense_target_indices=optional_long("dense_target_indices"),
+        evaluation_target_indices=optional_long("evaluation_target_indices"),
+        dates=dates,
+        asset_cols=tuple(str(value) for value in values["asset_cols"]),
+        future_steps=tuple(int(value) for value in values["future_steps"]),
+        evaluation_horizons=horizons,
+        temperature=(None if values.get("temperature") is None else float(values["temperature"])),
+        top_k=int(values.get("top_k", 0)),
+        top_p=float(values.get("top_p", 1.0)),
+        sample_count=sample_count,
+    )
+
+
+def _window_table_from_sampled_bundle(
+    bundle: SampledPathBundle,
+    *,
+    split: EvaluationSplit,
+) -> pd.DataFrame:
+    windows = int(bundle.sampled_close_paths.shape[1])
+    dates = list(bundle.dates) if bundle.dates else [None] * windows
+    origins = (
+        [None] * windows
+        if bundle.origin_idx is None
+        else [int(value) for value in bundle.origin_idx.reshape(-1).tolist()]
+    )
+    samples = (
+        [None] * windows
+        if bundle.sample_idx is None
+        else [int(value) for value in bundle.sample_idx.reshape(-1).tolist()]
+    )
+    records = []
+    for index in range(windows):
+        record = {
+            "Global window index": index,
+            "Date": None if dates[index] is None else _normalise_date(dates[index]),
+            "Sample index": samples[index],
+            "Origin index": origins[index],
+            "Split": split,
+        }
+        record.update(_window_time_values(origins[index], 60, len(bundle.future_steps)))
+        records.append(record)
+    table = pd.DataFrame(records)
+    table["Window within date"] = table.groupby("Date", dropna=False).cumcount() + 1
+    return table
+
+
+def analyse_sampled_path_window(
+    run_dir: str | Path,
+    *,
+    split: EvaluationSplit = "validation",
+    policy: str = "auto",
+    data_dir: str | Path,
+    asset: str,
+    date: str,
+    window_within_date: int,
+    context_points: int = 30,
+    figsize: tuple[float, float] = (12.0, 6.0),
+) -> SamplePathWindowReport:
+    """Plot every sampled path, the ensemble mean, and the realised path."""
+
+    bundle = load_model_sampled_path_bundle(run_dir, split=split, policy=policy)
+    if asset not in bundle.asset_cols:
+        raise ValueError(f"Asset {asset!r} is unavailable.")
+    asset_index = bundle.asset_cols.index(asset)
+    table = _window_table_from_sampled_bundle(bundle, split=split)
+    row = _resolve_evaluation_window(
+        table,
+        date=date,
+        window_within_date=window_within_date,
+        global_window_index=None,
+    )
+    window_index = int(row["Global window index"])
+
+    paths = bundle.sampled_close_paths[:, window_index, :, asset_index, 0]
+    mean_path = bundle.ensemble_mean_close_path[window_index, :, asset_index, 0]
+    eval_true = bundle.evaluation_true[window_index, :, asset_index, 0]
+    last_value = bundle.last_context_target[window_index, asset_index, 0]
+    context, true_future, true_date = _load_true_candle_window(
+        data_dir=data_dir,
+        bundle=bundle,
+        window_index=window_index,
+        asset_index=asset_index,
+        split=split,
+    )
+
+    figure, axes = plt.subplots(figsize=figsize)
+    future_x = np.arange(1, paths.shape[1] + 1)
+    for sample_index in range(paths.shape[0]):
+        axes.plot(future_x, paths[sample_index].numpy(), linewidth=0.9, alpha=0.32)
+    axes.plot(future_x, mean_path.numpy(), linewidth=2.5, label="Ensemble mean")
+    if true_future is not None:
+        axes.plot(future_x, true_future.numpy(), linewidth=2.2, label="True future")
+    else:
+        axes.scatter(bundle.evaluation_horizons, eval_true.numpy(), marker="x", s=55, label="Truth")
+    if context is not None and context_points > 0:
+        shown = context[-int(context_points):]
+        axes.plot(np.arange(-len(shown) + 1, 1), shown.numpy(), linewidth=1.8, label="Observed context")
+    else:
+        axes.scatter([0], [float(last_value)], label="Last observed Close")
+    axes.axvline(0, linestyle="--", linewidth=1.0)
+    time_label = row["Time window"] or "clock time unavailable"
+    axes.set_title(
+        f"{asset} — {true_date or date}, window {window_within_date} — {time_label}\n"
+        f"{bundle.policy}; T={bundle.temperature}; {bundle.sample_count} decoded paths"
+    )
+    axes.set_xlabel("Minutes relative to forecast origin")
+    axes.set_ylabel("Raw Close price")
+    axes.grid(True, alpha=0.25)
+    axes.legend()
+    figure.tight_layout()
+
+    path_table = pd.DataFrame(
+        paths.T.numpy(),
+        index=pd.Index(future_x, name="Future minute"),
+        columns=[f"Path {index + 1}" for index in range(paths.shape[0])],
+    )
+    path_table["Ensemble mean"] = mean_path.numpy()
+    path_table["True future"] = (
+        true_future.numpy() if true_future is not None else np.nan
+    )
+    if true_future is None:
+        for horizon, value in zip(bundle.evaluation_horizons, eval_true, strict=True):
+            path_table.loc[int(horizon), "True future"] = float(value.item())
+
+    horizon_indices = [int(horizon) - 1 for horizon in bundle.evaluation_horizons]
+    horizon_table = path_table.iloc[horizon_indices].copy()
+    horizon_table.index = pd.Index(bundle.evaluation_horizons, name="Horizon")
+    return SamplePathWindowReport(
+        figure=figure,
+        axes=axes,
+        paths=path_table,
+        horizons=horizon_table,
+        window=table.loc[[row.name]].copy(),
+    )
+
+
+def _sampled_return_tensors_v10(bundle: SampledPathBundle) -> tuple[Tensor, Tensor]:
+    last = bundle.last_context_target.unsqueeze(0).unsqueeze(2)
+    sampled_returns = torch.log(bundle.sampled_close_paths_at_evaluation_horizons / last)
+    true_returns = torch.log(
+        bundle.evaluation_true / bundle.last_context_target.unsqueeze(1)
+    )
+    return sampled_returns, true_returns
+
+
+def make_predictive_coverage_report(
+    run_dir: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    nominal_coverages: Sequence[float] = (0.5, 0.8, 0.9),
+    asset_coverage: float = 0.8,
+) -> PredictiveCoverageReport:
+    """Compute coverage, interval width, CRPS, and truth-rank diagnostics."""
+
+    resolved_split = normalise_evaluation_split(split)
+    bundle = load_model_sampled_path_bundle(run_dir, split=resolved_split, policy=policy)
+    sampled, truth = _sampled_return_tensors_v10(bundle)
+    overall_rows: list[dict[str, Any]] = []
+    interval_specs: list[tuple[str, float | None, float, float]] = []
+    for coverage in nominal_coverages:
+        value = float(coverage)
+        if not 0.0 < value < 1.0:
+            raise ValueError("nominal_coverages must lie in (0,1).")
+        tail = 0.5 * (1.0 - value)
+        interval_specs.append((f"Central {100 * value:g}%", value, tail, 1.0 - tail))
+    interval_specs.append(("Sample min-max", None, 0.0, 1.0))
+
+    for label, nominal, lower_q, upper_q in interval_specs:
+        lower = torch.quantile(sampled, lower_q, dim=0)
+        upper = torch.quantile(sampled, upper_q, dim=0)
+        covered = (truth >= lower) & (truth <= upper)
+        width_bps = 10000.0 * (upper - lower)
+        for index, horizon in enumerate(bundle.evaluation_horizons):
+            empirical = float(covered[:, index].float().mean().item())
+            overall_rows.append(
+                {
+                    "Split": resolved_split,
+                    "Policy": bundle.policy,
+                    "Temperature": bundle.temperature,
+                    "Sample count": bundle.sample_count,
+                    "Horizon": int(horizon),
+                    "Interval": label,
+                    "Nominal coverage": nominal,
+                    "Empirical coverage": empirical,
+                    "Coverage gap": None if nominal is None else empirical - nominal,
+                    "Below interval": float((truth[:, index] < lower[:, index]).float().mean().item()),
+                    "Above interval": float((truth[:, index] > upper[:, index]).float().mean().item()),
+                    "Mean interval width (log-return bps)": float(width_bps[:, index].mean().item()),
+                    "Median interval width (log-return bps)": float(width_bps[:, index].median().item()),
+                }
+            )
+    overall = pd.DataFrame(overall_rows)
+
+    coverage = float(asset_coverage)
+    tail = 0.5 * (1.0 - coverage)
+    lower = torch.quantile(sampled, tail, dim=0)
+    upper = torch.quantile(sampled, 1.0 - tail, dim=0)
+    covered = (truth >= lower) & (truth <= upper)
+    width_bps = 10000.0 * (upper - lower)
+    asset_rows: list[dict[str, Any]] = []
+    for horizon_index, horizon in enumerate(bundle.evaluation_horizons):
+        for asset_index, asset in enumerate(bundle.asset_cols):
+            asset_rows.append(
+                {
+                    "Asset": asset,
+                    "Horizon": int(horizon),
+                    "Nominal coverage": coverage,
+                    "Empirical coverage": float(covered[:, horizon_index, asset_index, 0].float().mean().item()),
+                    "Coverage gap": float(covered[:, horizon_index, asset_index, 0].float().mean().item()) - coverage,
+                    "Mean interval width (log-return bps)": float(width_bps[:, horizon_index, asset_index, 0].mean().item()),
+                    "Median interval width (log-return bps)": float(width_bps[:, horizon_index, asset_index, 0].median().item()),
+                }
+            )
+    by_asset = pd.DataFrame(asset_rows)
+
+    ensemble_mean = sampled.mean(dim=0)
+    sample_median = sampled.median(dim=0).values
+    term_one = (sampled - truth.unsqueeze(0)).abs().mean(dim=0)
+    pairwise = (sampled[:, None] - sampled[None, :]).abs().mean(dim=(0, 1))
+    crps = term_one - 0.5 * pairwise
+    dispersion = sampled.std(dim=0, unbiased=False)
+    score_rows = []
+    for index, horizon in enumerate(bundle.evaluation_horizons):
+        score_rows.append(
+            {
+                "Horizon": int(horizon),
+                "Empirical CRPS (log-return bps)": float(10000.0 * crps[:, index].mean().item()),
+                "Ensemble-mean Log MAE": float((ensemble_mean[:, index] - truth[:, index]).abs().mean().item()),
+                "Sample-median Log MAE": float((sample_median[:, index] - truth[:, index]).abs().mean().item()),
+                "Mean predictive std (log-return bps)": float(10000.0 * dispersion[:, index].mean().item()),
+                "Median predictive std (log-return bps)": float(10000.0 * dispersion[:, index].median().item()),
+            }
+        )
+    probabilistic_scores = pd.DataFrame(score_rows)
+
+    ranks = (sampled < truth.unsqueeze(0)).sum(dim=0)
+    rank_rows = []
+    for index, horizon in enumerate(bundle.evaluation_horizons):
+        flattened = ranks[:, index].reshape(-1)
+        total = int(flattened.numel())
+        for rank in range(bundle.sample_count + 1):
+            count = int((flattened == rank).sum().item())
+            rank_rows.append(
+                {
+                    "Horizon": int(horizon),
+                    "Rank": rank,
+                    "Count": count,
+                    "Frequency": count / max(total, 1),
+                    "Ideal frequency": 1.0 / (bundle.sample_count + 1),
+                }
+            )
+    rank_histogram = pd.DataFrame(rank_rows)
+    calibration_figure, calibration_axes = plot_coverage_calibration(overall)
+    return PredictiveCoverageReport(
+        overall=overall,
+        by_asset=by_asset,
+        probabilistic_scores=probabilistic_scores,
+        rank_histogram=rank_histogram,
+        calibration_figure=calibration_figure,
+        calibration_axes=calibration_axes,
+    )
+
+
+
+def resolve_candle_data_root(root: str | Path | None = None) -> Path:
+    """Resolve the canonical session-data directory on Mac or Colab."""
+
+    if root is not None:
+        path = Path(root).expanduser().resolve()
+        if not path.is_dir():
+            raise FileNotFoundError(f"Candle-data directory does not exist: {path}")
+        return path
+    candidates = (
+        Path(
+            "/Users/vishalruparelia/Library/CloudStorage/"
+            "GoogleDrive-vishal@autonomous-fox.ai/Shared drives/Vishal/"
+            "data/cached_datasets/exp-1m-95s-24y/session"
+        ),
+        Path(
+            "/content/drive/Shareddrives/Vishal/data/cached_datasets/"
+            "exp-1m-95s-24y/session"
+        ),
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        "Could not locate the canonical candle-data directory. Checked:\n"
+        + "\n".join(f"  - {candidate}" for candidate in candidates)
+    )
+
+
+def resolve_token_cache_path(
+    *,
+    split: Literal["train", "validation", "test"],
+    token_root: str | Path | None = None,
+) -> Path:
+    """Resolve an original 1,024-class origin-aligned token cache."""
+
+    if token_root is None:
+        model_roots = (
+            Path(
+                "/Users/vishalruparelia/Library/CloudStorage/"
+                "GoogleDrive-vishal@autonomous-fox.ai/My Drive/"
+                "dissertation/final_model/tokens"
+            ),
+            Path("/content/drive/MyDrive/dissertation/final_model/tokens"),
+        )
+        root = next((candidate for candidate in model_roots if candidate.is_dir()), None)
+        if root is None:
+            raise FileNotFoundError(
+                "Could not locate final_model/tokens. Checked:\n"
+                + "\n".join(f"  - {candidate}" for candidate in model_roots)
+            )
+    else:
+        root = Path(token_root).expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Token-cache directory does not exist: {root}")
+
+    names = {
+        "train": ("origin_aligned_train_tokens.pt",),
+        "validation": (
+            "origin_aligned_val_tokens.pt",
+            "origin_aligned_validation_tokens.pt",
+        ),
+        "test": ("origin_aligned_test_tokens.pt",),
+    }
+    if split not in names:
+        raise ValueError("split must be 'train', 'validation', or 'test'.")
+    for name in names[split]:
+        candidate = root / name
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        f"No original token cache for split {split!r} was found under {root}. "
+        f"Expected one of {list(names[split])}."
+    )
+
+
+def make_asset_coverage_ranking(
+    coverage_by_asset: pd.DataFrame,
+    *,
+    horizon: int | None = None,
+    top_n: int = 20,
+) -> pd.DataFrame:
+    """Rank assets by absolute calibration gap for one/all horizons."""
+
+    required = {
+        "Asset",
+        "Horizon",
+        "Nominal coverage",
+        "Empirical coverage",
+        "Coverage gap",
+        "Mean interval width (log-return bps)",
+    }
+    missing = required - set(coverage_by_asset.columns)
+    if missing:
+        raise ValueError(f"coverage_by_asset is missing {sorted(missing)}.")
+    selected = coverage_by_asset.copy()
+    if horizon is not None:
+        selected = selected.loc[selected["Horizon"] == int(horizon)].copy()
+    selected["Absolute coverage gap"] = selected["Coverage gap"].abs()
+    return (
+        selected.sort_values(
+            ["Absolute coverage gap", "Asset", "Horizon"],
+            ascending=[False, True, True],
+        )
+        .head(int(top_n))
+        .reset_index(drop=True)
+    )
+
+
+def plot_sample_rank_histogram(
+    rank_table: pd.DataFrame,
+    *,
+    figsize: tuple[float, float] = (10.0, 6.0),
+    ax: Axes | None = None,
+) -> tuple[Figure, Axes]:
+    """Plot truth-rank frequencies for each horizon against the ideal level."""
+
+    required = {"Horizon", "Rank", "Frequency", "Ideal frequency"}
+    missing = required - set(rank_table.columns)
+    if missing:
+        raise ValueError(f"rank_table is missing {sorted(missing)}.")
+    if ax is None:
+        figure, axes = plt.subplots(figsize=figsize)
+    else:
+        axes = ax
+        figure = axes.figure
+    for horizon, group in rank_table.groupby("Horizon"):
+        ordered = group.sort_values("Rank")
+        axes.plot(
+            ordered["Rank"],
+            ordered["Frequency"],
+            marker="o",
+            label=f"{int(horizon)} min",
+        )
+    ideal = float(rank_table["Ideal frequency"].dropna().iloc[0])
+    axes.axhline(ideal, linestyle="--", color="black", linewidth=1.0, label="Ideal")
+    axes.set_xlabel("Number of sampled returns below the realised return")
+    axes.set_ylabel("Frequency")
+    axes.set_title("Finite-ensemble truth-rank histogram")
+    axes.grid(True, alpha=0.25)
+    axes.legend()
+    figure.tight_layout()
+    return figure, axes
+
+# ============================================================================
+# Final Graph Hub API (v11)
+# ============================================================================
+#
+# The functions below implement the final notebook contract.  They are
+# deliberately folder-name agnostic and saved-artifact only: nothing here
+# trains a model or launches split inference.
+
+DaySelector = str | None
+WindowSelector = int | Literal["random"] | None
+AssetSelector = str | int | Literal["random"]
+TokenDistributionBar = Literal[
+    "mean_probability",
+    "hard_prediction_frequency",
+    "training_target_frequency",
+    "sampled_frequency",
+]
+
+
+@dataclass(frozen=True)
+class TrainingHistoryReport:
+    """Separate predictive, graph-concentration, and beta figures."""
+
+    history: pd.DataFrame
+    objective_figure: Figure
+    objective_axes: Axes
+    entropy_figure: Figure | None
+    entropy_axes: Axes | None
+    beta_figure: Figure | None
+    beta_axes: Axes | None
+
+
+@dataclass(frozen=True)
+class SelectedGraph:
+    """One exact or averaged graph selection under ``A[target, source]``."""
+
+    adjacency: pd.DataFrame
+    per_window_adjacency: Tensor  # [selected windows, target, source]
+    selected_windows: pd.DataFrame
+    run_dir: Path
+    run_name: str
+    run_kind: AnalysisRunKind
+    split: EvaluationSplit
+    policy: str
+    graph_type: str
+    component: str
+    layer: int
+    head: HeadSelection
+    requested_day: str | None
+    requested_window: int | str | None
+    resolved_day: str | None
+    resolved_window: int | None
+    selection_description: str
+    time_window_description: str | None
+    displayed_mean_row_entropy: float
+    displayed_effective_neighbours: float
+    mean_window_row_entropy: float
+    mean_window_effective_neighbours: float
+    maximum_edge_weight: float
+    mean_top5_row_mass: float
+    add_self_loops: bool
+
+
+@dataclass(frozen=True)
+class GraphAnalysisReport:
+    """Actual adjacency, concentration, connections, and source frequency."""
+
+    graph: SelectedGraph
+    summary: pd.DataFrame
+    connections: pd.DataFrame
+    top_source_frequency: pd.DataFrame
+    adjacency_figure: Figure
+    adjacency_axes: Axes
+    frequency_figure: Figure
+    frequency_axes: Axes
+    plotted_adjacency: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class GraphEntropyReport:
+    """Dynamic-graph row entropy across dates and target assets."""
+
+    day_values: pd.DataFrame
+    day_summary: pd.DataFrame
+    asset_summary: pd.DataFrame
+    window_asset_entropy: pd.DataFrame
+    figure: Figure
+    axes: Axes
+
+
+@dataclass(frozen=True)
+class SectorGraphReport:
+    """Sector-to-sector and asset-to-sector aggregations of one graph view."""
+
+    graph: SelectedGraph
+    asset_sector_mapping: pd.DataFrame
+    sector_adjacency: pd.DataFrame
+    asset_sector_adjacency: pd.DataFrame
+    sector_figure: Figure
+    sector_axes: Axes
+    asset_sector_figure: Figure
+    asset_sector_axes: Axes
+
+
+def list_saved_policies(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    models_root: str | Path | None = None,
+) -> pd.DataFrame:
+    """List saved policy directories and the manifest-selected policy."""
+
+    run_dir = resolve_model_folder(model, models_root=models_root)
+    resolved_split = normalise_evaluation_split(split)
+    selected = _selected_temperature_policy(run_dir, resolved_split)
+    policies = _available_saved_policies(run_dir, split=resolved_split)
+    rows = [
+        {
+            "Policy": policy,
+            "Selected by manifest": policy == selected,
+            "Split": resolved_split,
+        }
+        for policy in policies
+    ]
+    if not rows:
+        default_policy = (
+            "best"
+            if resolved_split == "validation"
+            and (run_dir / "best_validation_predictions.pt").is_file()
+            else "default"
+        )
+        rows.append(
+            {
+                "Policy": default_policy,
+                "Selected by manifest": selected == default_policy,
+                "Split": resolved_split,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def analyse_training_history(
+    model: str | Path,
+    *,
+    models_root: str | Path | None = None,
+    figsize: tuple[float, float] = (10.5, 4.5),
+) -> TrainingHistoryReport:
+    """Plot the saved training history with beta on its own figure.
+
+    The predictive objective, graph entropy, and learned spatial gate have
+    different scales and interpretations.  They are therefore never overlaid.
+    """
+
+    run_dir = resolve_model_folder(model, models_root=models_root)
+    history_path = run_dir / "history.csv"
+    if not history_path.is_file():
+        raise FileNotFoundError(history_path)
+    history = pd.read_csv(history_path)
+    if history.empty:
+        raise ValueError(f"History is empty: {history_path}")
+
+    epoch_column = _first_existing_column(history, ("epoch", "Epoch"))
+    if epoch_column is None:
+        history = history.copy()
+        history["epoch"] = np.arange(1, len(history) + 1)
+        epoch_column = "epoch"
+
+    train_column = _first_existing_column(
+        history,
+        ("train_token_loss", "training_loss", "train_loss", "training_native_loss"),
+    )
+    validation_column = _first_existing_column(
+        history,
+        ("validation_token_loss", "selection_score", "validation_loss", "val_loss"),
+    )
+    entropy_column = _first_existing_column(
+        history,
+        ("validation_graph_mean_row_entropy", "graph_mean_row_entropy"),
+    )
+    beta_column = _first_existing_column(
+        history,
+        ("spatial_beta", "validation_spatial_beta"),
+    )
+
+    objective_figure, objective_axes = plt.subplots(figsize=figsize)
+    if train_column is not None:
+        objective_axes.plot(history[epoch_column], history[train_column], label=train_column)
+    if validation_column is not None:
+        objective_axes.plot(
+            history[epoch_column], history[validation_column], label=validation_column
+        )
+    objective_axes.set_title(f"{run_dir.name} — predictive training objective")
+    objective_axes.set_xlabel("Epoch")
+    objective_axes.set_ylabel("Saved objective value")
+    objective_axes.grid(True, alpha=0.25)
+    if objective_axes.lines:
+        objective_axes.legend()
+    objective_figure.tight_layout()
+
+    entropy_figure: Figure | None = None
+    entropy_axes: Axes | None = None
+    if entropy_column is not None:
+        entropy_figure, entropy_axes = plt.subplots(figsize=figsize)
+        entropy_axes.plot(
+            history[epoch_column], history[entropy_column], color="tab:purple"
+        )
+        entropy_axes.set_title(f"{run_dir.name} — graph mean row entropy")
+        entropy_axes.set_xlabel("Epoch")
+        entropy_axes.set_ylabel("Mean row entropy (nats)")
+        entropy_axes.grid(True, alpha=0.25)
+        entropy_figure.tight_layout()
+
+    beta_figure: Figure | None = None
+    beta_axes: Axes | None = None
+    if beta_column is not None:
+        beta_figure, beta_axes = plt.subplots(figsize=figsize)
+        beta_axes.plot(history[epoch_column], history[beta_column], color="tab:green")
+        beta_axes.set_title(f"{run_dir.name} — learned spatial beta")
+        beta_axes.set_xlabel("Epoch")
+        beta_axes.set_ylabel("Beta: graph-aware feature mixture weight")
+        beta_axes.set_ylim(0.0, 1.0)
+        beta_axes.grid(True, alpha=0.25)
+        beta_figure.tight_layout()
+
+    selected_columns = [epoch_column]
+    for column in (train_column, validation_column, entropy_column, beta_column):
+        if column is not None and column not in selected_columns:
+            selected_columns.append(column)
+    return TrainingHistoryReport(
+        history=history[selected_columns].copy(),
+        objective_figure=objective_figure,
+        objective_axes=objective_axes,
+        entropy_figure=entropy_figure,
+        entropy_axes=entropy_axes,
+        beta_figure=beta_figure,
+        beta_axes=beta_axes,
+    )
+
+
+def _graph_component_tensor(
+    artifacts: EvaluationArtifacts,
+    *,
+    component: GraphComponent,
+    layer: int,
+) -> Tensor:
+    if artifacts.graph_artifacts is None:
+        raise FileNotFoundError(
+            f"No {artifacts.split} graph artefact exists for {artifacts.info.run_dir}."
+        )
+    graph = artifacts.graph_artifacts
+    if component == "selected" and int(layer) != -1:
+        per_layer = graph.get("per_layer")
+        if not isinstance(per_layer, Sequence) or isinstance(per_layer, (str, bytes)):
+            raise ValueError("Saved graph artefact does not contain per_layer graphs.")
+        layer_index = _normalise_layer_index(int(layer), len(per_layer))
+        values = per_layer[layer_index]
+    else:
+        values = graph.get(component)
+    if values is None:
+        raise ValueError(f"Graph component {component!r} is unavailable.")
+    tensor = torch.as_tensor(values).detach().cpu().double()
+    if tensor.ndim != 4:
+        raise ValueError("Normalised graph tensor must have shape [W,G,N,N].")
+    return tensor
+
+
+def _normalise_day_selector(day: str | None) -> str | None:
+    if day is None:
+        return None
+    text = str(day).strip()
+    if text.lower() == "random":
+        return "random"
+    return _normalise_date(text)
+
+
+def _normalise_window_selector(window: int | str | None) -> int | str | None:
+    if window is None:
+        return None
+    if isinstance(window, str):
+        if window.strip().lower() == "random":
+            return "random"
+        try:
+            window = int(window)
+        except ValueError as error:
+            raise ValueError("window must be a positive integer, None, or 'random'.") from error
+    value = int(window)
+    if value <= 0:
+        raise ValueError("window is one-based and must be positive.")
+    return value
+
+
+def _select_day_window_rows(
+    table: pd.DataFrame,
+    *,
+    day: str | None,
+    window: int | str | None,
+    random_seed: int,
+) -> tuple[pd.DataFrame, str | None, int | None, str]:
+    """Apply the final Graph Hub day/window aggregation convention."""
+
+    if table.empty:
+        raise ValueError("The saved split contains no windows.")
+    required = {"Date", "Window within date", "Global window index"}
+    missing = required - set(table.columns)
+    if missing:
+        raise ValueError(f"Window table is missing {sorted(missing)}.")
+
+    requested_day = _normalise_day_selector(day)
+    requested_window = _normalise_window_selector(window)
+    rng = np.random.default_rng(int(random_seed))
+
+    selected_day: str | None = None
+    if requested_day == "random":
+        available_days = sorted(str(value) for value in table["Date"].dropna().unique())
+        if not available_days:
+            raise ValueError("Random day selection requires saved date metadata.")
+        selected_day = str(rng.choice(available_days))
+    elif requested_day is not None:
+        selected_day = requested_day
+
+    working = table.copy()
+    if selected_day is not None:
+        working = working.loc[working["Date"].astype(str).eq(selected_day)].copy()
+        if working.empty:
+            available = sorted(str(value) for value in table["Date"].dropna().unique())
+            raise ValueError(
+                f"Day {selected_day!r} is unavailable. Available days include {available[:10]}."
+            )
+
+    selected_window: int | None = None
+    if requested_window == "random":
+        available_windows = sorted(
+            int(value) for value in working["Window within date"].dropna().unique()
+        )
+        if not available_windows:
+            raise ValueError("Random window selection found no candidate windows.")
+        selected_window = int(rng.choice(available_windows))
+    elif requested_window is not None:
+        selected_window = int(requested_window)
+
+    if selected_window is not None:
+        working = working.loc[
+            pd.to_numeric(working["Window within date"], errors="coerce")
+            == selected_window
+        ].copy()
+        if working.empty:
+            raise ValueError(
+                f"Window {selected_window} is unavailable under the selected day filter."
+            )
+
+    working = working.sort_values("Global window index").reset_index(drop=True)
+    if selected_day is not None and selected_window is not None:
+        description = f"{selected_day}, window {selected_window}"
+    elif selected_day is not None:
+        description = f"{selected_day}, averaged over all {len(working)} saved windows"
+    elif selected_window is not None:
+        day_count = int(working["Date"].nunique(dropna=True))
+        description = (
+            f"window {selected_window}, averaged across {day_count} days "
+            f"({len(working)} saved windows)"
+        )
+    else:
+        day_count = int(working["Date"].nunique(dropna=True))
+        description = (
+            f"all {len(working)} saved windows across {day_count} days"
+        )
+    return working, selected_day, selected_window, description
+
+
+def select_graph(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    day: str | None = None,
+    window: int | str | None = None,
+    component: GraphComponent = "selected",
+    layer: int = -1,
+    head: HeadSelection = "mean",
+    random_seed: int = 42,
+    models_root: str | Path | None = None,
+) -> SelectedGraph:
+    """Select or average graphs using the final day/window convention.
+
+    ``day=None`` and ``window=None`` average the full split.  Supplying only a
+    day averages all windows on that day.  Supplying only a one-based window
+    number averages that intraday window across all days.  Use the explicit
+    string ``"random"`` for reproducible random day/window selection; ``None``
+    is never interpreted as random.
+    """
+
+    run_dir = resolve_model_folder(model, models_root=models_root)
+    resolved_split = normalise_evaluation_split(split)
+    artifacts = load_evaluation_artifacts(
+        run_dir,
+        split=resolved_split,
+        policy=policy,
+        require_graph=True,
+    )
+    table = make_evaluation_window_table(
+        run_dir,
+        split=resolved_split,
+        policy=artifacts.policy,
+    )
+    selected_rows, selected_day, selected_window, description = _select_day_window_rows(
+        table,
+        day=day,
+        window=window,
+        random_seed=random_seed,
+    )
+    indices = torch.as_tensor(
+        selected_rows["Global window index"].to_numpy(dtype=np.int64),
+        dtype=torch.long,
+    )
+    tensor = _graph_component_tensor(
+        artifacts,
+        component=component,
+        layer=layer,
+    ).index_select(0, indices)
+
+    if head == "mean":
+        per_window = tensor.mean(dim=1)
+    else:
+        head_index = int(head)
+        if not 0 <= head_index < int(tensor.shape[1]):
+            raise IndexError(
+                f"Graph head {head_index} is out of range for {int(tensor.shape[1])} heads."
+            )
+        per_window = tensor[:, head_index]
+
+    displayed = per_window.mean(dim=0)
+    displayed_entropy = -(
+        displayed.clamp_min(1.0e-12) * displayed.clamp_min(1.0e-12).log()
+    ).sum(dim=-1)
+    per_window_entropy = -(
+        per_window.clamp_min(1.0e-12) * per_window.clamp_min(1.0e-12).log()
+    ).sum(dim=-1)
+    available_neighbours = displayed.shape[-1] - 1
+    top_k = max(1, min(5, available_neighbours))
+    top5_mass = displayed.topk(top_k, dim=-1).values.sum(dim=-1)
+
+    unique_time_windows = tuple(
+        str(value)
+        for value in selected_rows["Time window"].dropna().unique().tolist()
+    )
+    time_description = unique_time_windows[0] if len(unique_time_windows) == 1 else None
+    frame = pd.DataFrame(
+        displayed.numpy(),
+        index=artifacts.info.asset_cols,
+        columns=artifacts.info.asset_cols,
+    )
+    frame.index.name = "Target"
+    frame.columns.name = "Source"
+    return SelectedGraph(
+        adjacency=frame,
+        per_window_adjacency=per_window.contiguous(),
+        selected_windows=selected_rows,
+        run_dir=run_dir,
+        run_name=run_dir.name,
+        run_kind=artifacts.info.run_kind,
+        split=resolved_split,
+        policy=artifacts.policy,
+        graph_type=artifacts.info.graph_type,
+        component=component,
+        layer=int(layer),
+        head=head,
+        requested_day=day,
+        requested_window=window,
+        resolved_day=selected_day,
+        resolved_window=selected_window,
+        selection_description=description,
+        time_window_description=time_description,
+        displayed_mean_row_entropy=float(displayed_entropy.mean().item()),
+        displayed_effective_neighbours=float(displayed_entropy.exp().mean().item()),
+        mean_window_row_entropy=float(per_window_entropy.mean().item()),
+        mean_window_effective_neighbours=float(per_window_entropy.exp().mean().item()),
+        maximum_edge_weight=float(displayed.max().item()),
+        mean_top5_row_mass=float(top5_mass.mean().item()),
+        add_self_loops=artifacts.info.add_self_loops,
+    )
+
+
+def make_selected_graph_summary(graph: SelectedGraph) -> pd.DataFrame:
+    """Summarise the displayed mean graph and its window-level concentration."""
+
+    return pd.DataFrame(
+        [
+            {
+                "Run": graph.run_name,
+                "Family": graph.run_kind,
+                "Split": graph.split,
+                "Policy": graph.policy,
+                "Graph type": graph.graph_type,
+                "Component": graph.component,
+                "Layer": graph.layer,
+                "Head": graph.head,
+                "Selection": graph.selection_description,
+                "Clock-time window": graph.time_window_description,
+                "Selected windows": len(graph.selected_windows),
+                "Entropy of displayed mean adjacency": graph.displayed_mean_row_entropy,
+                "Effective neighbours of displayed mean adjacency": graph.displayed_effective_neighbours,
+                "Mean window-specific row entropy": graph.mean_window_row_entropy,
+                "Mean window-specific effective neighbours": graph.mean_window_effective_neighbours,
+                "Maximum displayed edge weight": graph.maximum_edge_weight,
+                "Mean displayed top-5 row mass": graph.mean_top5_row_mass,
+            }
+        ]
+    )
+
+
+def make_graph_connections(
+    graph: SelectedGraph,
+    *,
+    top_n: int = 5,
+    direction: NeighbourDirection = "impacted_by",
+) -> pd.DataFrame:
+    """Return strongest incoming or outgoing edges for every asset."""
+
+    return _top_neighbours_from_adjacency(
+        graph.adjacency.to_numpy(dtype=np.float64),
+        tuple(str(value) for value in graph.adjacency.index),
+        top_n=int(top_n),
+        direction=direction,
+    )
+
+
+def make_top_source_frequency(
+    graph: SelectedGraph,
+    *,
+    top_n: int = 5,
+) -> pd.DataFrame:
+    """Count how often each source appears in target rows' top-N inputs.
+
+    Self edges are always excluded.  With 93 assets the largest possible count
+    is therefore 92, meaning the source is among the top-N influences for every
+    *other* target asset.
+    """
+
+    matrix = graph.adjacency.to_numpy(dtype=np.float64)
+    labels = tuple(str(value) for value in graph.adjacency.index)
+    nodes = len(labels)
+    requested_count = int(top_n)
+    if requested_count <= 0:
+        raise ValueError("top_n must be positive.")
+    count = min(requested_count, nodes - 1)
+    source_counts = np.zeros(nodes, dtype=np.int64)
+    for target in range(nodes):
+        scores = matrix[target].copy()
+        scores[target] = -np.inf
+        positive = np.flatnonzero(scores > 0.0)
+        ranked = positive[np.argsort(scores[positive])[::-1]][:count]
+        source_counts[ranked] += 1
+    table = pd.DataFrame(
+        {
+            "Source asset": labels,
+            f"Targets for which source is in top {count}": source_counts,
+            "Eligible target assets": nodes - 1,
+            "Proportion of eligible targets": source_counts / max(nodes - 1, 1),
+        }
+    )
+    return table.sort_values(
+        [f"Targets for which source is in top {count}", "Source asset"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+
+def plot_selected_graph(
+    graph: SelectedGraph,
+    *,
+    cluster: bool = False,
+    cluster_method: str = "average",
+    figsize: tuple[float, float] = (13.0, 11.0),
+    tick_fontsize: float = 8.0,
+    ax: Axes | None = None,
+) -> tuple[Figure, Axes, pd.DataFrame]:
+    """Plot actual adjacency weights; clustering is off by default."""
+
+    matrix = graph.adjacency.to_numpy(dtype=np.float64, copy=True)
+    labels = np.asarray(graph.adjacency.index, dtype=object)
+    if cluster:
+        order = _cluster_graph_order(matrix, method=cluster_method)
+        matrix = matrix[np.ix_(order, order)]
+        labels = labels[order]
+    plotted_values = matrix.copy()
+    if not graph.add_self_loops:
+        np.fill_diagonal(plotted_values, np.nan)
+    finite = plotted_values[np.isfinite(plotted_values)]
+    maximum = float(np.max(finite)) if finite.size else 1.0
+    if not np.isfinite(maximum) or maximum <= 0.0:
+        maximum = 1.0
+
+    if ax is None:
+        figure, axes = plt.subplots(figsize=figsize)
+    else:
+        axes = ax
+        figure = axes.figure
+    cmap = plt.get_cmap("Reds").copy()
+    cmap.set_bad("white")
+    image = axes.imshow(
+        plotted_values,
+        cmap=cmap,
+        vmin=0.0,
+        vmax=maximum,
+        interpolation="nearest",
+        aspect="equal",
+    )
+    axes.set_xticks(np.arange(len(labels)))
+    axes.set_yticks(np.arange(len(labels)))
+    axes.set_xticklabels(labels, rotation=90, fontsize=tick_fontsize)
+    axes.set_yticklabels(labels, fontsize=tick_fontsize)
+    axes.set_xlabel("Source asset (influences target)")
+    axes.set_ylabel("Target asset (receives influence)")
+    time_text = (
+        f" — {graph.time_window_description}" if graph.time_window_description else ""
+    )
+    axes.set_title(
+        f"{graph.run_name} — {graph.split} / {graph.policy}\n"
+        f"{graph.selection_description}{time_text}\n"
+        f"entropy of displayed adjacency={graph.displayed_mean_row_entropy:.4f}; "
+        f"mean window entropy={graph.mean_window_row_entropy:.4f}"
+    )
+    colourbar = figure.colorbar(image, ax=axes, fraction=0.046, pad=0.03)
+    colourbar.set_label("Adjacency weight")
+    figure.tight_layout()
+    plotted = pd.DataFrame(matrix, index=labels, columns=labels)
+    plotted.index.name = "Target"
+    plotted.columns.name = "Source"
+    return figure, axes, plotted
+
+
+def plot_top_source_frequency(
+    table: pd.DataFrame,
+    *,
+    top_n: int,
+    figsize: tuple[float, float] = (16.0, 5.5),
+    ax: Axes | None = None,
+) -> tuple[Figure, Axes]:
+    """Plot source-asset counts from ``make_top_source_frequency``."""
+
+    count_candidates = [
+        column
+        for column in table.columns
+        if str(column).startswith("Targets for which source is in top ")
+    ]
+    if len(count_candidates) != 1:
+        raise ValueError("Could not identify the top-source count column.")
+    count_column = count_candidates[0]
+    actual_top_n = int(str(count_column).rsplit(" ", 1)[-1])
+    required = {"Source asset", count_column}
+    missing = required - set(table.columns)
+    if missing:
+        raise ValueError(f"Top-source table is missing {sorted(missing)}.")
+    ordered = table.sort_values(count_column, ascending=False).reset_index(drop=True)
+    if ax is None:
+        figure, axes = plt.subplots(figsize=figsize)
+    else:
+        axes = ax
+        figure = axes.figure
+    axes.bar(ordered["Source asset"], ordered[count_column], color="tab:blue")
+    axes.set_xlabel("Source asset")
+    axes.set_ylabel(f"Number of other targets where source is in top {actual_top_n}")
+    axes.set_title(f"Frequency of appearance in target rows' top {actual_top_n} influences")
+    axes.tick_params(axis="x", rotation=90, labelsize=8)
+    axes.grid(True, axis="y", alpha=0.25)
+    figure.tight_layout()
+    return figure, axes
+
+
+def analyse_graph(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    day: str | None = None,
+    window: int | str | None = None,
+    component: GraphComponent = "selected",
+    layer: int = -1,
+    head: HeadSelection = "mean",
+    top_n: int = 5,
+    direction: NeighbourDirection = "impacted_by",
+    cluster: bool = False,
+    random_seed: int = 42,
+    models_root: str | Path | None = None,
+) -> GraphAnalysisReport:
+    """Run the complete actual-adjacency analysis for one graph selection."""
+
+    graph = select_graph(
+        model,
+        split=split,
+        policy=policy,
+        day=day,
+        window=window,
+        component=component,
+        layer=layer,
+        head=head,
+        random_seed=random_seed,
+        models_root=models_root,
+    )
+    summary = make_selected_graph_summary(graph)
+    connections = make_graph_connections(graph, top_n=top_n, direction=direction)
+    frequency = make_top_source_frequency(graph, top_n=top_n)
+    adjacency_figure, adjacency_axes, plotted = plot_selected_graph(
+        graph,
+        cluster=cluster,
+    )
+    frequency_figure, frequency_axes = plot_top_source_frequency(
+        frequency,
+        top_n=top_n,
+    )
+    return GraphAnalysisReport(
+        graph=graph,
+        summary=summary,
+        connections=connections,
+        top_source_frequency=frequency,
+        adjacency_figure=adjacency_figure,
+        adjacency_axes=adjacency_axes,
+        frequency_figure=frequency_figure,
+        frequency_axes=frequency_axes,
+        plotted_adjacency=plotted,
+    )
+
+
+def analyse_graph_entropy(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    day: str | None = None,
+    window: int | str | None = None,
+    component: GraphComponent = "selected",
+    layer: int = -1,
+    head: HeadSelection = "mean",
+    random_seed: int = 42,
+    models_root: str | Path | None = None,
+    figsize: tuple[float, float] = (14.0, 5.5),
+) -> GraphEntropyReport:
+    """Summarise row-entropy variation across dates and target assets."""
+
+    graph = select_graph(
+        model,
+        split=split,
+        policy=policy,
+        day=day,
+        window=window,
+        component=component,
+        layer=layer,
+        head=head,
+        random_seed=random_seed,
+        models_root=models_root,
+    )
+    entropy = -(
+        graph.per_window_adjacency.clamp_min(1.0e-12)
+        * graph.per_window_adjacency.clamp_min(1.0e-12).log()
+    ).sum(dim=-1)
+    records: list[dict[str, Any]] = []
+    assets = tuple(str(value) for value in graph.adjacency.index)
+    for local_index, row in graph.selected_windows.reset_index(drop=True).iterrows():
+        for asset_index, asset in enumerate(assets):
+            records.append(
+                {
+                    "Date": row["Date"],
+                    "Window within date": int(row["Window within date"]),
+                    "Global window index": int(row["Global window index"]),
+                    "Asset": asset,
+                    "Row entropy": float(entropy[local_index, asset_index].item()),
+                }
+            )
+    detailed = pd.DataFrame(records)
+    if detailed["Date"].isna().any():
+        raise ValueError(
+            "Daily entropy analysis requires saved date metadata for every selected window."
+        )
+    day_values = (
+        detailed.groupby("Date", as_index=False)
+        .agg(
+            **{
+                "Windows": ("Global window index", "nunique"),
+                "Daily mean row entropy": ("Row entropy", "mean"),
+            }
+        )
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
+    daily_series = day_values["Daily mean row entropy"]
+    minimum_row = day_values.loc[daily_series.idxmin()]
+    maximum_row = day_values.loc[daily_series.idxmax()]
+    day_summary = pd.DataFrame(
+        [
+            {
+                "Selected split": graph.split,
+                "Selection": graph.selection_description,
+                "Days": len(day_values),
+                "Mean of daily average row entropy": float(daily_series.mean()),
+                "Lower quartile of daily average row entropy": float(daily_series.quantile(0.25)),
+                "Upper quartile of daily average row entropy": float(daily_series.quantile(0.75)),
+                "Lowest-entropy day": str(minimum_row["Date"]),
+                "Lowest daily average row entropy": float(minimum_row["Daily mean row entropy"]),
+                "Highest-entropy day": str(maximum_row["Date"]),
+                "Highest daily average row entropy": float(maximum_row["Daily mean row entropy"]),
+            }
+        ]
+    )
+    asset_summary = (
+        detailed.groupby("Asset", as_index=False)["Row entropy"]
+        .agg(
+            **{
+                "Mean row entropy": "mean",
+                "Lower quartile row entropy": lambda values: values.quantile(0.25),
+                "Upper quartile row entropy": lambda values: values.quantile(0.75),
+            }
+        )
+        .sort_values("Mean row entropy")
+        .reset_index(drop=True)
+    )
+
+    figure, axes = plt.subplots(figsize=figsize)
+    dates = pd.to_datetime(day_values["Date"])
+    positions = np.arange(len(day_values))
+    axes.plot(positions, day_values["Daily mean row entropy"], linewidth=1.7)
+    month_keys = dates.dt.to_period("M")
+    tick_positions: list[int] = []
+    tick_labels: list[str] = []
+    seen: set[str] = set()
+    unique_month_periods = pd.Series(month_keys.drop_duplicates().tolist())
+    repeated_month_names = unique_month_periods.astype(str).str[5:7].duplicated(keep=False).any()
+    for position, (date_value, month_key) in enumerate(zip(dates, month_keys, strict=True)):
+        key = str(month_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        tick_positions.append(position)
+        tick_labels.append(
+            date_value.strftime("%b %Y" if repeated_month_names else "%b")
+        )
+    axes.set_xticks(tick_positions)
+    axes.set_xticklabels(tick_labels)
+    axes.set_xlabel("Date (label shown at first saved day of each month)")
+    axes.set_ylabel("Daily average row entropy (nats)")
+    axes.set_title(
+        f"{graph.run_name} — daily graph entropy — {graph.split} / {graph.policy}\n"
+        f"{graph.selection_description}"
+    )
+    axes.grid(True, alpha=0.25)
+    figure.tight_layout()
+    return GraphEntropyReport(
+        day_values=day_values,
+        day_summary=day_summary,
+        asset_summary=asset_summary,
+        window_asset_entropy=detailed,
+        figure=figure,
+        axes=axes,
+    )
+
+
+def resolve_company_profiles_path(path: str | Path | None = None) -> Path:
+    """Resolve ``company_profiles.csv`` on the author's Mac or in Colab."""
+
+    if path is not None:
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(resolved)
+        return resolved
+    candidates = (
+        Path(
+            "/Users/vishalruparelia/Library/CloudStorage/"
+            "GoogleDrive-vishal@autonomous-fox.ai/My Drive/"
+            "dissertation/company_profiles.csv"
+        ),
+        Path("/content/drive/MyDrive/dissertation/company_profiles.csv"),
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        "Could not locate dissertation/company_profiles.csv. Checked:\n"
+        + "\n".join(f"  - {candidate}" for candidate in candidates)
+    )
+
+
+def _asset_sector_mapping(
+    assets: Sequence[str],
+    *,
+    company_profiles_path: str | Path | None,
+) -> pd.DataFrame:
+    path = resolve_company_profiles_path(company_profiles_path)
+    profiles = pd.read_csv(path)
+    if profiles.shape[1] < 6:
+        raise ValueError("company_profiles.csv must contain at least six columns.")
+    ticker_column = profiles.columns[0]
+    sector_column = profiles.columns[5]
+    selected = profiles[[ticker_column, sector_column]].copy()
+    selected.columns = ["Ticker", "Sector"]
+    selected["Ticker"] = selected["Ticker"].astype(str).str.upper().str.strip()
+    selected["Sector"] = selected["Sector"].astype(str).str.strip()
+    selected = selected.loc[selected["Ticker"].isin([str(value).upper() for value in assets])]
+    duplicated = selected.loc[selected["Ticker"].duplicated(keep=False), "Ticker"].unique()
+    if len(duplicated):
+        raise ValueError(f"Company profile contains duplicate project tickers: {list(duplicated)}")
+    mapping = selected.set_index("Ticker")["Sector"].to_dict()
+    missing = [str(asset) for asset in assets if str(asset).upper() not in mapping]
+    if missing:
+        raise ValueError(f"No sector was found for project assets: {missing}")
+    return pd.DataFrame(
+        {
+            "Ticker": [str(asset) for asset in assets],
+            "Sector": [mapping[str(asset).upper()] for asset in assets],
+        }
+    )
+
+
+def analyse_sector_graph(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    day: str | None = None,
+    window: int | str | None = None,
+    component: GraphComponent = "selected",
+    layer: int = -1,
+    head: HeadSelection = "mean",
+    company_profiles_path: str | Path | None = None,
+    random_seed: int = 42,
+    models_root: str | Path | None = None,
+    sector_figsize: tuple[float, float] = (10.0, 8.0),
+    asset_figsize: tuple[float, float] = (13.0, 18.0),
+) -> SectorGraphReport:
+    """Aggregate an asset graph into sector and asset-to-sector views."""
+
+    graph = select_graph(
+        model,
+        split=split,
+        policy=policy,
+        day=day,
+        window=window,
+        component=component,
+        layer=layer,
+        head=head,
+        random_seed=random_seed,
+        models_root=models_root,
+    )
+    mapping = _asset_sector_mapping(
+        tuple(str(value) for value in graph.adjacency.index),
+        company_profiles_path=company_profiles_path,
+    )
+    sectors = tuple(sorted(mapping["Sector"].unique()))
+    sector_index = {sector: index for index, sector in enumerate(sectors)}
+    asset_sector = np.zeros((len(mapping), len(sectors)), dtype=np.float64)
+    for asset_index, sector in enumerate(mapping["Sector"]):
+        asset_sector[asset_index, sector_index[str(sector)]] = 1.0
+
+    adjacency = graph.adjacency.to_numpy(dtype=np.float64)
+    target_indicator = asset_sector
+    sector_values = target_indicator.T @ adjacency @ asset_sector
+    row_sums = sector_values.sum(axis=1, keepdims=True)
+    if np.any(row_sums <= 0.0):
+        raise ValueError("Sector aggregation produced an empty target-sector row.")
+    sector_values = sector_values / row_sums
+    asset_sector_values = adjacency @ asset_sector
+    asset_row_sums = asset_sector_values.sum(axis=1, keepdims=True)
+    if not np.allclose(asset_row_sums, 1.0, atol=2.0e-5, rtol=0.0):
+        raise ValueError("Asset-to-sector rows do not sum to one.")
+
+    sector_frame = pd.DataFrame(sector_values, index=sectors, columns=sectors)
+    sector_frame.index.name = "Target sector"
+    sector_frame.columns.name = "Source sector"
+
+    ordering = mapping.sort_values(["Sector", "Ticker"]).index.to_numpy(dtype=int)
+    ordered_mapping = mapping.iloc[ordering].reset_index(drop=True)
+    ordered_values = asset_sector_values[ordering]
+    asset_sector_frame = pd.DataFrame(
+        ordered_values,
+        index=ordered_mapping["Ticker"],
+        columns=sectors,
+    )
+    asset_sector_frame.index.name = "Target asset"
+    asset_sector_frame.columns.name = "Source sector"
+
+    sector_figure, sector_axes = plt.subplots(figsize=sector_figsize)
+    sector_image = sector_axes.imshow(
+        sector_values,
+        cmap="Reds",
+        vmin=0.0,
+        vmax=max(float(sector_values.max()), 1.0e-12),
+        aspect="equal",
+    )
+    sector_axes.set_xticks(np.arange(len(sectors)))
+    sector_axes.set_yticks(np.arange(len(sectors)))
+    sector_axes.set_xticklabels(sectors, rotation=90)
+    sector_axes.set_yticklabels(sectors)
+    sector_axes.set_xlabel("Source sector (influences target sector)")
+    sector_axes.set_ylabel("Target sector (receives influence)")
+    sector_axes.set_title(
+        f"Sector graph — {graph.run_name}\n{graph.selection_description}"
+    )
+    sector_figure.colorbar(sector_image, ax=sector_axes, fraction=0.046, pad=0.03).set_label(
+        "Row-normalised sector influence weight"
+    )
+    sector_figure.tight_layout()
+
+    asset_sector_figure = plt.figure(figsize=asset_figsize)
+    grid = GridSpec(1, 2, width_ratios=[2.8, 10.0], wspace=0.02, figure=asset_sector_figure)
+    sector_label_axes = asset_sector_figure.add_subplot(grid[0, 0])
+    asset_sector_axes = asset_sector_figure.add_subplot(grid[0, 1])
+    asset_image = asset_sector_axes.imshow(
+        ordered_values,
+        cmap="Reds",
+        vmin=0.0,
+        vmax=max(float(ordered_values.max()), 1.0e-12),
+        aspect="auto",
+    )
+    asset_sector_axes.set_xticks(np.arange(len(sectors)))
+    asset_sector_axes.set_xticklabels(sectors, rotation=90)
+    asset_sector_axes.set_yticks(np.arange(len(ordered_mapping)))
+    asset_sector_axes.set_yticklabels(ordered_mapping["Ticker"], fontsize=7)
+    asset_sector_axes.set_xlabel("Source sector")
+    asset_sector_axes.set_ylabel("Target asset")
+    asset_sector_axes.set_title(
+        f"Asset-to-sector influence — {graph.run_name}\n{graph.selection_description}"
+    )
+
+    colour_map = plt.get_cmap("tab20")
+    sector_colours = {
+        sector: colour_map(index / max(len(sectors) - 1, 1))
+        for index, sector in enumerate(sectors)
+    }
+    start = 0
+    for sector, group in ordered_mapping.groupby("Sector", sort=False):
+        length = len(group)
+        sector_label_axes.add_patch(
+            Rectangle(
+                (0.0, start - 0.5),
+                1.0,
+                length,
+                facecolor=sector_colours[str(sector)],
+                alpha=0.30,
+                edgecolor="none",
+            )
+        )
+        sector_label_axes.text(
+            0.95,
+            start + (length - 1) / 2,
+            str(sector),
+            ha="right",
+            va="center",
+            fontsize=9,
+            wrap=True,
+        )
+        if start > 0:
+            asset_sector_axes.axhline(start - 0.5, color="black", linewidth=0.7)
+        start += length
+    sector_label_axes.set_xlim(0.0, 1.0)
+    sector_label_axes.set_ylim(len(ordered_mapping) - 0.5, -0.5)
+    sector_label_axes.axis("off")
+    asset_sector_figure.colorbar(
+        asset_image,
+        ax=asset_sector_axes,
+        fraction=0.026,
+        pad=0.02,
+    ).set_label("Influence weight assigned to source sector")
+    asset_sector_figure.subplots_adjust(left=0.08, right=0.93, bottom=0.16, top=0.93)
+
+    return SectorGraphReport(
+        graph=graph,
+        asset_sector_mapping=ordered_mapping,
+        sector_adjacency=sector_frame,
+        asset_sector_adjacency=asset_sector_frame,
+        sector_figure=sector_figure,
+        sector_axes=sector_axes,
+        asset_sector_figure=asset_sector_figure,
+        asset_sector_axes=asset_sector_axes,
+    )
+
+
+def _resolve_random_asset(
+    asset: AssetSelector,
+    assets: Sequence[str],
+    *,
+    random_seed: int,
+) -> str:
+    if isinstance(asset, str) and asset.strip().lower() == "random":
+        return str(np.random.default_rng(int(random_seed)).choice(tuple(assets)))
+    if isinstance(asset, int) and not isinstance(asset, bool):
+        index = int(asset)
+        if not 0 <= index < len(assets):
+            raise IndexError(f"Asset index {index} is out of range.")
+        return str(assets[index])
+    value = str(asset)
+    if value not in assets:
+        raise ValueError(f"Asset {value!r} is unavailable.")
+    return value
+
+
+def _resolve_exact_example_window(
+    table: pd.DataFrame,
+    *,
+    day: str,
+    window: int | str,
+    random_seed: int,
+) -> pd.Series:
+    selected, _, _, _ = _select_day_window_rows(
+        table,
+        day=day,
+        window=window,
+        random_seed=random_seed,
+    )
+    if len(selected) != 1:
+        raise ValueError(
+            "Point/path examples require one exact saved window. Pass an exact "
+            "day and one-based window, or use the explicit 'random' sentinel."
+        )
+    return selected.iloc[0]
+
+
+def plot_point_forecast_example(
+    models: Mapping[str, str | Path],
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policies: Mapping[str, str | None] | None = None,
+    asset: AssetSelector = "random",
+    day: str = "random",
+    window: int | str = "random",
+    random_seed: int = 42,
+    figsize: tuple[float, float] = (10.0, 6.0),
+) -> PointForecastReport:
+    """Plot one exact or reproducibly random point-forecast example."""
+
+    if not models:
+        raise ValueError("At least one model is required.")
+    resolved_split = normalise_evaluation_split(split)
+    first_label, first_model = next(iter(models.items()))
+    first_policy = None if policies is None else policies.get(first_label)
+    first_dir = resolve_model_folder(first_model)
+    first_artifacts = load_evaluation_artifacts(
+        first_dir,
+        split=resolved_split,
+        policy=first_policy,
+    )
+    table = make_evaluation_window_table(
+        first_dir,
+        split=resolved_split,
+        policy=first_artifacts.policy,
+    )
+    selected_row = _resolve_exact_example_window(
+        table,
+        day=day,
+        window=window,
+        random_seed=random_seed,
+    )
+    resolved_asset = _resolve_random_asset(
+        asset,
+        first_artifacts.info.asset_cols,
+        random_seed=random_seed,
+    )
+    resolved_policies = None if policies is None else {
+        label: value for label, value in policies.items() if value is not None
+    }
+    return plot_point_forecast_comparison(
+        models,
+        split=resolved_split,
+        policies=resolved_policies,
+        asset=resolved_asset,
+        date=str(selected_row["Date"]),
+        window_within_date=int(selected_row["Window within date"]),
+        figsize=figsize,
+    )
+
+
+def analyse_sampled_path_example(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    data_dir: str | Path,
+    asset: AssetSelector = "random",
+    day: str = "random",
+    window: int | str = "random",
+    random_seed: int = 42,
+    context_points: int = 30,
+    figsize: tuple[float, float] = (12.0, 6.0),
+) -> SamplePathWindowReport:
+    """Plot one exact or reproducibly random ten-path forecast example."""
+
+    resolved_split = normalise_evaluation_split(split)
+    bundle = load_model_sampled_path_bundle(
+        resolve_model_folder(model),
+        split=resolved_split,
+        policy=policy,
+    )
+    table = _window_table_from_sampled_bundle(bundle, split=resolved_split)
+    selected_row = _resolve_exact_example_window(
+        table,
+        day=day,
+        window=window,
+        random_seed=random_seed,
+    )
+    resolved_asset = _resolve_random_asset(
+        asset,
+        bundle.asset_cols,
+        random_seed=random_seed,
+    )
+    return analyse_sampled_path_window(
+        resolve_model_folder(model),
+        split=resolved_split,
+        policy=bundle.policy,
+        data_dir=data_dir,
+        asset=resolved_asset,
+        date=str(selected_row["Date"]),
+        window_within_date=int(selected_row["Window within date"]),
+        context_points=context_points,
+        figsize=figsize,
+    )
+
+
+def analyse_coarse_token_predictive_distribution(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    asset: str | int | Literal["random"] | None = None,
+    horizon: int = 1,
+    source: MetricsSource = "best",
+    bars: Sequence[TokenDistributionBar] = (
+        "mean_probability",
+        "hard_prediction_frequency",
+        "training_target_frequency",
+        "sampled_frequency",
+    ),
+    window_indices: Sequence[int] | None = None,
+    max_windows: int | None = None,
+    batch_size: int = 2,
+    device: str | torch.device | None = None,
+    use_amp: bool | None = None,
+    plot_top_n: int = 40,
+    random_seed: int = 42,
+    figsize: tuple[float, float] = (16.0, 5.5),
+) -> dict[str, Any]:
+    """Plot selectable model/argmax/training/sampled coarse-token frequencies.
+
+    The fourth distribution uses the *saved* ten sampled paths at the chosen
+    evaluation horizon; it never launches a new sampling run.  All four bars
+    therefore refer to the same asset, horizon, and selected window subset.
+    """
+
+    allowed = {
+        "mean_probability",
+        "hard_prediction_frequency",
+        "training_target_frequency",
+        "sampled_frequency",
+    }
+    selected_bars = tuple(str(value) for value in bars)
+    if not selected_bars or len(set(selected_bars)) != len(selected_bars):
+        raise ValueError("bars must be a non-empty sequence without duplicates.")
+    unknown = set(selected_bars) - allowed
+    if unknown:
+        raise ValueError(f"Unknown token-distribution bars: {sorted(unknown)}")
+
+    run_dir = resolve_model_folder(model)
+    info = load_run_info(run_dir)
+    resolved_split = normalise_evaluation_split(split)
+    selected_asset = asset
+    if isinstance(asset, str) and asset.strip().lower() == "random":
+        selected_asset = _resolve_random_asset(
+            "random",
+            info.asset_cols,
+            random_seed=random_seed,
+        )
+    cache_path = resolve_token_cache_path(split=resolved_split)
+    training_cache_path = resolve_token_cache_path(split="train")
+    base = analyse_token_predictive_distribution(
+        run_dir,
+        asset=selected_asset,
+        horizon=int(horizon),
+        source=source,
+        validation_cache_path=cache_path,
+        training_cache_path=training_cache_path,
+        window_indices=window_indices,
+        max_windows=max_windows,
+        batch_size=batch_size,
+        device=device,
+        use_amp=use_amp,
+        plot_top_n=plot_top_n,
+        figsize=figsize,
+    )
+
+    artifacts = load_evaluation_artifacts(
+        run_dir,
+        split=resolved_split,
+        policy=policy,
+    )
+    if artifacts.token_artifacts is None:
+        raise FileNotFoundError(
+            f"No saved token artefact exists for {resolved_split}/{artifacts.policy}."
+        )
+    sampled_values = artifacts.token_artifacts.get("sampled_s1_evaluation")
+    if sampled_values is None:
+        raise KeyError("Saved token artefact has no sampled_s1_evaluation tensor.")
+    sampled = torch.as_tensor(sampled_values).long()
+    if sampled.ndim != 4:
+        raise ValueError("sampled_s1_evaluation must have shape [S,W,H,N].")
+    if int(horizon) not in artifacts.info.horizons:
+        raise ValueError(
+            f"Sampled-token frequencies are saved only at evaluation horizons "
+            f"{artifacts.info.horizons}; received {horizon}."
+        )
+    horizon_index = artifacts.info.horizons.index(int(horizon))
+    selected_indices = torch.as_tensor(
+        base["validation_window_indices"],
+        dtype=torch.long,
+    )
+    sampled = sampled.index_select(1, selected_indices)[:, :, horizon_index]
+    if selected_asset is None:
+        scoped_sampled = sampled
+    elif isinstance(selected_asset, int) and not isinstance(selected_asset, bool):
+        scoped_sampled = sampled[:, :, int(selected_asset) : int(selected_asset) + 1]
+    else:
+        asset_name = str(selected_asset)
+        if asset_name not in info.asset_cols:
+            raise ValueError(f"Asset {asset_name!r} is unavailable.")
+        asset_index = info.asset_cols.index(asset_name)
+        scoped_sampled = sampled[:, :, asset_index : asset_index + 1]
+    flat_sampled = scoped_sampled.reshape(-1)
+    vocabulary_size = len(base["mean_predictive_distribution"])
+    sampled_counts = torch.bincount(flat_sampled, minlength=vocabulary_size).double()
+    sampled_frequency = sampled_counts / max(int(flat_sampled.numel()), 1)
+    token_index = base["mean_predictive_distribution"].index
+    sampled_series = pd.Series(
+        sampled_frequency.numpy(),
+        index=token_index,
+        name="Sampled token frequency",
+    )
+
+    distributions = {
+        "mean_probability": base["mean_predictive_distribution"],
+        "hard_prediction_frequency": base["hard_prediction_distribution"],
+        "training_target_frequency": base["training_target_distribution"],
+        "sampled_frequency": sampled_series,
+    }
+    labels = {
+        "mean_probability": "Mean model probability",
+        "hard_prediction_frequency": "Hard argmax frequency",
+        "training_target_frequency": "Training target frequency",
+        "sampled_frequency": "Actual sampled frequency",
+    }
+    ranking = np.zeros(vocabulary_size, dtype=np.float64)
+    for key in selected_bars:
+        ranking = np.maximum(ranking, distributions[key].to_numpy(dtype=np.float64))
+    shown_ids = np.argsort(ranking)[::-1][: min(int(plot_top_n), vocabulary_size)]
+
+    figure, axes = plt.subplots(figsize=figsize)
+    x = np.arange(len(shown_ids))
+    width = 0.82 / len(selected_bars)
+    offsets = (np.arange(len(selected_bars)) - (len(selected_bars) - 1) / 2.0) * width
+    for offset, key in zip(offsets, selected_bars, strict=True):
+        axes.bar(
+            x + offset,
+            distributions[key].iloc[shown_ids].to_numpy() * 100.0,
+            width,
+            label=labels[key],
+        )
+    axes.set_xticks(x)
+    axes.set_xticklabels(shown_ids, rotation=90)
+    axes.set_xlabel("Coarse token ID")
+    axes.set_ylabel("Percentage of positions")
+    asset_label = str(base["summary"].iloc[0]["Asset"])
+    axes.set_title(
+        "Coarse-token predictive and sampled distributions\n"
+        f"split={resolved_split}; policy={artifacts.policy}; asset={asset_label}; "
+        f"horizon={int(horizon)} min"
+    )
+    axes.legend()
+    axes.grid(True, axis="y", alpha=0.20)
+    figure.tight_layout()
+
+    table = pd.DataFrame(
+        {
+            "Token ID": np.arange(vocabulary_size),
+            "Mean model probability (%)": distributions["mean_probability"].to_numpy() * 100.0,
+            "Hard argmax frequency (%)": distributions["hard_prediction_frequency"].to_numpy() * 100.0,
+            "Training target frequency (%)": distributions["training_target_frequency"].to_numpy() * 100.0,
+            "Actual sampled frequency (%)": sampled_series.to_numpy() * 100.0,
+        }
+    ).sort_values("Actual sampled frequency (%)", ascending=False).reset_index(drop=True)
+
+    result = dict(base)
+    result.update(
+        {
+            "sampled_distribution": sampled_series,
+            "distribution_table": table,
+            "bars": selected_bars,
+            "policy": artifacts.policy,
+            "split": resolved_split,
+            "figure": figure,
+            "axes": axes,
+        }
+    )
+    return result
+
+
+def analyse_coarse_token_topk(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    asset: str | int | Literal["random"] | None = None,
+    source: MetricsSource = "best",
+    window_indices: Sequence[int] | None = None,
+    max_windows: int | None = None,
+    batch_size: int = 2,
+    device: str | torch.device | None = None,
+    use_amp: bool | None = None,
+    top_k_values: Sequence[int] = (1, 2, 5, 10),
+    horizons: Sequence[int] | None = None,
+    random_seed: int = 42,
+) -> pd.DataFrame:
+    """Split-aware wrapper for the existing coarse-token top-K diagnostic."""
+
+    run_dir = resolve_model_folder(model)
+    info = load_run_info(run_dir)
+    resolved_asset = asset
+    if isinstance(asset, str) and asset.strip().lower() == "random":
+        resolved_asset = _resolve_random_asset(
+            "random", info.asset_cols, random_seed=random_seed
+        )
+    resolved_split = normalise_evaluation_split(split)
+    result = analyse_s1_topk_accuracy_by_horizon(
+        run_dir,
+        asset=resolved_asset,
+        source=source,
+        validation_cache_path=resolve_token_cache_path(split=resolved_split),
+        training_cache_path=resolve_token_cache_path(split="train"),
+        window_indices=window_indices,
+        max_windows=max_windows,
+        batch_size=batch_size,
+        device=device,
+        use_amp=use_amp,
+        top_k_values=top_k_values,
+        horizons=horizons,
+    )
+    result.attrs["split"] = resolved_split
+    return result

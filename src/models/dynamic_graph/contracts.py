@@ -32,6 +32,7 @@ GraphType = Literal[
     "free_static",
     "mtgnn_static",
     "dynamic",
+    "dynamic_correlation",
     "dynamic_base",
     "oracle",
 ]
@@ -377,6 +378,7 @@ class GraphConfig:
             "free_static",
             "mtgnn_static",
             "dynamic",
+            "dynamic_correlation",
             "dynamic_base",
             "oracle",
         }
@@ -866,6 +868,13 @@ class DynamicGraphModelConfig:
             num_nodes=self.num_nodes,
             d_model=self.d_model,
         )
+
+        if self.graph.type == "dynamic_correlation":
+            raise ValueError(
+                "graph.type='dynamic_correlation' is currently supported "
+                "only by the continuous forecaster, where the graph is "
+                "computed from observed raw Close values in each window."
+            )
 
         self.spatial.validate(
             graph_type=self.graph.type,

@@ -299,6 +299,286 @@ def build_absolute_correlation_adjacency(
     )
 
 
+
+def build_window_absolute_correlation_adjacency(
+    context_values: Tensor,
+    *,
+    threshold: float | None,
+    num_heads: int,
+    add_self_loops: bool,
+    empty_row_policy: EmptyCorrelationRowPolicy = "strongest",
+    eps: float = 1.0e-8,
+) -> Tensor:
+    """Build one absolute Close-return correlation graph per context window.
+
+    Args:
+        context_values:
+            Positive raw Close levels with shape ``[B,T,N]`` or
+            ``[B,T,N,1]``. Only the observed context is used.
+        threshold:
+            If not ``None``, absolute correlations strictly below this value
+            are removed before row normalisation. ``None`` retains every
+            non-self absolute correlation.
+        num_heads:
+            Number of graph heads. The deterministic correlation adjacency is
+            repeated across heads.
+        add_self_loops:
+            Whether the diagonal may retain its unit self-correlation.
+        empty_row_policy:
+            ``"error"`` raises when thresholding removes every eligible edge
+            in a target row. ``"strongest"`` restores that row's strongest
+            non-self absolute correlation before normalisation; a genuinely
+            zero-variance row falls back to a uniform non-self row.
+        eps:
+            Positive numerical floor used for log returns and variance tests.
+
+    Returns:
+        Row-stochastic adjacency with shape ``[B,G,N,N]`` and canonical
+        orientation ``A[target, source]``.
+    """
+    if eps <= 0.0 or not math.isfinite(float(eps)):
+        raise ValueError("eps must be finite and positive.")
+    if threshold is not None and not 0.0 <= float(threshold) <= 1.0:
+        raise ValueError("threshold must be None or lie in [0, 1].")
+    if empty_row_policy not in {"error", "strongest"}:
+        raise ValueError(
+            "empty_row_policy must be 'error' or 'strongest'."
+        )
+    if num_heads <= 0:
+        raise ValueError("num_heads must be positive.")
+
+    values = torch.as_tensor(context_values)
+    if values.ndim == 4:
+        if int(values.shape[-1]) != 1:
+            raise ValueError(
+                "A four-dimensional context_values tensor must end in one "
+                "Close channel."
+            )
+        values = values[..., 0]
+    if values.ndim != 3:
+        raise ValueError(
+            "context_values must have shape [B,T,N] or [B,T,N,1]."
+        )
+
+    batch_size, num_steps, num_nodes = (
+        int(value) for value in values.shape
+    )
+    if batch_size <= 0 or num_nodes < 2 or num_steps < 3:
+        raise ValueError(
+            "Dynamic correlation requires B>0, N>=2, and at least three "
+            "observed Close levels."
+        )
+    if not torch.isfinite(values).all():
+        raise ValueError("context_values contains non-finite values.")
+    if torch.any(values <= 0):
+        raise ValueError(
+            "Dynamic Close-return correlation requires strictly positive "
+            "raw Close levels."
+        )
+
+    # Keep the deterministic graph in float32 even under CUDA AMP. The
+    # correlation reduction itself uses float64 to reduce error over only
+    # T-1=59 return observations.
+    values64 = values.to(dtype=torch.float64)
+    log_values = torch.log(values64.clamp_min(float(eps)))
+    returns = log_values[:, 1:] - log_values[:, :-1]
+    centred = returns - returns.mean(dim=1, keepdim=True)
+
+    sum_squares = centred.square().sum(dim=1)
+    covariance_numerator = torch.einsum(
+        "btn,btm->bnm",
+        centred,
+        centred,
+    )
+    denominator = torch.sqrt(
+        sum_squares[:, :, None] * sum_squares[:, None, :]
+    )
+    valid_denominator = denominator > float(eps)
+    correlation = torch.where(
+        valid_denominator,
+        covariance_numerator / denominator.clamp_min(float(eps)),
+        torch.zeros_like(covariance_numerator),
+    ).clamp(-1.0, 1.0)
+    correlation = 0.5 * (
+        correlation + correlation.transpose(-1, -2)
+    )
+
+    absolute = correlation.abs().to(dtype=torch.float32)
+    diagonal_mask = torch.eye(
+        num_nodes,
+        dtype=torch.bool,
+        device=absolute.device,
+    ).unsqueeze(0)
+    if not add_self_loops:
+        absolute = absolute.masked_fill(diagonal_mask, 0.0)
+
+    if threshold is None:
+        retained = absolute.clone()
+    else:
+        retained = torch.where(
+            absolute >= float(threshold),
+            absolute,
+            torch.zeros_like(absolute),
+        )
+
+    if not add_self_loops:
+        retained = retained.masked_fill(diagonal_mask, 0.0)
+
+    empty_rows = retained.sum(dim=-1) <= 0
+    if torch.any(empty_rows):
+        if empty_row_policy == "error":
+            locations = torch.nonzero(empty_rows, as_tuple=False)
+            raise ValueError(
+                "The window correlation graph contains empty [batch,target] "
+                f"rows after thresholding: {locations.tolist()}."
+            )
+
+        candidates = absolute.clone()
+        if not add_self_loops:
+            candidates = candidates.masked_fill(diagonal_mask, -1.0)
+        strongest_values, strongest_sources = candidates.max(dim=-1)
+        nondegenerate = empty_rows & (strongest_values > 0)
+        if torch.any(nondegenerate):
+            batch_indices, target_indices = torch.nonzero(
+                nondegenerate,
+                as_tuple=True,
+            )
+            source_indices = strongest_sources[
+                batch_indices,
+                target_indices,
+            ]
+            retained[
+                batch_indices,
+                target_indices,
+                source_indices,
+            ] = strongest_values[batch_indices, target_indices]
+
+        # A constant-price asset has zero variance and hence zero correlation
+        # with every source. Keep the graph contract usable by falling back
+        # to a uniform distribution over eligible non-self sources.
+        degenerate = empty_rows & (strongest_values <= 0)
+        if torch.any(degenerate):
+            batch_indices, target_indices = torch.nonzero(
+                degenerate,
+                as_tuple=True,
+            )
+            uniform_weight = 1.0 / (
+                num_nodes if add_self_loops else num_nodes - 1
+            )
+            retained[batch_indices, target_indices] = uniform_weight
+            if not add_self_loops:
+                retained[
+                    batch_indices,
+                    target_indices,
+                    target_indices,
+                ] = 0.0
+
+    row_mass = retained.sum(dim=-1, keepdim=True)
+    adjacency = retained / row_mass
+    adjacency = adjacency.unsqueeze(1)
+    if num_heads > 1:
+        adjacency = adjacency.expand(
+            -1,
+            num_heads,
+            -1,
+            -1,
+        ).clone()
+    return adjacency.contiguous()
+
+
+class WindowAbsoluteCorrelationGraphLearner(nn.Module):
+    """Deterministic absolute Close-return correlation graph per window.
+
+    The graph is recomputed from each observed context. It has no trainable
+    adjacency parameters and uses no future candles. Its output is the exact
+    row-normalised graph consumed by spatial message passing.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: GraphConfig,
+        num_nodes: int,
+        threshold: float | None,
+        empty_row_policy: EmptyCorrelationRowPolicy = "strongest",
+        eps: float = 1.0e-8,
+    ) -> None:
+        super().__init__()
+        if config.type != "dynamic_correlation":
+            raise ValueError(
+                "WindowAbsoluteCorrelationGraphLearner requires "
+                "graph.type='dynamic_correlation'."
+            )
+        config.validate(num_nodes=num_nodes, d_model=1)
+        if config.activation != "softmax":
+            raise ValueError(
+                "Dynamic correlation uses direct row normalisation and "
+                "requires graph.activation='softmax' for a clear contract."
+            )
+        if threshold is not None and not 0.0 <= float(threshold) <= 1.0:
+            raise ValueError("threshold must be None or lie in [0, 1].")
+        if empty_row_policy not in {"error", "strongest"}:
+            raise ValueError(
+                "empty_row_policy must be 'error' or 'strongest'."
+            )
+        if eps <= 0.0 or not math.isfinite(float(eps)):
+            raise ValueError("eps must be finite and positive.")
+
+        self.config = config
+        self.num_nodes = int(num_nodes)
+        self.num_heads = int(config.num_heads)
+        self.threshold = (
+            None if threshold is None else float(threshold)
+        )
+        self.empty_row_policy = empty_row_policy
+        self.eps = float(eps)
+
+    def forward(
+        self,
+        context_hidden: Tensor,
+        *,
+        context_values: Tensor | None = None,
+    ) -> GraphOutput:
+        batch_size, _, _, _ = _validate_context_hidden(
+            context_hidden,
+            num_nodes=self.num_nodes,
+        )
+        if context_values is None:
+            raise ValueError(
+                "dynamic_correlation requires observed raw Close context "
+                "values for each batch."
+            )
+        if int(context_values.shape[0]) != batch_size:
+            raise ValueError(
+                "context_values batch axis differs from context_hidden."
+            )
+
+        device_type = context_hidden.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            adjacency = build_window_absolute_correlation_adjacency(
+                context_values.to(device=context_hidden.device),
+                threshold=self.threshold,
+                num_heads=self.num_heads,
+                add_self_loops=bool(self.config.add_self_loops),
+                empty_row_policy=self.empty_row_policy,
+                eps=self.eps,
+            )
+
+        output = GraphOutput(
+            selected=adjacency,
+            base=None,
+            dynamic=adjacency,
+            alpha=None,
+            logits=None,
+        )
+        output.validate(
+            batch_size=batch_size,
+            num_heads=self.num_heads,
+            num_nodes=self.num_nodes,
+        )
+        return output
+
+
 class NoGraphLearner(nn.Module):
     """No-graph provider behind the shared graph-learner interface."""
 
@@ -1694,6 +1974,11 @@ def build_graph_learner(
     correlation_empty_row_policy: (
         EmptyCorrelationRowPolicy
     ) = "error",
+    dynamic_correlation_threshold: float | None = None,
+    dynamic_correlation_empty_row_policy: (
+        EmptyCorrelationRowPolicy
+    ) = "strongest",
+    dynamic_correlation_eps: float = 1.0e-8,
     oracle_graph: Tensor | None = None,
 ) -> nn.Module:
     """Build any project graph learner behind one common interface."""
@@ -1755,6 +2040,15 @@ def build_graph_learner(
             config=config,
             num_nodes=num_nodes,
             d_model=d_model,
+        )
+
+    if config.type == "dynamic_correlation":
+        return WindowAbsoluteCorrelationGraphLearner(
+            config=config,
+            num_nodes=num_nodes,
+            threshold=dynamic_correlation_threshold,
+            empty_row_policy=dynamic_correlation_empty_row_policy,
+            eps=dynamic_correlation_eps,
         )
 
     if config.type == "dynamic_base":

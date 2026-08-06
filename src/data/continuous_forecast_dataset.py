@@ -114,6 +114,22 @@ class CumulativeLogChangeTargetAdapter:
         self.eps = float(eps)
 
     def __call__(self, example: ExampleDict) -> ExampleDict:
+        raw_context = torch.as_tensor(
+            example["x"],
+            dtype=torch.float32,
+        )
+        input_channels = list(example["input_channels"])
+        target_channels = list(example["target_channels"])
+        target_positions = torch.tensor(
+            [input_channels.index(channel) for channel in target_channels],
+            dtype=torch.long,
+            device=raw_context.device,
+        )
+        raw_context_target = raw_context.index_select(
+            2,
+            target_positions,
+        )
+
         output = self.normaliser(example)
         raw_target = torch.as_tensor(
             output["y_unnormalised"],
@@ -124,6 +140,10 @@ class CumulativeLogChangeTargetAdapter:
             dtype=torch.float32,
         )
         output = dict(output)
+        # Preserve the observed raw target-channel context for deterministic
+        # window-conditioned graph resources such as dynamic correlation.
+        # This tensor contains no future observations.
+        output["context_target_unnormalised"] = raw_context_target
         output["target_cumulative_log_change"] = (
             raw_to_cumulative_log_change(
                 raw_target,
@@ -310,6 +330,15 @@ def _cpu_smoke_test() -> None:
         raise AssertionError("Unexpected raw input shape.")
     if tuple(changed["x"].shape) != (60, 3, 5):
         raise AssertionError("Unexpected log-change input shape.")
+    for item in (raw, changed):
+        if tuple(item["context_target_unnormalised"].shape) != (60, 3, 1):
+            raise AssertionError(
+                "Unexpected raw context target shape."
+            )
+        if not torch.all(item["context_target_unnormalised"] > 0):
+            raise AssertionError(
+                "Raw context target must preserve positive Close levels."
+            )
     if not torch.equal(raw["target_indices"], changed["target_indices"]):
         raise AssertionError("Representations changed target timestamps.")
     if not torch.equal(raw["y_unnormalised"], changed["y_unnormalised"]):

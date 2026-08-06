@@ -226,9 +226,42 @@ def validate_config(config: Mapping[str, Any]) -> None:
         "fixed",
         "free_static",
         "dynamic",
+        "dynamic_correlation",
         "dynamic_base",
     }:
         raise ValueError("Unsupported graph type for continuous forecasting.")
+
+    dynamic_correlation = model.get(
+        "dynamic_correlation",
+        {
+            "threshold": None,
+            "empty_row_policy": "strongest",
+            "eps": 1.0e-8,
+        },
+    )
+    if graph_type == "dynamic_correlation":
+        threshold = dynamic_correlation.get("threshold")
+        if threshold is not None and not 0.0 <= float(threshold) <= 1.0:
+            raise ValueError(
+                "model.dynamic_correlation.threshold must be null or lie "
+                "in [0,1]."
+            )
+        if str(dynamic_correlation.get("empty_row_policy")) not in {
+            "error",
+            "strongest",
+        }:
+            raise ValueError(
+                "model.dynamic_correlation.empty_row_policy must be "
+                "'error' or 'strongest'."
+            )
+        if float(dynamic_correlation.get("eps", 0.0)) <= 0.0:
+            raise ValueError(
+                "model.dynamic_correlation.eps must be positive."
+            )
+        if str(model["graph"]["activation"]) != "softmax":
+            raise ValueError(
+                "dynamic_correlation requires graph.activation='softmax'."
+            )
 
     spatial = model["spatial"]
     if str(spatial["gate_type"]) not in {
@@ -287,6 +320,14 @@ def _model_config(
     temporal = model["temporal"]
     modern = temporal["modern_tcn"]
     graph = model["graph"]
+    dynamic_correlation = model.get(
+        "dynamic_correlation",
+        {
+            "threshold": None,
+            "empty_row_policy": "strongest",
+            "eps": 1.0e-8,
+        },
+    )
     spatial = model["spatial"]
     return ContinuousForecasterConfig(
         num_nodes=int(num_nodes),
@@ -334,6 +375,17 @@ def _model_config(
             base_graph_type=str(graph["base_graph_type"]),
             gate_type=str(graph["gate_type"]),
             initial_alpha=float(graph["initial_alpha"]),
+        ),
+        dynamic_correlation_threshold=(
+            None
+            if dynamic_correlation.get("threshold") is None
+            else float(dynamic_correlation["threshold"])
+        ),
+        dynamic_correlation_empty_row_policy=str(
+            dynamic_correlation.get("empty_row_policy", "strongest")
+        ),
+        dynamic_correlation_eps=float(
+            dynamic_correlation.get("eps", 1.0e-8)
         ),
         spatial_num_layers=int(spatial["num_layers"]),
         spatial_feedforward_multiplier=int(
@@ -717,6 +769,38 @@ def _expand_graph_component(
     return values.contiguous()
 
 
+def _graph_context_values(
+    batch: Mapping[str, Any],
+    *,
+    model: ContinuousForecaster,
+    device: torch.device,
+) -> Tensor | None:
+    """Return observed raw Close levels for dynamic correlation.
+
+    The dataset field is derived only from the 60 observed context rows.
+    Other graph types return ``None`` without transferring the extra tensor.
+    """
+    if model.config.graph.type != "dynamic_correlation":
+        return None
+    if "context_target_unnormalised" not in batch:
+        raise KeyError(
+            "The continuous dataset did not provide "
+            "context_target_unnormalised required by dynamic_correlation."
+        )
+    values = torch.as_tensor(
+        batch["context_target_unnormalised"]
+    ).to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=True,
+    )
+    if values.ndim != 4 or int(values.shape[-1]) != 1:
+        raise ValueError(
+            "context_target_unnormalised must have shape [B,T,N,1]."
+        )
+    return values[..., 0]
+
+
 def _run_train_epoch(
     *,
     model: ContinuousForecaster,
@@ -786,6 +870,11 @@ def _run_train_epoch(
                 x,
                 context_start=batch["context_start"],
                 session_length=batch["session_length"],
+                graph_context_values=_graph_context_values(
+                    batch,
+                    model=model,
+                    device=device,
+                ),
             )
         forecast_optimisation_loss, native_loss = _loss_values(
             output.predictions,
@@ -1027,6 +1116,11 @@ def _run_validation(
                     x,
                     context_start=batch["context_start"],
                     session_length=batch["session_length"],
+                    graph_context_values=_graph_context_values(
+                        batch,
+                        model=model,
+                        device=device,
+                    ),
                 )
             optimisation_loss, native_loss = _loss_values(
                 output.predictions,
@@ -1525,6 +1619,11 @@ def main() -> None:
         "cross_asset_path_before_graph": False,
         "fixed_graph_resource": (
             None if fixed_resource is None else fixed_resource.metadata()
+        ),
+        "dynamic_correlation": (
+            dict(resolved["model"].get("dynamic_correlation", {}))
+            if model_config.graph.type == "dynamic_correlation"
+            else None
         ),
         "run_signature": run_signature,
     }

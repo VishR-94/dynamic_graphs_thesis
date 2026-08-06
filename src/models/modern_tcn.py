@@ -10,7 +10,7 @@ from src.evaluation.prediction_transforms import inverse_window_normalisation
 from torch.utils.data import DataLoader
 import random
 import numpy as np
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import math
 from torch import nn
 
@@ -1680,6 +1680,18 @@ class ModernTCNBaseline:
             if self.normaliser is None
             else bool(self.normaliser.clip)
         )
+        normalisation = (
+            None
+            if self.normaliser is None
+            else {
+                "eps": float(self.normaliser.eps),
+                "clip": bool(self.normaliser.clip),
+                "clip_min": float(self.normaliser.clip_min),
+                "clip_max": float(self.normaliser.clip_max),
+                "apply_to_target": bool(self.normaliser.apply_to_target),
+                "include_stats": bool(self.normaliser.include_stats),
+            }
+        )
 
         return {
             "experiment_name": self.experiment_name,
@@ -1694,6 +1706,7 @@ class ModernTCNBaseline:
             "temporal_encoding_enabled": (self.temporal_encoding_enabled),
             "loss_space": self.loss_space,
             "normalisation_clip": normalisation_clip,
+            "normalisation": normalisation,
             "asset_cols": list(resolved_asset_cols),
             "num_assets": resolved_num_assets,
             # num_channels is retained as a legacy alias so existing
@@ -1720,9 +1733,9 @@ class ModernTCNBaseline:
             },
         }
     
+    @staticmethod
     def _normalise_checkpoint_metadata(
-        self,
-        checkpoint: dict[str, Any],
+        checkpoint: Mapping[str, Any],
     ) -> dict[str, Any]:
         """
         Add input/target metadata fields that are absent from older
@@ -1788,7 +1801,155 @@ class ModernTCNBaseline:
             )
         )
 
+        revin = bool(normalised["revin"])
+        saved_normalisation = normalised.get("normalisation")
+        if revin:
+            normalised["normalisation"] = None
+            normalised["normalisation_clip"] = None
+        else:
+            if saved_normalisation is None:
+                # Backward-compatible reconstruction for checkpoints written
+                # before the complete context-normalisation contract was
+                # embedded. These are the canonical project defaults used by
+                # all existing non-RevIN ModernTCN runs.
+                saved_normalisation = {
+                    "eps": 1.0e-8,
+                    "clip": bool(
+                        normalised.get("normalisation_clip", False)
+                    ),
+                    "clip_min": -5.0,
+                    "clip_max": 5.0,
+                    "apply_to_target": True,
+                    "include_stats": True,
+                }
+            elif not isinstance(saved_normalisation, Mapping):
+                raise TypeError(
+                    "Checkpoint normalisation metadata must be a mapping "
+                    "or None."
+                )
+            else:
+                saved_normalisation = {
+                    "eps": float(saved_normalisation.get("eps", 1.0e-8)),
+                    "clip": bool(
+                        saved_normalisation.get(
+                            "clip",
+                            normalised.get("normalisation_clip", False),
+                        )
+                    ),
+                    "clip_min": float(
+                        saved_normalisation.get("clip_min", -5.0)
+                    ),
+                    "clip_max": float(
+                        saved_normalisation.get("clip_max", 5.0)
+                    ),
+                    "apply_to_target": bool(
+                        saved_normalisation.get("apply_to_target", True)
+                    ),
+                    "include_stats": bool(
+                        saved_normalisation.get("include_stats", True)
+                    ),
+                }
+            normalised["normalisation"] = saved_normalisation
+            normalised["normalisation_clip"] = bool(
+                saved_normalisation["clip"]
+            )
+
         return normalised
+
+    @classmethod
+    def _from_checkpoint_payload(
+        cls,
+        checkpoint: Mapping[str, Any],
+    ) -> "ModernTCNBaseline":
+        """Construct the inference wrapper from saved checkpoint metadata.
+
+        This deliberately ignores the current ``forecasting.yaml`` model
+        section. The checkpoint is the authoritative description of a trained
+        ModernTCN run; the current YAML may describe a different baseline.
+        """
+        metadata = cls._normalise_checkpoint_metadata(checkpoint)
+        architecture = metadata.get("architecture")
+        if not isinstance(architecture, Mapping):
+            raise TypeError(
+                "ModernTCN checkpoint architecture must be a mapping."
+            )
+
+        revin = bool(metadata["revin"])
+        normaliser = None
+        if not revin:
+            values = metadata["normalisation"]
+            if not isinstance(values, Mapping):
+                raise TypeError(
+                    "Non-RevIN checkpoint is missing normalisation metadata."
+                )
+            normaliser = WindowContextNormaliser(
+                eps=float(values["eps"]),
+                clip=bool(values["clip"]),
+                clip_min=float(values["clip_min"]),
+                clip_max=float(values["clip_max"]),
+                apply_to_target=bool(values["apply_to_target"]),
+                include_stats=bool(values["include_stats"]),
+            )
+
+        return cls(
+            context_length=int(metadata["context_length"]),
+            horizons=[int(value) for value in metadata["horizons"]],
+            target_channels=[
+                str(value) for value in metadata["target_channels"]
+            ],
+            input_channels=[
+                str(value) for value in metadata["input_channels"]
+            ],
+            stride=int(metadata["stride"]),
+            patch_size=int(architecture["patch_size"]),
+            patch_stride=int(architecture["patch_stride"]),
+            hidden_dim=int(architecture["hidden_dim"]),
+            ffn_ratio=int(architecture["ffn_ratio"]),
+            num_blocks=int(architecture["num_blocks"]),
+            large_kernel=int(architecture["large_kernel"]),
+            small_kernel=int(architecture["small_kernel"]),
+            dropout=float(architecture["dropout"]),
+            head_dropout=float(architecture["head_dropout"]),
+            variable_layout=str(metadata["variable_layout"]),
+            revin=revin,
+            normaliser=normaliser,
+            revin_affine=bool(architecture["revin_affine"]),
+            subtract_last=bool(architecture["subtract_last"]),
+            individual_head=bool(architecture["individual_head"]),
+            use_multi_scale=bool(architecture["use_multi_scale"]),
+            small_kernel_merged=bool(architecture["small_kernel_merged"]),
+            temporal_encoding_enabled=bool(
+                metadata["temporal_encoding_enabled"]
+            ),
+        )
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: str | Path,
+        device: str | torch.device = "cpu",
+    ) -> "ModernTCNBaseline":
+        """Load any project ModernTCN checkpoint for inference.
+
+        The model input channels, target channels, layout, normalisation and
+        architecture are reconstructed from the checkpoint itself. This makes
+        inference independent of whichever ModernTCN configuration currently
+        happens to be committed in ``forecasting.yaml``.
+        """
+        resolved_path = Path(checkpoint_path).expanduser().resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(resolved_path)
+        checkpoint = torch.load(
+            resolved_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        model = cls._from_checkpoint_payload(checkpoint)
+        return model.load_checkpoint(
+            resolved_path,
+            device=device,
+            use_checkpoint_configuration=False,
+        )
 
 
     def _save_checkpoint(
@@ -1872,6 +2033,7 @@ class ModernTCNBaseline:
         checkpoint = torch.load(
             checkpoint_path,
             map_location=device,
+            weights_only=False,
         )
 
         checkpoint_metadata = (
@@ -2146,6 +2308,8 @@ class ModernTCNBaseline:
         self,
         checkpoint_path: str | Path,
         device: str | torch.device = "cpu",
+        *,
+        use_checkpoint_configuration: bool = True,
     ) -> "ModernTCNBaseline":
         """
         Load a trained ModernTCN checkpoint for inference.
@@ -2160,6 +2324,13 @@ class ModernTCNBaseline:
 
             device:
                 Device on which prediction will run.
+
+            use_checkpoint_configuration:
+                When true (the inference default), replace the wrapper's
+                current YAML-derived settings with the complete configuration
+                saved in the checkpoint before constructing the model. Set to
+                false only when the wrapper has already been reconstructed
+                from that same checkpoint.
 
         Returns:
             The current ModernTCNBaseline instance.
@@ -2186,6 +2357,7 @@ class ModernTCNBaseline:
         checkpoint = torch.load(
             checkpoint_path,
             map_location="cpu",
+            weights_only=False,
         )
 
         required_keys = {
@@ -2221,6 +2393,13 @@ class ModernTCNBaseline:
                 checkpoint
             )
         )
+
+        if use_checkpoint_configuration:
+            reconstructed = type(self)._from_checkpoint_payload(checkpoint)
+            # Public load_checkpoint is an inference API. Replacing these
+            # unresolved wrapper attributes is safe and prevents the current
+            # YAML from silently determining a different model architecture.
+            self.__dict__.update(reconstructed.__dict__)
 
         checkpoint_asset_cols = list(
             checkpoint["asset_cols"]
@@ -2282,9 +2461,8 @@ class ModernTCNBaseline:
             )
         except RuntimeError as exc:
             raise ValueError(
-                "Checkpoint weights are incompatible with the "
-                "current ModernTCN architecture. Ensure that the "
-                "config contains the selected run's architecture."
+                "Checkpoint weights are incompatible with the architecture "
+                "recorded inside the checkpoint."
             ) from exc
 
         self.model.to(resolved_device)

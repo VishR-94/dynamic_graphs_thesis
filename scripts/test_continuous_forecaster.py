@@ -23,7 +23,10 @@ from src.models.continuous_forecaster import (
     ContinuousTemporalConfig,
 )
 from src.models.dynamic_graph.contracts import GraphConfig
-from src.models.dynamic_graph.graph_learners import FixedGraphLearner
+from src.models.dynamic_graph.graph_learners import (
+    FixedGraphLearner,
+    build_window_absolute_correlation_adjacency,
+)
 from src.models.dynamic_graph.losses import (
     GraphRegularisationConfig,
     compute_graph_regularisation,
@@ -32,6 +35,7 @@ from src.training.run_continuous_forecaster import (
     _adjust_learning_rate,
     _build_optimizer,
     _current_learning_rates,
+    _graph_context_values,
     _loss_values,
     _trainable_parameter_partition,
 )
@@ -278,6 +282,118 @@ def main() -> None:
         atol=0.0,
         rtol=0.0,
     )
+    torch.testing.assert_close(
+        batch["context_target_unnormalised"],
+        log_batch["context_target_unnormalised"],
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    # Deterministic per-window absolute Close-return correlation.
+    graph_context = batch["context_target_unnormalised"][..., 0]
+    unthresholded = build_window_absolute_correlation_adjacency(
+        graph_context,
+        threshold=None,
+        num_heads=1,
+        add_self_loops=False,
+        empty_row_policy="strongest",
+    )
+    thresholded = build_window_absolute_correlation_adjacency(
+        graph_context,
+        threshold=0.18,
+        num_heads=1,
+        add_self_loops=False,
+        empty_row_policy="strongest",
+    )
+    for adjacency in (unthresholded, thresholded):
+        if tuple(adjacency.shape) != (2, 1, 4, 4):
+            raise AssertionError(
+                "Unexpected dynamic-correlation graph shape."
+            )
+        torch.testing.assert_close(
+            adjacency.sum(dim=-1),
+            torch.ones(2, 1, 4),
+            atol=1.0e-6,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            torch.diagonal(adjacency, dim1=-2, dim2=-1),
+            torch.zeros(2, 1, 4),
+            atol=0.0,
+            rtol=0.0,
+        )
+    if int((thresholded > 0).sum()) > int((unthresholded > 0).sum()):
+        raise AssertionError(
+            "Thresholding increased dynamic-correlation support."
+        )
+    if torch.allclose(
+        unthresholded[0],
+        unthresholded[1],
+        atol=1.0e-7,
+        rtol=0.0,
+    ):
+        raise AssertionError(
+            "Per-window correlation graphs did not change across windows."
+        )
+
+    dynamic_correlation_config = ContinuousForecasterConfig(
+        num_nodes=4,
+        context_length=60,
+        horizons=(1, 5, 15, 30, 60),
+        temporal=temporal,
+        graph=GraphConfig(
+            type="dynamic_correlation",
+            num_heads=1,
+            hidden_dim=16,
+            activation="softmax",
+            add_self_loops=False,
+            mtgnn_top_k=2,
+        ),
+        dynamic_correlation_threshold=0.18,
+        dynamic_correlation_empty_row_policy="strongest",
+        spatial_gate_type="learned_scalar",
+        spatial_gate_initial_beta=0.5,
+    )
+    dynamic_correlation_model = ContinuousForecaster(
+        dynamic_correlation_config
+    )
+    runner_graph_context = _graph_context_values(
+        batch,
+        model=dynamic_correlation_model,
+        device=torch.device("cpu"),
+    )
+    torch.testing.assert_close(
+        runner_graph_context,
+        graph_context,
+        atol=0.0,
+        rtol=0.0,
+    )
+    dynamic_correlation_output = dynamic_correlation_model(
+        batch["x"],
+        context_start=batch["context_start"],
+        session_length=batch["session_length"],
+        graph_context_values=runner_graph_context,
+    )
+    torch.testing.assert_close(
+        dynamic_correlation_output.graph.selected,
+        thresholded,
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        dynamic_correlation_output.graph.dynamic,
+        thresholded,
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+    if any(
+        parameter.requires_grad
+        for parameter in dynamic_correlation_model.graph_learner.parameters()
+    ):
+        raise AssertionError(
+            "Deterministic dynamic correlation unexpectedly has graph "
+            "parameters."
+        )
 
     # Asset independence before graph.
     changed_x = batch["x"].clone()
