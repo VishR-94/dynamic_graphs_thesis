@@ -246,6 +246,115 @@ def _write_continuous_run(root: Path, name: str, graph_type: str, offset: float)
     return run
 
 
+
+def _write_basedygraph_continuous_run(root: Path) -> Path:
+    """Write a one-minute BaseDyGraph run using its saved config schema."""
+
+    run = root / "continuous_basedygraph"
+    run.mkdir(parents=True)
+    graph_activations = ["softmax", "softmax", "softmax", "sparsemax"]
+    config = {
+        "runner": "src.training.run_basedygraph_sparsemax_diagnostic",
+        "model_family": "official_basedygraph_financial",
+        "forecast_strategy": "direct_one_step",
+        "basedygraph_financial": {
+            "mode": "continuous",
+            "graph_type": "dynamic_graph",
+            "graph_scope": "per_timestep",
+            "context_length": 60,
+            "prediction_length": 1,
+            "evaluation_horizons": [1],
+            "num_nodes": len(ASSETS),
+            "input_channels": 5,
+            "d_model": 96,
+            "temporal_heads": 4,
+            "temporal_layers": 1,
+            "spatial_layers": 1,
+            "ff_mult": 2,
+            "graph_heads": 1,
+            "graph_hidden_dim": 64,
+            "num_st_blocks": 4,
+            "graph_activation": "softmax",
+            "graph_activations": graph_activations,
+            "regularisation": {
+                "target_entropy": 3.0,
+                "target_entropy_weight": 1.0,
+                "temporal_smooth_weight": 0.01,
+                "direct_entropy_weight": 0.0,
+                "warmup_epochs": 5,
+            },
+        },
+        "data": {
+            "context_length": 60,
+            "model_prediction_length": 1,
+            "reported_horizons": [1],
+            "stride": 15,
+            "input_channels": ["open", "high", "low", "close", "volume"],
+            "target_channel": "close",
+        },
+        "training": {
+            "selection_metric": "test_one_minute_cumulative_log_change_mae",
+            "learning_rate": 1.0e-4,
+        },
+        "model": {
+            "output_representation": "normalised_close",
+            "num_st_blocks": 4,
+            "graph": {
+                "type": "dynamic",
+                "num_heads": 1,
+                "hidden_dim": 64,
+                "activation": "sparsemax",
+                "activations_by_layer": graph_activations,
+                "add_self_loops": False,
+            },
+            "temporal": {
+                "type": "official_basedygraph_transformer",
+                "d_model": 96,
+                "num_layers": 1,
+                "num_heads": 4,
+            },
+            "forecast_strategy": "direct_one_step",
+        },
+    }
+    _save_json(run / "resolved_config.json", config)
+    _save_json(
+        run / "run_metadata.json",
+        {
+            "status": "completed",
+            "asset_cols": list(ASSETS),
+            "best_epoch": 3,
+            "trainable_parameter_count": 4321,
+            "project_git_commit": "def",
+        },
+    )
+    _write_history(run)
+
+    prediction = _prediction_result()
+    one_minute = dict(prediction)
+    one_minute["y_pred"] = prediction["y_pred"][:, :1].clone()
+    one_minute["y_true"] = prediction["y_true"][:, :1].clone()
+    one_minute["horizons"] = [1]
+    one_minute["target_indices"] = prediction["target_indices"][:, :1].clone()
+
+    graph = _graphs("dynamic")
+    graph["per_layer"] = tuple(graph["selected"].clone() for _ in range(4))
+
+    torch.save(one_minute, run / "best_validation_predictions.pt")
+    torch.save(graph, run / "best_validation_graphs.pt")
+    _metric_table().loc[lambda frame: frame["horizon"].eq(1)].to_csv(
+        run / "best_validation_metric_table.csv", index=False
+    )
+
+    for split in ("train", "test"):
+        directory = run / "analysis" / split
+        directory.mkdir(parents=True)
+        torch.save({"epoch": 3, "prediction_result": one_minute}, directory / "predictions.pt")
+        torch.save({"epoch": 3, "graph_artifacts": graph}, directory / "graphs.pt")
+        _metric_table().loc[lambda frame: frame["horizon"].eq(1)].to_csv(
+            directory / "metric_table.csv", index=False
+        )
+    return run
+
 def _token_config() -> dict:
     return {
         "models": {
@@ -394,6 +503,7 @@ def main() -> None:
         static = _write_continuous_run(root, "continuous_static", "free_static", 1.0e-5)
         correlation = _write_continuous_run(root, "continuous_correlation", "fixed", 2.0e-5)
         token = _write_token_run(root)
+        basedygraph = _write_basedygraph_continuous_run(root)
         arbitrary = _write_continuous_run(
             root, "weighted_loss_dynamic_experiment", "dynamic", 3.0e-5
         )
@@ -417,6 +527,7 @@ def main() -> None:
             "continuous_static",
             "continuous_correlation",
             "tokenized_dynamic",
+            "continuous_basedygraph",
             "weighted_loss_dynamic_experiment",
         }
         assert resolve_model_folder("continuous_dynamic", models_root=root) == dynamic.resolve()
@@ -439,6 +550,12 @@ def main() -> None:
             policy=None,
         )
         assert train_paths.predictions.name == "predictions.pt"
+        basedygraph_info = load_evaluation_artifacts(
+            basedygraph, split="train", policy=None, require_graph=True
+        )
+        assert basedygraph_info.info.horizons == (1,)
+        assert basedygraph_info.info.graph_type == "dynamic"
+        assert len(basedygraph_info.graph_artifacts["per_layer"]) == 4
         val_alias_paths = resolve_evaluation_artifact_paths(
             dynamic,
             split="val",
@@ -470,6 +587,7 @@ def main() -> None:
             "Continuous static": static,
             "Continuous correlation": correlation,
             "Tokenized dynamic": token,
+            "Continuous BaseDyGraph": basedygraph,
         }
         policies = {"Tokenized dynamic": "auto"}
         audit = make_model_artifact_audit(models, split="validation", policies=policies)
@@ -479,8 +597,13 @@ def main() -> None:
 
         architecture = make_model_architecture_comparison(models)
         assert set(architecture.columns) == set(models)
+        assert architecture.loc["Evaluation horizons", "Continuous BaseDyGraph"] == [1]
+        assert architecture.loc["Interlaced ST blocks", "Continuous BaseDyGraph"] == 4
+        assert architecture.loc["Graph activations by layer", "Continuous BaseDyGraph"] == [
+            "softmax", "softmax", "softmax", "sparsemax"
+        ]
         metrics = make_model_metric_comparison(models, split="validation", policies=policies)
-        assert len(metrics) == len(models) * len(HORIZONS)
+        assert len(metrics) == (len(models) - 1) * len(HORIZONS) + 1
         style_model_metric_comparison(metrics, caption="test")._repr_html_()
         style_numeric_table(
             pd.DataFrame({"Text": ["x"], "Value": [1.2345]}),
@@ -574,7 +697,7 @@ def main() -> None:
             date="2024-09-03",
             window_within_date=1,
         )
-        assert len(forecast_report.values) == len(models) * len(HORIZONS)
+        assert len(forecast_report.values) == (len(models) - 1) * len(HORIZONS) + 1
         assert "10:30" in forecast_report.axes.get_title()
         forecast_report.figure.clf()
         random_forecast = plot_point_forecast_example(
@@ -586,7 +709,7 @@ def main() -> None:
             window="random",
             random_seed=9,
         )
-        assert len(random_forecast.values) == len(models) * len(HORIZONS)
+        assert len(random_forecast.values) == (len(models) - 1) * len(HORIZONS) + 1
         random_forecast.figure.clf()
 
         bundle = load_model_sampled_path_bundle(token, split="validation", policy="auto")

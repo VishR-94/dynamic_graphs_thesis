@@ -1411,7 +1411,10 @@ def _run_token_experiment(
             )
             for split, dataset in datasets.items()
         }
-        raw_train_split = _load_raw_training_split(args.data_dir)
+        raw_train_split = _load_raw_training_split(
+            args.data_dir,
+            expected_asset_cols=datasets["train"].asset_cols,
+        )
         export_scores = _token_postselection_exports(
             model=model,
             run_dir=run_dir,

@@ -4690,7 +4690,33 @@ def load_unified_run_info(run_dir: str | Path) -> UnifiedRunInfo:
     if run_kind == "continuous":
         model_values = resolved["model"]
         graph_values = model_values["graph"]
-        horizon_values = resolved["data"]["horizons"]
+
+        # Historical continuous runs store their reported horizons at
+        # ``data.horizons``.  The BaseDyGraph financial diagnostics must
+        # distinguish the model's native one-step head from the horizons
+        # reported after an autoregressive rollout, so they store the public
+        # evaluation contract at ``data.reported_horizons`` instead.  Treat
+        # both spellings as equivalent analysis metadata.  The final fallback
+        # supports the earlier BaseDyGraph financial runner, whose exact task
+        # configuration is also serialised under ``basedygraph_financial``.
+        data_values = resolved.get("data", {})
+        if not isinstance(data_values, Mapping):
+            raise TypeError("resolved_config.data must be a mapping.")
+        horizon_values = data_values.get("horizons")
+        if horizon_values is None:
+            horizon_values = data_values.get("reported_horizons")
+        if horizon_values is None:
+            basedygraph_values = resolved.get("basedygraph_financial", {})
+            if isinstance(basedygraph_values, Mapping):
+                horizon_values = basedygraph_values.get("evaluation_horizons")
+        if horizon_values is None:
+            raise KeyError(
+                "The continuous resolved configuration contains no public "
+                "evaluation horizons. Expected data.horizons, "
+                "data.reported_horizons, or "
+                "basedygraph_financial.evaluation_horizons."
+            )
+
         num_nodes = len(asset_cols)
         selection_metric = str(
             resolved.get("training", {}).get("selection_metric", "")
@@ -5977,51 +6003,92 @@ def make_unified_model_summary_table(run_dir: str | Path) -> pd.DataFrame:
 
     if info.run_kind == "continuous":
         model = resolved["model"]
-        temporal = model["temporal"]
-        modern = temporal.get("modern_tcn", {})
         graph = model["graph"]
-        spatial = model["spatial"]
-        training = resolved["training"]
-        loss = training.get("loss", {})
-        rows.extend(
-            [
-                ("Input representation", resolved["data"].get("input_representation")),
-                ("Temporal backbone", temporal.get("type")),
-                ("Hidden dimension", temporal.get("d_model")),
-                ("ModernTCN blocks", modern.get("num_blocks")),
-                ("Patch / stride", f"{modern.get('patch_size')} / {modern.get('patch_stride')}"),
-                ("Large / small kernel", f"{modern.get('large_kernel')} / {modern.get('small_kernel')}"),
-                ("ModernTCN FFN ratio", modern.get("ffn_ratio")),
-                ("Graph type", graph.get("type")),
-                ("Graph heads", graph.get("num_heads")),
-                ("Graph hidden dimension", graph.get("hidden_dim")),
-                ("Spatial layers", spatial.get("num_layers")),
-                ("Spatial gate", spatial.get("gate_type")),
-                ("Initial spatial beta", spatial.get("initial_beta")),
-                ("Output representation", model.get("output_representation")),
-                ("Training loss", loss.get("type")),
-                ("Backbone learning rate", training.get("learning_rate")),
-                ("Graph learning rate", training.get("graph_learning_rate")),
-            ]
-        )
-        if str(graph.get("type")) == "dynamic_correlation":
-            dynamic_correlation = model.get("dynamic_correlation", {})
+        training = resolved.get("training", {})
+        basedygraph = resolved.get("basedygraph_financial")
+
+        if isinstance(basedygraph, Mapping):
+            regularisation = basedygraph.get("regularisation", {})
+            if not isinstance(regularisation, Mapping):
+                regularisation = {}
+            activations = basedygraph.get("graph_activations")
+            if activations is None:
+                activation = basedygraph.get(
+                    "graph_activation", graph.get("activation")
+                )
+                activations = [activation] * int(
+                    basedygraph.get(
+                        "num_st_blocks", model.get("num_st_blocks", 1)
+                    )
+                )
             rows.extend(
                 [
-                    (
-                        "Dynamic-correlation threshold",
-                        dynamic_correlation.get("threshold"),
-                    ),
-                    (
-                        "Dynamic-correlation empty-row policy",
-                        dynamic_correlation.get("empty_row_policy"),
-                    ),
-                    (
-                        "Dynamic-correlation epsilon",
-                        dynamic_correlation.get("eps"),
-                    ),
+                    ("Input representation", "context-normalised OHLCV"),
+                    ("Temporal backbone", "official BaseDyGraph Transformer"),
+                    ("Hidden dimension", basedygraph.get("d_model")),
+                    ("Interlaced ST blocks", basedygraph.get("num_st_blocks")),
+                    ("Temporal layers per block", basedygraph.get("temporal_layers")),
+                    ("Temporal attention heads", basedygraph.get("temporal_heads")),
+                    ("Temporal FF multiplier", basedygraph.get("ff_mult")),
+                    ("Graph type", graph.get("type", basedygraph.get("graph_type"))),
+                    ("Graph scope", basedygraph.get("graph_scope")),
+                    ("Graph heads", basedygraph.get("graph_heads", graph.get("num_heads"))),
+                    ("Graph hidden dimension", basedygraph.get("graph_hidden_dim", graph.get("hidden_dim"))),
+                    ("Graph activations by layer", list(activations)),
+                    ("Spatial layers per block", basedygraph.get("spatial_layers")),
+                    ("Forecast strategy", resolved.get("forecast_strategy", model.get("forecast_strategy"))),
+                    ("Model prediction length", basedygraph.get("prediction_length")),
+                    ("Output representation", model.get("output_representation")),
+                    ("Target graph entropy", regularisation.get("target_entropy")),
+                    ("Target-entropy weight", regularisation.get("target_entropy_weight")),
+                    ("Temporal-smoothness weight", regularisation.get("temporal_smooth_weight")),
+                    ("Backbone learning rate", training.get("learning_rate")),
                 ]
             )
+        else:
+            temporal = model["temporal"]
+            modern = temporal.get("modern_tcn", {})
+            spatial = model["spatial"]
+            loss = training.get("loss", {})
+            rows.extend(
+                [
+                    ("Input representation", resolved["data"].get("input_representation")),
+                    ("Temporal backbone", temporal.get("type")),
+                    ("Hidden dimension", temporal.get("d_model")),
+                    ("ModernTCN blocks", modern.get("num_blocks")),
+                    ("Patch / stride", f"{modern.get('patch_size')} / {modern.get('patch_stride')}"),
+                    ("Large / small kernel", f"{modern.get('large_kernel')} / {modern.get('small_kernel')}"),
+                    ("ModernTCN FFN ratio", modern.get("ffn_ratio")),
+                    ("Graph type", graph.get("type")),
+                    ("Graph heads", graph.get("num_heads")),
+                    ("Graph hidden dimension", graph.get("hidden_dim")),
+                    ("Spatial layers", spatial.get("num_layers")),
+                    ("Spatial gate", spatial.get("gate_type")),
+                    ("Initial spatial beta", spatial.get("initial_beta")),
+                    ("Output representation", model.get("output_representation")),
+                    ("Training loss", loss.get("type")),
+                    ("Backbone learning rate", training.get("learning_rate")),
+                    ("Graph learning rate", training.get("graph_learning_rate")),
+                ]
+            )
+            if str(graph.get("type")) == "dynamic_correlation":
+                dynamic_correlation = model.get("dynamic_correlation", {})
+                rows.extend(
+                    [
+                        (
+                            "Dynamic-correlation threshold",
+                            dynamic_correlation.get("threshold"),
+                        ),
+                        (
+                            "Dynamic-correlation empty-row policy",
+                            dynamic_correlation.get("empty_row_policy"),
+                        ),
+                        (
+                            "Dynamic-correlation epsilon",
+                            dynamic_correlation.get("eps"),
+                        ),
+                    ]
+                )
     else:
         model = resolved["models"]["dynamic_graph"]
         temporal = model["temporal"]
@@ -7043,7 +7110,14 @@ def plot_training_diagnostics(
 
     train_column = _first_existing_column(
         history,
-        ("train_token_loss", "training_loss", "train_loss", "training_native_loss"),
+        (
+            "train_token_loss",
+            "training_loss",
+            "train_loss",
+            "training_native_loss",
+            "training_native_log_mae",
+            "training_objective_loss",
+        ),
     )
     validation_column = _first_existing_column(
         history,
@@ -7051,7 +7125,12 @@ def plot_training_diagnostics(
     )
     entropy_column = _first_existing_column(
         history,
-        ("validation_graph_mean_row_entropy", "graph_mean_row_entropy"),
+        (
+            "validation_graph_mean_row_entropy",
+            "graph_mean_row_entropy",
+            "test_graph_mean_row_entropy",
+            "training_graph_mean_row_entropy",
+        ),
     )
     beta_column = _first_existing_column(history, ("spatial_beta", "validation_spatial_beta"))
 
@@ -7475,10 +7554,10 @@ def plot_point_forecast_comparison(
 
     figure, axes = plt.subplots(figsize=figsize)
     records: list[dict[str, Any]] = []
-    reference_truth: Tensor | None = None
+    reference_truth_by_horizon: dict[int, float] = {}
     reference_last: float | None = None
     reference_window: pd.DataFrame | None = None
-    reference_horizons: tuple[int, ...] | None = None
+    reference_origin: int | None = None
 
     for label, model in models.items():
         policy = None if policies is None else policies.get(label)
@@ -7513,17 +7592,33 @@ def plot_point_forecast_comparison(
                 window_index, asset_index, 0
             ].item()
         )
-        if reference_truth is None:
-            reference_truth = truth
+        current_origin = row.get("Origin index")
+        current_origin = None if pd.isna(current_origin) else int(current_origin)
+        if reference_window is None:
             reference_last = last
             reference_window = table.loc[[row.name]].copy()
-            reference_horizons = artifacts.info.horizons
+            reference_origin = current_origin
         else:
-            torch.testing.assert_close(truth, reference_truth, atol=1.0e-6, rtol=0.0)
+            if current_origin != reference_origin:
+                raise ValueError(
+                    "Models selected different forecast origins for the same "
+                    "date/window request. Compare an exact common origin."
+                )
             if abs(last - float(reference_last)) > 1.0e-6:
                 raise ValueError("Models do not share the same last observed Close.")
 
         horizons = np.asarray(artifacts.info.horizons, dtype=int)
+        for horizon, actual in zip(horizons, truth, strict=True):
+            horizon_value = int(horizon)
+            actual_value = float(actual.item())
+            previous = reference_truth_by_horizon.get(horizon_value)
+            if previous is not None and abs(actual_value - previous) > 1.0e-6:
+                raise ValueError(
+                    f"Models disagree on the realised Close at horizon "
+                    f"{horizon_value}."
+                )
+            reference_truth_by_horizon[horizon_value] = actual_value
+
         axes.plot(horizons, prediction.numpy(), marker="o", label=str(label))
         for horizon, pred, actual in zip(horizons, prediction, truth, strict=True):
             records.append(
@@ -7543,13 +7638,22 @@ def plot_point_forecast_comparison(
             )
 
     assert (
-        reference_truth is not None
+        reference_truth_by_horizon
         and reference_last is not None
         and reference_window is not None
-        and reference_horizons is not None
     )
-    horizons = np.asarray(reference_horizons, dtype=int)
-    axes.plot(horizons, reference_truth.numpy(), marker="o", linewidth=2.5, label="Truth")
+    truth_horizons = np.asarray(sorted(reference_truth_by_horizon), dtype=int)
+    truth_values = np.asarray(
+        [reference_truth_by_horizon[int(value)] for value in truth_horizons],
+        dtype=float,
+    )
+    axes.plot(
+        truth_horizons,
+        truth_values,
+        marker="o",
+        linewidth=2.5,
+        label="Truth",
+    )
     axes.scatter([0], [reference_last], color="black", label="Last observed Close")
     time_label = str(reference_window.iloc[0]["Time window"])
     axes.set_title(
@@ -8219,7 +8323,14 @@ def analyse_training_history(
 
     train_column = _first_existing_column(
         history,
-        ("train_token_loss", "training_loss", "train_loss", "training_native_loss"),
+        (
+            "train_token_loss",
+            "training_loss",
+            "train_loss",
+            "training_native_loss",
+            "training_native_log_mae",
+            "training_objective_loss",
+        ),
     )
     validation_column = _first_existing_column(
         history,
@@ -8227,7 +8338,12 @@ def analyse_training_history(
     )
     entropy_column = _first_existing_column(
         history,
-        ("validation_graph_mean_row_entropy", "graph_mean_row_entropy"),
+        (
+            "validation_graph_mean_row_entropy",
+            "graph_mean_row_entropy",
+            "test_graph_mean_row_entropy",
+            "training_graph_mean_row_entropy",
+        ),
     )
     beta_column = _first_existing_column(
         history,

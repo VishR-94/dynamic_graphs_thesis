@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """CPU contracts for the four BaseDyGraph sparsemax diagnostics."""
 
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -260,6 +261,31 @@ def _assert_graph_rows(graph: Tensor) -> None:
     assert torch.allclose(graph.sum(dim=-1), expected, atol=1.0e-5)
 
 
+
+def test_raw_training_split_call_contract() -> None:
+    """The token post-selection export must validate raw/token asset order."""
+    repository_root = Path(__file__).resolve().parents[1]
+    runner_path = (
+        repository_root
+        / "src"
+        / "training"
+        / "run_basedygraph_sparsemax_diagnostic.py"
+    )
+    module = ast.parse(runner_path.read_text(encoding="utf-8"))
+    matching_calls = []
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if isinstance(function, ast.Name) and function.id == "_load_raw_training_split":
+            matching_calls.append(node)
+
+    assert len(matching_calls) == 1
+    call = matching_calls[0]
+    keyword_names = {keyword.arg for keyword in call.keywords}
+    assert "expected_asset_cols" in keyword_names
+
+
 def test_spec_contract() -> None:
     assert len(EXPERIMENT_SPECS) == 4
     assert PHASE1_EXPERIMENTS == (
@@ -499,6 +525,7 @@ def test_real_official_integration_if_available() -> None:
 
 
 def main() -> None:
+    test_raw_training_split_call_contract()
     test_spec_contract()
     test_serialisation_compatibility()
     test_teacher_forced_one_step_contract()
