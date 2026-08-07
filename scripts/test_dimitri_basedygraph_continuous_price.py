@@ -74,6 +74,23 @@ def _test_dataset_contract() -> None:
     assert tuple(item["close_std"].shape) == (93,)
     assert torch.count_nonzero(values[..., 5]) == 0
 
+    summary = dataset.summary()
+    assert summary.split == "train"
+    assert summary.split_mode == "canonical"
+    assert summary.sessions == 1
+    assert summary.windows == 4
+    assert summary.assets == 93
+    assert summary.channels == 6
+    assert summary.context_length == 4
+    assert summary.continuation_length == 2
+    assert summary.sequence_length == 6
+    assert summary.stride == 2
+    assert summary.windows_per_session_min == 4
+    assert summary.windows_per_session_max == 4
+    assert summary.first_date == "2024-01-02"
+    assert summary.last_date == "2024-01-02"
+    assert summary.to_dict()["Windows"] == 4
+
     # First four rows are normalised with their own sample mean/std.
     context = values[:, :4]
     torch.testing.assert_close(

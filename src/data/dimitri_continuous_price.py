@@ -18,6 +18,7 @@ is used to predict Close at ``t+1``; the public one-minute forecast is the
 transition from position ``C-1`` to ``C``.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -40,6 +41,44 @@ from src.data.dimitri_token_price import (
 DIMITRI_CONTINUOUS_PRICE_CONTRACT = (
     "dimitri_basedygraph_v2_continuous_input_direct_price_v1"
 )
+
+
+@dataclass(frozen=True)
+class DimitriContinuousPriceDatasetSummary:
+    """Small serialisable description used by notebook preflight tables."""
+
+    split: str
+    split_mode: str
+    sessions: int
+    windows: int
+    assets: int
+    channels: int
+    context_length: int
+    continuation_length: int
+    sequence_length: int
+    stride: int
+    windows_per_session_min: int
+    windows_per_session_max: int
+    first_date: str
+    last_date: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "Split": self.split,
+            "Split mode": self.split_mode,
+            "Sessions": self.sessions,
+            "Windows": self.windows,
+            "Assets": self.assets,
+            "Channels": self.channels,
+            "Context length": self.context_length,
+            "Continuation length": self.continuation_length,
+            "Sequence length": self.sequence_length,
+            "Stride": self.stride,
+            "Windows/session min": self.windows_per_session_min,
+            "Windows/session max": self.windows_per_session_max,
+            "First date": self.first_date,
+            "Last date": self.last_date,
+        }
 
 
 class DimitriContinuousPriceDataset(Dataset[dict[str, Any]]):
@@ -127,6 +166,32 @@ class DimitriContinuousPriceDataset(Dataset[dict[str, Any]]):
 
     def __len__(self) -> int:
         return len(self.sample_indices)
+
+    def summary(self) -> DimitriContinuousPriceDatasetSummary:
+        """Return the split/window contract without materialising any items."""
+        windows_per_session = [
+            len(exact_window_starts(int(values.shape[0]), self.spec))
+            for values in self.clean_sessions
+        ]
+        if not windows_per_session:
+            raise RuntimeError(f"{self.split_name} contains no clean sessions.")
+        dates = sorted(self.session_dates)
+        return DimitriContinuousPriceDatasetSummary(
+            split=self.split_name,
+            split_mode=self.split_mode,
+            sessions=len(self.clean_sessions),
+            windows=len(self),
+            assets=len(self.asset_cols),
+            channels=len(self.channels),
+            context_length=int(self.spec.context_length),
+            continuation_length=int(self.spec.continuation_length),
+            sequence_length=int(self.spec.sequence_length),
+            stride=int(self.spec.stride),
+            windows_per_session_min=min(windows_per_session),
+            windows_per_session_max=max(windows_per_session),
+            first_date=dates[0],
+            last_date=dates[-1],
+        )
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample_index = int(self.sample_indices[index])
