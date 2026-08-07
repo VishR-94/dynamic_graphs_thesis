@@ -582,6 +582,48 @@ def main() -> None:
         )
         assert test.split == "test"
 
+        # V2 graph artefacts are deliberately stored in FP16.  Even an
+        # exactly uniform row acquires a deterministic >2e-4 row-sum error
+        # after that cast.  The loader must accept only this bounded storage
+        # drift, convert to FP32 and restore exact stochastic rows.
+        quantized_root = Path(temporary) / "quantized_models"
+        quantized_root.mkdir()
+        quantized = _write_continuous_run(
+            quantized_root,
+            "float16_graph",
+            "dynamic",
+            0.0,
+        )
+        graph_path = quantized / "best_validation_graphs.pt"
+        graph_payload = torch.load(
+            graph_path, map_location="cpu", weights_only=False
+        )
+        half_graph = torch.full(
+            (len(DATES), 1, len(ASSETS), len(ASSETS)),
+            1.0 / len(ASSETS),
+            dtype=torch.float16,
+        )
+        assert float(
+            (half_graph.float().sum(dim=-1) - 1.0).abs().max()
+        ) > 2.0e-4
+        graph_payload["selected"] = half_graph
+        graph_payload["dynamic"] = half_graph
+        graph_payload["per_layer"] = (half_graph,)
+        torch.save(graph_payload, graph_path)
+        quantized_loaded = load_evaluation_artifacts(
+            quantized,
+            split="validation",
+            require_graph=True,
+        )
+        quantized_selected = quantized_loaded.graph_artifacts["selected"]
+        assert quantized_selected.dtype == torch.float32
+        torch.testing.assert_close(
+            quantized_selected.sum(dim=-1),
+            torch.ones_like(quantized_selected.sum(dim=-1)),
+            atol=1.0e-6,
+            rtol=0.0,
+        )
+
         models = {
             "Continuous dynamic": dynamic,
             "Continuous static": static,

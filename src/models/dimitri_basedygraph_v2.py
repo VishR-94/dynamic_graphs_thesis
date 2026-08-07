@@ -391,6 +391,182 @@ def instantiate_dimitri_token_to_price_model(
     return DimitriV2TokenToPriceForecaster(config_overrides=config_overrides)
 
 
+DIMITRI_CONTINUOUS_PRICE_CONTRACT = (
+    "dimitri_basedygraph_v2_continuous_input_direct_price_v1"
+)
+# Exact count for the default six-channel input adapter.  This replaces the
+# 1024 x 96 discrete state embedding with Linear(6,96), leaving every temporal,
+# graph, spatial and output-head parameter unchanged.
+DIMITRI_CONTINUOUS_PRICE_EXPECTED_PARAMETER_COUNT = 930_258
+
+
+class _DimitriV2ContinuousBackbone(nn.Module):
+    """Dimitri's exact four-block V2 backbone with continuous state inputs.
+
+    The unchanged external backbone is instantiated to obtain the exact
+    interlaced ST blocks, normalisation layers, node embedding, graph scorers,
+    slow/fast fusion, trainable base logits and spatial message paths.  Its
+    discrete ``Embedding(1024,96)`` is removed and replaced by a project-side
+    ``Linear(C,96)`` adapter.
+
+    The projected continuous state ``e`` plays exactly the role of Dimitri's
+    raw token embedding: it is added to the node embedding at the input and is
+    passed directly to every graph scorer and every spatial value projection
+    because the saved V2 configuration uses ``scorer_value='concat'`` and
+    ``spatial_value='concat'``.
+    """
+
+    def __init__(
+        self,
+        cfg: Any,
+        *,
+        input_channels: int = 6,
+        reference_backbone: nn.Module | None = None,
+    ) -> None:
+        super().__init__()
+        if input_channels <= 0:
+            raise ValueError("input_channels must be positive.")
+        if bool(getattr(cfg, "use_state_pair_bias", False)):
+            raise ValueError(
+                "Continuous inputs do not define discrete state-pair IDs; "
+                "use_state_pair_bias must remain false."
+            )
+
+        if reference_backbone is None:
+            imported = import_dimitri_basedygraph()
+            reference = imported["DiscreteSTGraphBackbone"](cfg)
+        else:
+            reference = reference_backbone
+        if not reference.use_interlaced or len(reference.st_blocks) != 4:
+            raise AssertionError("Expected Dimitri's four interlaced ST blocks.")
+
+        # Remove the unused discrete embedding from the registered parameter
+        # tree. All other source modules remain byte-for-byte unchanged.
+        reference.state_embedding = nn.Identity()
+
+        self.cfg = cfg
+        self.input_channels = int(input_channels)
+        self.input_projection = nn.Linear(self.input_channels, int(cfg.d_model))
+        self.reference = reference
+
+    @property
+    def st_blocks(self) -> nn.ModuleList:
+        """Expose source ST blocks for prior initialisation and diagnostics."""
+        return self.reference.st_blocks
+
+    def forward(self, continuous_values: torch.Tensor) -> dict[str, Any]:
+        if continuous_values.ndim != 4:
+            raise ValueError(
+                "continuous_values must have shape [B,N,T,C], got "
+                f"{tuple(continuous_values.shape)}."
+            )
+        b, n, t, channels = continuous_values.shape
+        if n != int(self.cfg.num_nodes):
+            raise ValueError(
+                f"Expected num_nodes={self.cfg.num_nodes}, got {n}."
+            )
+        if channels != self.input_channels:
+            raise ValueError(
+                f"Expected {self.input_channels} continuous channels, got "
+                f"{channels}."
+            )
+        if not torch.is_floating_point(continuous_values):
+            raise TypeError("continuous_values must be floating point.")
+
+        # Raw continuous state representation, analogous to the token lookup
+        # e_{b,t,i}. The dataset provides [B,N,T,C].
+        e_bntd = self.input_projection(continuous_values)
+        e_btnd = e_bntd.permute(0, 2, 1, 3).contiguous()
+
+        h_bntd = e_bntd
+        if self.reference.node_embedding is not None:
+            node_ids = torch.arange(n, device=continuous_values.device)
+            h_bntd = h_bntd + self.reference.node_embedding(node_ids).view(
+                1, n, 1, int(self.cfg.d_model)
+            )
+        h_btnd = self.reference.pre_norm(h_bntd).permute(0, 2, 1, 3).contiguous()
+
+        # The unchanged scorer signature accepts state IDs for the optional
+        # state-pair bias. x0jhc0tx has that bias disabled, so a zero placeholder
+        # is semantically inert and is asserted above.
+        dummy_state_ids = torch.zeros(
+            b,
+            n,
+            t,
+            dtype=torch.long,
+            device=continuous_values.device,
+        )
+
+        block_attns: list[torch.Tensor | None] = []
+        for block in self.reference.st_blocks:
+            h_btnd, attention = block(
+                h_btnd,
+                dummy_state_ids,
+                e_btnd,
+                regimes=None,
+                oracle_regime_graphs=None,
+            )
+            block_attns.append(attention)
+
+        spatial = self.reference.post_norm(h_btnd)
+        return {
+            "temporal_repr": h_btnd,
+            "spatial_repr": spatial,
+            "graph_attn": self.reference._select_graph_attn(block_attns),
+            "block_graph_attns": block_attns,
+        }
+
+
+class DimitriV2ContinuousToPriceForecaster(nn.Module):
+    """Continuous OHLCVA in, direct next-Close out, with exact V2 ST blocks."""
+
+    def __init__(
+        self,
+        *,
+        input_channels: int = 6,
+        config_overrides: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        config_values = _json_copy(DIMITRI_X0_CONFIG)
+        if config_overrides:
+            unknown = sorted(set(config_overrides).difference(config_values))
+            if unknown:
+                raise KeyError(f"Unknown Dimitri V2 config overrides: {unknown}")
+            config_values.update(_json_copy(dict(config_overrides)))
+        imported = import_dimitri_basedygraph()
+        self.cfg = imported["ModelConfig"](**config_values)
+
+        # Build the unchanged reference backbone and output head in exactly the
+        # same RNG order as DimitriV2TokenToPriceForecaster.  The new continuous
+        # input projection is created only afterwards, so all shared backbone and
+        # head parameters have identical initial values under the same seed.
+        reference = imported["DiscreteSTGraphBackbone"](self.cfg)
+        self.next_close_head = nn.Linear(int(self.cfg.d_model), 1)
+        self.backbone = _DimitriV2ContinuousBackbone(
+            self.cfg,
+            input_channels=input_channels,
+            reference_backbone=reference,
+        )
+
+    def forward(self, continuous_values: torch.Tensor) -> dict[str, Any]:
+        output = self.backbone(continuous_values)
+        output["next_close_normalised"] = self.next_close_head(
+            output["spatial_repr"][:, :-1]
+        )
+        return output
+
+
+def instantiate_dimitri_continuous_to_price_model(
+    *,
+    input_channels: int = 6,
+    config_overrides: Mapping[str, Any] | None = None,
+) -> DimitriV2ContinuousToPriceForecaster:
+    return DimitriV2ContinuousToPriceForecaster(
+        input_channels=input_channels,
+        config_overrides=config_overrides,
+    )
+
+
 def build_sector_prior(
     asset_cols: Sequence[str],
     company_profiles_path: str | Path,

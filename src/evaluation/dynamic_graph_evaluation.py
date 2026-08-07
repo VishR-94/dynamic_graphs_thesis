@@ -4891,6 +4891,24 @@ def _validate_prediction_result(
     return windows
 
 
+def _saved_graph_row_sum_tolerance(dtype: torch.dtype) -> float:
+    """Return a storage-dtype-aware row-sum tolerance.
+
+    Large Dimitri V2 graph artefacts are intentionally stored in ``float16``
+    to keep the train/validation/test exports tractable.  A row that was
+    exactly stochastic in FP32 can differ from one by a few times ``1e-4``
+    after that storage cast.  Only that bounded quantisation drift is accepted;
+    downstream loaders renormalise accepted rows in FP32 before calculating
+    entropy, sector mass or connection summaries.
+    """
+
+    if dtype == torch.float16:
+        return 1.0e-3
+    if dtype == torch.bfloat16:
+        return 1.0e-2
+    return 2.0e-4
+
+
 def _validate_graph_artifacts(
     graph_artifacts: Mapping[str, Any],
     info: UnifiedRunInfo,
@@ -4928,7 +4946,7 @@ def _validate_graph_artifacts(
         if not torch.allclose(
             row_sums,
             torch.ones_like(row_sums),
-            atol=2.0e-4,
+            atol=_saved_graph_row_sum_tolerance(tensor.dtype),
             rtol=0.0,
         ):
             maximum_error = float((row_sums - 1.0).abs().max().item())
@@ -4973,7 +4991,15 @@ def load_analysis_artifacts(
     )
 
     windows = _validate_prediction_result(prediction_result, info)
-    _validate_graph_artifacts(graph_artifacts, info, windows)
+    # Use the same normalising path as the current Graph Hub API.  This
+    # converts storage-compressed FP16 graphs to FP32 and corrects only the
+    # tiny row-sum drift introduced by serialisation.
+    graph_artifacts = _normalise_graph_payload(
+        graph_artifacts,
+        info=info,
+        prediction_result=prediction_result,
+        windows=windows,
+    )
 
     if prediction_epoch is not None and graph_epoch is not None:
         if prediction_epoch != graph_epoch:
@@ -6671,7 +6697,9 @@ def _normalise_saved_graph_tensor(
     expected_heads: int,
     name: str,
 ) -> Tensor:
-    tensor = torch.as_tensor(values).detach().cpu().float()
+    saved_tensor = torch.as_tensor(values).detach().cpu()
+    saved_dtype = saved_tensor.dtype
+    tensor = saved_tensor.float()
     if tensor.ndim == 2:
         if tuple(tensor.shape) != (nodes, nodes):
             raise ValueError(f"Graph component {name!r} has wrong node shape.")
@@ -6703,17 +6731,25 @@ def _normalise_saved_graph_tensor(
     if (tensor < -1.0e-7).any():
         raise ValueError(f"Graph component {name!r} contains negative weights.")
     row_sums = tensor.sum(dim=-1)
+    if (row_sums <= 0.0).any():
+        raise ValueError(f"Graph component {name!r} contains an empty row.")
+    tolerance = _saved_graph_row_sum_tolerance(saved_dtype)
     if not torch.allclose(
         row_sums,
         torch.ones_like(row_sums),
-        atol=2.0e-4,
+        atol=tolerance,
         rtol=0.0,
     ):
         maximum_error = float((row_sums - 1.0).abs().max().item())
         raise ValueError(
             f"Graph component {name!r} is not row-stochastic; maximum "
-            f"row-sum error={maximum_error:.3e}."
+            f"row-sum error={maximum_error:.3e} exceeds the "
+            f"{saved_dtype} storage tolerance {tolerance:.1e}."
         )
+
+    # Accepted storage drift is quantisation, not model behaviour.  Restore
+    # exact FP32 row stochasticity before all downstream graph calculations.
+    tensor = tensor / row_sums.unsqueeze(-1)
     return tensor.contiguous()
 
 
