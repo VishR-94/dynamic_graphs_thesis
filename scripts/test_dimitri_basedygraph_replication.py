@@ -47,7 +47,7 @@ class FakeTokenizer:
 
 def test_source_and_architecture() -> None:
     hashes = verify_dimitri_source_snapshot()
-    assert set(hashes) == {"model.py", "modules.py", "utilities.py", "data_module.py"}
+    assert set(hashes) == {"model.py", "modules.py", "utilities.py", "data_module.py", "sector_prior.py"}
 
     model = instantiate_exact_x0_model()
     assert parameter_count(model) == DIMITRI_X0_EXPECTED_PARAMETER_COUNT

@@ -11,13 +11,14 @@ process and verifies every source hash first.
 
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 import hashlib
 import importlib
 import json
 import sys
 
 import torch
+from torch import nn
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -28,6 +29,7 @@ DIMITRI_SOURCE_HASHES = {
     "modules.py": "1bd31701b300f6f805dfc53530c66eedd9265620093223d3302e3e74409b51ff",
     "utilities.py": "cfe849e2963386ddaab15ad7c89e7df92fc957f22c15f45ea40c89ec4c82f40a",
     "data_module.py": "ecfbe768a1e2c0840043ecf640295b425106843f27062184307534312136cac1",
+    "sector_prior.py": "7ecd77eb38865acce0dea2d8986d2b0201f4bf9be967845ab1bebd9168fe5919",
 }
 
 DIMITRI_X0_CHECKPOINT_SHA256 = (
@@ -150,7 +152,7 @@ def import_dimitri_basedygraph() -> dict[str, Any]:
         sys.path.remove(source_root)
     sys.path.insert(0, source_root)
 
-    for name in ("model", "modules", "utilities", "data_module"):
+    for name in ("model", "modules", "utilities", "data_module", "sector_prior"):
         existing = sys.modules.get(name)
         if existing is None:
             continue
@@ -162,12 +164,14 @@ def import_dimitri_basedygraph() -> dict[str, Any]:
     modules = importlib.import_module("modules")
     model = importlib.import_module("model")
     data_module = importlib.import_module("data_module")
+    sector_prior = importlib.import_module("sector_prior")
 
     loaded = {
         "utilities": utilities,
         "modules": modules,
         "model": model,
         "data_module": data_module,
+        "sector_prior": sector_prior,
     }
     root = DIMITRI_SOURCE_ROOT.resolve()
     for name, module in loaded.items():
@@ -177,8 +181,10 @@ def import_dimitri_basedygraph() -> dict[str, Any]:
 
     return {
         "ModelConfig": utilities.ModelConfig,
+        "DiscreteSTGraphBackbone": model.DiscreteSTGraphBackbone,
         "DiscreteSTGraphLightningModule": model.DiscreteSTGraphLightningModule,
         "DiscreteStateDataModule": data_module.DiscreteStateDataModule,
+        "sector_prior_module": sector_prior,
         "model_module": model,
         "modules_module": modules,
     }
@@ -323,3 +329,254 @@ def checkpoint_contract_summary(checkpoint_path: str | Path) -> dict[str, Any]:
         "per_block": resolved_per_block_contract(model.cfg),
         "dynamic_alphas": extract_dynamic_alphas(model),
     }
+
+# ---------------------------------------------------------------------------
+# Direct-price adapter and graph-prior utilities
+# ---------------------------------------------------------------------------
+
+DIMITRI_TOKEN_PRICE_CONTRACT = "dimitri_basedygraph_v2_token_to_price_v1"
+DIMITRI_TOKEN_PRICE_EXPECTED_PARAMETER_COUNT = 1_027_890
+
+
+class DimitriV2TokenToPriceForecaster(nn.Module):
+    """Exact Dimitri V2 context backbone with a scalar next-Close head.
+
+    The four interlaced ST blocks are unchanged from ``x0jhc0tx``.  The only
+    architectural change is the output head:
+
+    ``Linear(96, 1024)`` next-token logits
+        -> ``Linear(96, 1)`` next normalised Close.
+
+    The head is applied at every sequence position except the final one, so the
+    model can be trained with the same dense teacher-forced one-step objective
+    as Dimitri's token classifier while being evaluated at one chosen forecast
+    origin.
+    """
+
+    def __init__(
+        self,
+        *,
+        config_overrides: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        imported = import_dimitri_basedygraph()
+        config_values = _json_copy(DIMITRI_X0_CONFIG)
+        if config_overrides:
+            unknown = sorted(set(config_overrides).difference(config_values))
+            if unknown:
+                raise KeyError(f"Unknown Dimitri V2 config overrides: {unknown}")
+            config_values.update(_json_copy(dict(config_overrides)))
+        self.cfg = imported["ModelConfig"](**config_values)
+        self.backbone = imported["DiscreteSTGraphBackbone"](self.cfg)
+        self.next_close_head = nn.Linear(int(self.cfg.d_model), 1)
+
+    def forward(self, state_ids: torch.Tensor) -> dict[str, Any]:
+        if state_ids.ndim != 3:
+            raise ValueError(
+                "state_ids must have shape [B,N,T], got "
+                f"{tuple(state_ids.shape)}."
+            )
+        output = self.backbone(state_ids)
+        spatial = output["spatial_repr"]
+        # Representation at position t predicts the raw candle at t+1 after
+        # inverse normalisation in the runner.
+        output["next_close_normalised"] = self.next_close_head(spatial[:, :-1])
+        return output
+
+
+def instantiate_dimitri_token_to_price_model(
+    *,
+    config_overrides: Mapping[str, Any] | None = None,
+) -> DimitriV2TokenToPriceForecaster:
+    return DimitriV2TokenToPriceForecaster(config_overrides=config_overrides)
+
+
+def build_sector_prior(
+    asset_cols: Sequence[str],
+    company_profiles_path: str | Path,
+    *,
+    level: str = "sector",
+    self_loops: bool = False,
+    off_block: float = 0.0,
+) -> tuple[torch.Tensor, list[str]]:
+    """Build Dimitri's exact row-normalised block prior."""
+    if level not in {"sector", "industry"}:
+        raise ValueError("level must be 'sector' or 'industry'.")
+    imported = import_dimitri_basedygraph()
+    prior, labels = imported["sector_prior_module"].build_block_prior(
+        list(asset_cols),
+        str(Path(company_profiles_path)),
+        level=level,
+        self_loops=bool(self_loops),
+        row_normalise=True,
+        off_block=float(off_block),
+        dtype=torch.float32,
+    )
+    return prior.float().contiguous(), [str(value) for value in labels]
+
+
+def build_absolute_correlation_prior(
+    clean_training_split: Mapping[str, Any],
+    *,
+    asset_cols: Sequence[str],
+    threshold: float | None = None,
+    eps: float = 1.0e-12,
+) -> torch.Tensor:
+    """Build a training-only absolute Close-return correlation prior.
+
+    Returns a non-negative row-stochastic ``[N,N]`` matrix using only
+    within-session one-minute Close log returns.  The diagonal is removed.
+    When thresholding empties a row, that row's strongest original non-self
+    correlation is restored.  A zero-variance all-zero row falls back to a
+    uniform non-self distribution.
+    """
+    if list(clean_training_split.get("asset_cols", [])) != list(asset_cols):
+        raise ValueError("Training-split asset order differs from asset_cols.")
+    channels = [str(value).lower() for value in clean_training_split["channels"]]
+    if "close" not in channels:
+        raise KeyError("Training split has no Close channel.")
+    close_index = channels.index("close")
+    return_parts: list[torch.Tensor] = []
+    for sample in clean_training_split["samples"]:
+        values = torch.as_tensor(sample[0]).detach().cpu().double()
+        if values.ndim != 3 or values.shape[1] != len(asset_cols):
+            raise ValueError("Malformed training candle tensor for correlation prior.")
+        close = values[..., close_index].clamp_min(eps)
+        log_return = close[1:].log() - close[:-1].log()
+        if log_return.numel():
+            return_parts.append(log_return)
+    if not return_parts:
+        raise ValueError("No within-session returns are available for the prior.")
+    returns = torch.cat(return_parts, dim=0)
+    centred = returns - returns.mean(dim=0, keepdim=True)
+    covariance = centred.transpose(0, 1) @ centred
+    variance = centred.square().sum(dim=0)
+    denominator = torch.sqrt(variance[:, None] * variance[None, :])
+    correlation = torch.where(
+        denominator > eps,
+        covariance / denominator.clamp_min(eps),
+        torch.zeros_like(covariance),
+    ).abs()
+    correlation = torch.nan_to_num(correlation, nan=0.0, posinf=0.0, neginf=0.0)
+    correlation.fill_diagonal_(0.0)
+    unthresholded = correlation.clone()
+
+    if threshold is not None:
+        threshold = float(threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("correlation threshold must lie in [0,1].")
+        correlation = torch.where(
+            correlation >= threshold,
+            correlation,
+            torch.zeros_like(correlation),
+        )
+
+    num_nodes = correlation.shape[0]
+    for row_index in range(num_nodes):
+        if float(correlation[row_index].sum().item()) > eps:
+            continue
+        candidate = unthresholded[row_index].clone()
+        candidate[row_index] = 0.0
+        maximum = float(candidate.max().item())
+        if maximum > eps:
+            correlation[row_index, int(candidate.argmax().item())] = maximum
+        else:
+            correlation[row_index] = 1.0
+            correlation[row_index, row_index] = 0.0
+
+    row_sum = correlation.sum(dim=-1, keepdim=True).clamp_min(eps)
+    prior = correlation / row_sum
+    if not torch.allclose(
+        prior.sum(dim=-1),
+        torch.ones(num_nodes, dtype=prior.dtype),
+        atol=1.0e-8,
+        rtol=0.0,
+    ):
+        raise AssertionError("Correlation prior is not row-stochastic.")
+    return prior.float().contiguous()
+
+
+def initialise_base_graphs_from_prior(
+    model: nn.Module,
+    prior: torch.Tensor,
+    *,
+    scale: float = 4.0,
+    jitter: float = 0.02,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Initialise every V2 dual-fusion base graph exactly as Dimitri did.
+
+    Dimitri's helper normalises the supplied prior by its maximum, centres it,
+    multiplies by ``scale``, and adds small head-specific Gaussian jitter.  The
+    resulting tensors initialise the trainable ``base_graph`` logit biases.
+    """
+    prior = torch.as_tensor(prior).detach().cpu().float()
+    if prior.ndim != 2 or prior.shape[0] != prior.shape[1]:
+        raise ValueError("prior must have shape [N,N].")
+    if not torch.isfinite(prior).all() or (prior < 0).any():
+        raise ValueError("prior must be finite and non-negative.")
+    if scale <= 0:
+        raise ValueError("prior scale must be positive.")
+    if jitter < 0:
+        raise ValueError("prior jitter cannot be negative.")
+
+    normalised = prior / prior.max().clamp_min(1.0e-6)
+    base_logits = float(scale) * (normalised - normalised.mean())
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+
+    initialised: list[dict[str, Any]] = []
+    for module_name, module in model.named_modules():
+        base_graph = getattr(module, "base_graph", None)
+        if base_graph is None or not getattr(module, "use_base_graph", False):
+            continue
+        if not isinstance(base_graph, (nn.Parameter, torch.Tensor)):
+            continue
+        expected = tuple(base_graph.shape)
+        if expected[-2:] != tuple(prior.shape):
+            raise ValueError(
+                f"Prior shape {tuple(prior.shape)} is incompatible with "
+                f"{module_name}.base_graph {expected}."
+            )
+        heads = int(expected[0])
+        values = base_logits.unsqueeze(0).expand(heads, -1, -1).clone()
+        if jitter:
+            values += torch.randn(
+                values.shape,
+                generator=generator,
+                dtype=values.dtype,
+            ) * float(jitter)
+        with torch.no_grad():
+            base_graph.copy_(values.to(base_graph.device, base_graph.dtype))
+        initialised.append(
+            {
+                "module": module_name,
+                "shape": list(expected),
+                "heads": heads,
+            }
+        )
+
+    if not initialised:
+        raise RuntimeError("No trainable V2 base_graph tensors were found.")
+    return {
+        "count": len(initialised),
+        "scale": float(scale),
+        "jitter": float(jitter),
+        "seed": int(seed),
+        "modules": initialised,
+        "base_logit_min": float(base_logits.min().item()),
+        "base_logit_max": float(base_logits.max().item()),
+    }
+
+
+def extract_base_graph_logits(model: nn.Module) -> list[torch.Tensor]:
+    """Return one detached base-logit tensor per interlaced ST block."""
+    values: list[torch.Tensor] = []
+    for block in model.backbone.st_blocks:
+        scorer = getattr(block, "graph_scorer", None)
+        base_graph = getattr(scorer, "base_graph", None)
+        if base_graph is None:
+            values.append(torch.empty(0))
+        else:
+            values.append(base_graph.detach().cpu().float().clone())
+    return values
