@@ -567,6 +567,107 @@ def instantiate_dimitri_continuous_to_price_model(
     )
 
 
+DIMITRI_CONTINUOUS_MULTI_HORIZON_CONTRACT = (
+    "dimitri_basedygraph_v2_continuous_input_direct_multi_horizon_price_v1"
+)
+
+
+def dimitri_continuous_multi_horizon_parameter_count(
+    num_horizons: int,
+) -> int:
+    """Return the exact parameter count for a direct parallel Close head."""
+    if int(num_horizons) <= 0:
+        raise ValueError("num_horizons must be positive.")
+    # The one-step model already contains one Linear(96,1) head.  Each extra
+    # horizon contributes another 96 weights and one bias.
+    return int(
+        DIMITRI_CONTINUOUS_PRICE_EXPECTED_PARAMETER_COUNT
+        + (int(num_horizons) - 1) * (int(DIMITRI_X0_CONFIG["d_model"]) + 1)
+    )
+
+
+class DimitriV2ContinuousMultiHorizonForecaster(nn.Module):
+    """Exact V2 context backbone with a direct parallel future-Close head.
+
+    Only the observed context is supplied to the backbone.  The final causal
+    representation at the forecast origin is mapped directly to one
+    context-normalised Close value for each requested horizon.  No future
+    candle or teacher-forced continuation enters temporal, graph, or spatial
+    processing.
+    """
+
+    def __init__(
+        self,
+        *,
+        evaluation_horizons: Sequence[int],
+        input_channels: int = 6,
+        config_overrides: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        horizons = tuple(int(value) for value in evaluation_horizons)
+        if not horizons:
+            raise ValueError("evaluation_horizons cannot be empty.")
+        if any(value <= 0 for value in horizons):
+            raise ValueError("evaluation_horizons must be positive.")
+        if tuple(sorted(set(horizons))) != horizons:
+            raise ValueError(
+                "evaluation_horizons must be unique and strictly increasing."
+            )
+
+        config_values = _json_copy(DIMITRI_X0_CONFIG)
+        if config_overrides:
+            unknown = sorted(set(config_overrides).difference(config_values))
+            if unknown:
+                raise KeyError(f"Unknown Dimitri V2 config overrides: {unknown}")
+            config_values.update(_json_copy(dict(config_overrides)))
+        imported = import_dimitri_basedygraph()
+        self.cfg = imported["ModelConfig"](**config_values)
+        self.evaluation_horizons = horizons
+
+        # Preserve the one-step model's RNG order for the complete shared
+        # backbone and continuous input projection.  The temporary legacy head
+        # consumes exactly the random draws used by Linear(96,1); its first row
+        # is copied into the new multi-horizon head so horizon 1 also starts
+        # from the matched one-step initialisation.
+        reference = imported["DiscreteSTGraphBackbone"](self.cfg)
+        legacy_head = nn.Linear(int(self.cfg.d_model), 1)
+        self.backbone = _DimitriV2ContinuousBackbone(
+            self.cfg,
+            input_channels=input_channels,
+            reference_backbone=reference,
+        )
+        self.future_close_head = nn.Linear(
+            int(self.cfg.d_model),
+            len(self.evaluation_horizons),
+        )
+        with torch.no_grad():
+            self.future_close_head.weight[0].copy_(legacy_head.weight[0])
+            self.future_close_head.bias[0].copy_(legacy_head.bias[0])
+
+    def forward(self, continuous_context: torch.Tensor) -> dict[str, Any]:
+        output = self.backbone(continuous_context)
+        origin_hidden = output["spatial_repr"][:, -1]  # [B,N,D]
+        future = self.future_close_head(origin_hidden)  # [B,N,H]
+        output["future_close_normalised"] = (
+            future.permute(0, 2, 1).contiguous().unsqueeze(-1)
+        )  # [B,H,N,1]
+        output["evaluation_horizons"] = self.evaluation_horizons
+        return output
+
+
+def instantiate_dimitri_continuous_multi_horizon_model(
+    *,
+    evaluation_horizons: Sequence[int],
+    input_channels: int = 6,
+    config_overrides: Mapping[str, Any] | None = None,
+) -> DimitriV2ContinuousMultiHorizonForecaster:
+    return DimitriV2ContinuousMultiHorizonForecaster(
+        evaluation_horizons=evaluation_horizons,
+        input_channels=input_channels,
+        config_overrides=config_overrides,
+    )
+
+
 def build_sector_prior(
     asset_cols: Sequence[str],
     company_profiles_path: str | Path,
