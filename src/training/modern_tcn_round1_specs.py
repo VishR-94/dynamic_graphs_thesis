@@ -12,6 +12,14 @@ import pandas as pd
 
 PriorType = Literal["none", "sector", "correlation"]
 Variant = Literal["dynamic_only", "prior_mixture", "prior_mixture_state"]
+OptimisationProfile = Literal["round1", "dimitri"]
+SpatialGateType = Literal["learned_scalar", "none"]
+AblationFamily = Literal[
+    "round1_baseline",
+    "dimitri_optimisation",
+    "no_beta_round1_optimisation",
+    "no_beta_dimitri_optimisation",
+]
 
 
 @dataclass(frozen=True)
@@ -23,6 +31,9 @@ class Round1RunSpec:
     graph_heads: int
     graph_hidden_dim: int
     config: dict[str, Any]
+    optimisation_profile: OptimisationProfile = "round1"
+    spatial_gate_type: SpatialGateType = "learned_scalar"
+    ablation_family: AblationFamily = "round1_baseline"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -32,6 +43,9 @@ class Round1RunSpec:
             "prior_type": self.prior_type,
             "graph_heads": int(self.graph_heads),
             "graph_hidden_dim": int(self.graph_hidden_dim),
+            "optimisation_profile": self.optimisation_profile,
+            "spatial_gate_type": self.spatial_gate_type,
+            "ablation_family": self.ablation_family,
             "config": self.config,
         }
 
@@ -125,7 +139,10 @@ def _base_config(
         },
         "training": {
             "optimizer": "adam",
+            "parameter_grouping": "split",
             "scheduler": "modern_tcn_type3",
+            "scheduler_t_max": 120,
+            "scheduler_eta_min": 0.0,
             "learning_rate": 2.5e-4,
             "graph_learning_rate": 5.0e-4,
             "weight_decay": 0.0,
@@ -173,6 +190,197 @@ def _with_variant(
     values["model"]["graph"]["num_heads_per_layer"] = [int(graph_heads)]
     values["model"]["graph"]["hidden_dim"] = int(graph_hidden_dim)
     return values
+
+
+def _with_spatial_gate(
+    values: Mapping[str, Any],
+    *,
+    gate_type: SpatialGateType,
+) -> dict[str, Any]:
+    result = json.loads(json.dumps(values))
+    if gate_type not in {"learned_scalar", "none"}:
+        raise ValueError(f"Unsupported spatial gate type {gate_type!r}.")
+    result["model"]["spatial"]["gate_type"] = str(gate_type)
+    return result
+
+
+def _with_optimisation_profile(
+    values: Mapping[str, Any],
+    *,
+    profile: OptimisationProfile,
+    dimitri_learning_rate: float = 1.2e-3,
+    dimitri_weight_decay: float = 1.0e-4,
+    dimitri_t_max: int = 120,
+    dimitri_max_epochs: int = 120,
+    dimitri_patience: int = 15,
+) -> dict[str, Any]:
+    """Apply one of the two controlled optimiser/scheduler families.
+
+    ``round1`` preserves Adam, separate backbone/graph learning rates, and
+    the ModernTCN type-3 schedule.
+
+    ``dimitri`` keeps the Round-1 data loader, batch size, and seed fixed so
+    the ablation isolates optimiser/schedule behaviour, while matching the
+    important V2 choices: AdamW, one shared learning rate, weight decay,
+    cosine annealing, FP32, no clipping, 120 epochs, and patience 15.
+    """
+
+    result = json.loads(json.dumps(values))
+    training = result["training"]
+    if profile == "round1":
+        training.update(
+            {
+                "optimizer": "adam",
+                "parameter_grouping": "split",
+                "scheduler": "modern_tcn_type3",
+                "learning_rate": 2.5e-4,
+                "graph_learning_rate": 5.0e-4,
+                "weight_decay": 0.0,
+                "max_epochs": 100,
+                "patience": 10,
+                "gradient_clip_norm": 1.0,
+                "mixed_precision": True,
+            }
+        )
+    elif profile == "dimitri":
+        if float(dimitri_learning_rate) <= 0.0:
+            raise ValueError("dimitri_learning_rate must be positive.")
+        if int(dimitri_t_max) <= 0:
+            raise ValueError("dimitri_t_max must be positive.")
+        training.update(
+            {
+                "optimizer": "adamw",
+                "parameter_grouping": "shared",
+                "scheduler": "cosine_annealing",
+                "scheduler_t_max": int(dimitri_t_max),
+                "scheduler_eta_min": 0.0,
+                "learning_rate": float(dimitri_learning_rate),
+                "graph_learning_rate": float(dimitri_learning_rate),
+                "weight_decay": float(dimitri_weight_decay),
+                "max_epochs": int(dimitri_max_epochs),
+                "patience": int(dimitri_patience),
+                "gradient_clip_norm": 0.0,
+                "mixed_precision": False,
+            }
+        )
+    else:
+        raise ValueError(f"Unsupported optimisation profile {profile!r}.")
+    training["optimisation_profile"] = str(profile)
+    return result
+
+
+def _clone_for_ablation(
+    base: Round1RunSpec,
+    *,
+    run_prefix: str,
+    label_suffix: str,
+    profile: OptimisationProfile,
+    gate_type: SpatialGateType,
+    family: AblationFamily,
+    dimitri_learning_rate: float,
+    dimitri_weight_decay: float,
+    dimitri_t_max: int,
+    dimitri_max_epochs: int,
+    dimitri_patience: int,
+) -> Round1RunSpec:
+    values = _with_spatial_gate(base.config, gate_type=gate_type)
+    values = _with_optimisation_profile(
+        values,
+        profile=profile,
+        dimitri_learning_rate=dimitri_learning_rate,
+        dimitri_weight_decay=dimitri_weight_decay,
+        dimitri_t_max=dimitri_t_max,
+        dimitri_max_epochs=dimitri_max_epochs,
+        dimitri_patience=dimitri_patience,
+    )
+    return Round1RunSpec(
+        run_name=f"{run_prefix}__{base.run_name}",
+        label=f"{base.label} — {label_suffix}",
+        variant=base.variant,
+        prior_type=base.prior_type,
+        graph_heads=base.graph_heads,
+        graph_hidden_dim=base.graph_hidden_dim,
+        config=values,
+        optimisation_profile=profile,
+        spatial_gate_type=gate_type,
+        ablation_family=family,
+    )
+
+
+def make_gate_optimisation_ablation_specs(
+    *,
+    prior_type: Literal["sector", "correlation"] = "sector",
+    context_length: int = 60,
+    stride: int = 15,
+    horizons: Sequence[int] = (1, 5, 15, 30, 60),
+    prior_scale: float = 4.0,
+    prior_jitter: float = 0.02,
+    seed: int = 42,
+    dimitri_learning_rate: float = 1.2e-3,
+    dimitri_weight_decay: float = 1.0e-4,
+    dimitri_t_max: int = 120,
+    dimitri_max_epochs: int = 120,
+    dimitri_patience: int = 15,
+) -> tuple[Round1RunSpec, ...]:
+    """Return nine one-head runs: three architectures × three ablations."""
+
+    base_specs = make_round1_specs(
+        prior_type=prior_type,
+        context_length=context_length,
+        stride=stride,
+        horizons=horizons,
+        prior_scale=prior_scale,
+        prior_jitter=prior_jitter,
+        seed=seed,
+    )
+    result: list[Round1RunSpec] = []
+    for base in base_specs:
+        result.extend(
+            [
+                _clone_for_ablation(
+                    base,
+                    run_prefix="r1x_dimitriopt_beta",
+                    label_suffix="Dimitri optimisation; learned beta",
+                    profile="dimitri",
+                    gate_type="learned_scalar",
+                    family="dimitri_optimisation",
+                    dimitri_learning_rate=dimitri_learning_rate,
+                    dimitri_weight_decay=dimitri_weight_decay,
+                    dimitri_t_max=dimitri_t_max,
+                    dimitri_max_epochs=dimitri_max_epochs,
+                    dimitri_patience=dimitri_patience,
+                ),
+                _clone_for_ablation(
+                    base,
+                    run_prefix="r1x_round1opt_nobeta",
+                    label_suffix="Round-1 optimisation; no external beta gate",
+                    profile="round1",
+                    gate_type="none",
+                    family="no_beta_round1_optimisation",
+                    dimitri_learning_rate=dimitri_learning_rate,
+                    dimitri_weight_decay=dimitri_weight_decay,
+                    dimitri_t_max=dimitri_t_max,
+                    dimitri_max_epochs=dimitri_max_epochs,
+                    dimitri_patience=dimitri_patience,
+                ),
+                _clone_for_ablation(
+                    base,
+                    run_prefix="r1x_dimitriopt_nobeta",
+                    label_suffix="Dimitri optimisation; no external beta gate",
+                    profile="dimitri",
+                    gate_type="none",
+                    family="no_beta_dimitri_optimisation",
+                    dimitri_learning_rate=dimitri_learning_rate,
+                    dimitri_weight_decay=dimitri_weight_decay,
+                    dimitri_t_max=dimitri_t_max,
+                    dimitri_max_epochs=dimitri_max_epochs,
+                    dimitri_patience=dimitri_patience,
+                ),
+            ]
+        )
+    if len(result) != 9 or len({spec.run_name for spec in result}) != 9:
+        raise AssertionError("Expected nine unique gate/optimisation ablations.")
+    return tuple(result)
 
 
 def make_round1_specs(
@@ -275,6 +483,9 @@ def make_six_head_ablation_spec(
         graph_heads=int(graph_heads),
         graph_hidden_dim=graph_hidden_dim,
         config=values,
+        optimisation_profile=winner.optimisation_profile,
+        spatial_gate_type=winner.spatial_gate_type,
+        ablation_family=winner.ablation_family,
     )
 
 
@@ -352,6 +563,9 @@ def summarise_runs(
             "Prior": spec.prior_type,
             "Graph heads": spec.graph_heads,
             "Graph hidden dim": spec.graph_hidden_dim,
+            "Optimisation": spec.optimisation_profile,
+            "Beta gate": spec.spatial_gate_type,
+            "Ablation family": spec.ablation_family,
             "Best epoch": best_epoch,
             "Epochs completed": int(metadata["epochs_completed"]),
             "Mean test Log MAE": float(row["selection_score"]),

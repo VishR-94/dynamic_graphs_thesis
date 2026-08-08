@@ -53,8 +53,11 @@ class ModernTCNGraphRound1Config:
             raise ValueError("Round 1 uses softmax graphs only.")
         if self.forecaster.graph.add_self_loops:
             raise ValueError("Round 1 excludes graph self-edges.")
-        if self.forecaster.spatial_gate_type != "learned_scalar":
-            raise ValueError("Round 1 requires the learned scalar beta gate.")
+        if self.forecaster.spatial_gate_type not in {"learned_scalar", "none"}:
+            raise ValueError(
+                "Round 1 supports either a learned scalar beta gate or "
+                "direct full-spatial output with no external beta gate."
+            )
         if self.graph_variant not in {
             "dynamic_only",
             "prior_mixture",
@@ -601,7 +604,7 @@ def round1_model_config_from_mapping(
         spatial_num_layers=1,
         spatial_feedforward_multiplier=int(spatial["feedforward_multiplier"]),
         spatial_dropout=float(spatial["dropout"]),
-        spatial_gate_type="learned_scalar",
+        spatial_gate_type=str(spatial["gate_type"]),
         spatial_gate_initial_beta=float(spatial["initial_beta"]),
         head_dropout=0.0,
     )

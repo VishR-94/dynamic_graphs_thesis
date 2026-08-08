@@ -14,6 +14,7 @@ configuration, datasets, and saved tensors.
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import shutil
@@ -134,8 +135,10 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("Round 1 uses softmax graph activation.")
     if bool(model["graph"]["add_self_loops"]):
         raise ValueError("Round 1 requires zero graph diagonal.")
-    if str(model["spatial"]["gate_type"]) != "learned_scalar":
-        raise ValueError("Round 1 requires learned scalar beta.")
+    if str(model["spatial"]["gate_type"]) not in {"learned_scalar", "none"}:
+        raise ValueError(
+            "spatial.gate_type must be 'learned_scalar' or 'none'."
+        )
     if str(model["variant"]) not in {
         "dynamic_only",
         "prior_mixture",
@@ -155,10 +158,33 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("This isolated curiosity runner selects on test.")
     if tuple(int(value) for value in training["selection_horizons"]) != horizons:
         raise ValueError("Selection horizons must equal every configured horizon.")
-    if str(training["optimizer"]) != "adam":
-        raise ValueError("The exact control uses Adam.")
-    if str(training["scheduler"]) != "modern_tcn_type3":
-        raise ValueError("The exact control uses the ModernTCN type-3 schedule.")
+    optimizer_name = str(training["optimizer"]).lower()
+    if optimizer_name not in {"adam", "adamw"}:
+        raise ValueError("training.optimizer must be 'adam' or 'adamw'.")
+    grouping = str(training.get("parameter_grouping", "split"))
+    if grouping not in {"split", "shared"}:
+        raise ValueError("training.parameter_grouping must be 'split' or 'shared'.")
+    scheduler_name = str(training["scheduler"]).lower()
+    if scheduler_name not in {"modern_tcn_type3", "cosine_annealing"}:
+        raise ValueError(
+            "training.scheduler must be 'modern_tcn_type3' or "
+            "'cosine_annealing'."
+        )
+    if scheduler_name == "cosine_annealing":
+        if int(training.get("scheduler_t_max", 0)) <= 0:
+            raise ValueError("Cosine annealing requires scheduler_t_max > 0.")
+        if float(training.get("scheduler_eta_min", 0.0)) < 0.0:
+            raise ValueError("scheduler_eta_min must be non-negative.")
+    if grouping == "shared" and not math.isclose(
+        float(training["learning_rate"]),
+        float(training["graph_learning_rate"]),
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            "Shared parameter grouping requires identical backbone and graph "
+            "learning-rate fields."
+        )
     for key in (
         "learning_rate",
         "graph_learning_rate",
@@ -276,46 +302,105 @@ def _build_optimizer(
     config: Mapping[str, Any],
 ) -> torch.optim.Optimizer:
     training = config["training"]
-    backbone, graph = _parameter_partition(model)
-    groups: list[dict[str, Any]] = [
-        {
-            "params": backbone,
-            "lr": float(training["learning_rate"]),
-            "base_lr": float(training["learning_rate"]),
-            "name": "backbone",
-        }
-    ]
-    if graph:
-        groups.append(
+    optimizer_name = str(training["optimizer"]).lower()
+    grouping = str(training.get("parameter_grouping", "split"))
+    weight_decay = float(training["weight_decay"])
+
+    if optimizer_name == "adam":
+        optimizer_class = torch.optim.Adam
+    elif optimizer_name == "adamw":
+        optimizer_class = torch.optim.AdamW
+    else:
+        raise ValueError(f"Unsupported optimizer {optimizer_name!r}.")
+
+    if grouping == "shared":
+        shared_lr = float(training["learning_rate"])
+        parameters = [
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        ]
+        groups = [
             {
-                "params": graph,
-                "lr": float(training["graph_learning_rate"]),
-                "base_lr": float(training["graph_learning_rate"]),
-                "name": "graph",
+                "params": parameters,
+                "lr": shared_lr,
+                "base_lr": shared_lr,
+                "name": "all",
             }
-        )
-    return torch.optim.Adam(groups, weight_decay=float(training["weight_decay"]))
+        ]
+    elif grouping == "split":
+        backbone, graph = _parameter_partition(model)
+        groups = [
+            {
+                "params": backbone,
+                "lr": float(training["learning_rate"]),
+                "base_lr": float(training["learning_rate"]),
+                "name": "backbone",
+            }
+        ]
+        if graph:
+            groups.append(
+                {
+                    "params": graph,
+                    "lr": float(training["graph_learning_rate"]),
+                    "base_lr": float(training["graph_learning_rate"]),
+                    "name": "graph",
+                }
+            )
+    else:
+        raise ValueError(f"Unsupported parameter grouping {grouping!r}.")
+
+    return optimizer_class(groups, weight_decay=weight_decay)
 
 
 def _learning_rates(
     optimizer: torch.optim.Optimizer,
 ) -> dict[str, float | None]:
-    result: dict[str, float | None] = {"backbone": None, "graph": None}
+    result: dict[str, float | None] = {
+        "backbone": None,
+        "graph": None,
+        "shared": None,
+    }
     for index, group in enumerate(optimizer.param_groups):
         name = str(group.get("name", "backbone" if index == 0 else "graph"))
-        if name in result:
-            result[name] = float(group["lr"])
+        value = float(group["lr"])
+        if name == "all":
+            result["shared"] = value
+            result["backbone"] = value
+            result["graph"] = value
+        elif name in result:
+            result[name] = value
     return result
 
 
-def _advance_type3_schedule(
+def _advance_schedule(
     optimizer: torch.optim.Optimizer,
     *,
+    training: Mapping[str, Any],
     completed_epoch: int,
 ) -> None:
-    multiplier = 1.0 if completed_epoch < 3 else 0.9 ** (completed_epoch - 3)
+    scheduler_name = str(training["scheduler"]).lower()
+    if scheduler_name == "modern_tcn_type3":
+        multiplier = (
+            1.0
+            if int(completed_epoch) < 3
+            else 0.9 ** (int(completed_epoch) - 3)
+        )
+        eta_min = 0.0
+    elif scheduler_name == "cosine_annealing":
+        t_max = int(training["scheduler_t_max"])
+        eta_min = float(training.get("scheduler_eta_min", 0.0))
+        progress = min(max(int(completed_epoch), 0), t_max)
+        multiplier = 0.5 * (
+            1.0 + math.cos(math.pi * progress / t_max)
+        )
+    else:
+        raise ValueError(f"Unsupported scheduler {scheduler_name!r}.")
+
     for group in optimizer.param_groups:
-        group["lr"] = float(group["base_lr"]) * multiplier
+        base_lr = float(group["base_lr"])
+        if scheduler_name == "cosine_annealing":
+            group["lr"] = eta_min + (base_lr - eta_min) * multiplier
+        else:
+            group["lr"] = base_lr * multiplier
 
 
 def _normalised_prediction_to_raw(
@@ -609,6 +694,9 @@ def _evaluate_selection(
             None if model.alpha() is None else float(model.alpha().item())
         ),
         "block_0_beta": float(model.beta().item()),
+        "block_0_beta_trainable": bool(
+            model.spatial_gate.raw_beta is not None
+        ),
         "block_0_selected_entropy": selected_summary["entropy"],
         "block_0_selected_effective_neighbours": selected_summary[
             "effective_neighbours"
@@ -630,16 +718,28 @@ def _history_record(
     learning_rates: Mapping[str, float | None],
     train: Mapping[str, Any],
     selection: Mapping[str, Any],
+    config: Mapping[str, Any],
 ) -> dict[str, Any]:
     record: dict[str, Any] = {
         "epoch": int(epoch),
         "backbone_learning_rate": learning_rates.get("backbone"),
         "graph_learning_rate": learning_rates.get("graph"),
+        "shared_learning_rate": learning_rates.get("shared"),
+        "optimisation_profile": str(
+            config["training"].get("optimisation_profile", "round1")
+        ),
+        "optimizer": str(config["training"]["optimizer"]),
+        "scheduler": str(config["training"]["scheduler"]),
+        "parameter_grouping": str(
+            config["training"].get("parameter_grouping", "split")
+        ),
+        "spatial_gate_type": str(config["model"]["spatial"]["gate_type"]),
         **dict(train),
         "selection_score": float(selection["selection_score"]),
         "selection_split": "test",
         "block_0_alpha": selection.get("block_0_alpha"),
         "block_0_beta": selection.get("block_0_beta"),
+        "block_0_beta_trainable": selection.get("block_0_beta_trainable"),
         # Backward-compatible single-block aliases for existing plots.
         "dynamic_alpha": selection.get("block_0_alpha"),
         "spatial_beta": selection.get("block_0_beta"),
@@ -834,6 +934,8 @@ def _export_selected_checkpoint(
             else float(model.alpha().item())
         ),
         "spatial_beta": float(model.beta().item()),
+        "spatial_gate_type": str(config["model"]["spatial"]["gate_type"]),
+        "beta_trainable": bool(model.spatial_gate.raw_beta is not None),
         "dates": dates,
         "sample_idx": prediction_result["sample_idx"],
         "origin_idx": prediction_result["origin_idx"],
@@ -852,6 +954,8 @@ def _export_selected_checkpoint(
         "assets": int(prediction_result["y_pred"].shape[2]),
         "alpha": graph_artifacts["dynamic_alpha"],
         "beta": graph_artifacts["spatial_beta"],
+        "spatial_gate_type": graph_artifacts["spatial_gate_type"],
+        "beta_trainable": graph_artifacts["beta_trainable"],
         "selected_graph": selected_summary,
         "static_graph": static_summary,
         "dynamic_graph": dynamic_summary,
@@ -1098,6 +1202,21 @@ def main() -> None:
         "stride": int(resolved["data"]["stride"]),
         "horizons": [int(value) for value in resolved["data"]["horizons"]],
         "model_family": "modern_tcn_graph_round1",
+        "optimisation_profile": str(
+            resolved["training"].get("optimisation_profile", "round1")
+        ),
+        "optimizer": str(resolved["training"]["optimizer"]),
+        "parameter_grouping": str(
+            resolved["training"].get("parameter_grouping", "split")
+        ),
+        "scheduler": str(resolved["training"]["scheduler"]),
+        "scheduler_t_max": int(
+            resolved["training"].get("scheduler_t_max", 0)
+        ),
+        "weight_decay": float(resolved["training"]["weight_decay"]),
+        "gradient_clip_norm": float(
+            resolved["training"]["gradient_clip_norm"]
+        ),
         "temporal_backbone": "modern_tcn",
         "graph_variant": str(resolved["model"]["variant"]),
         "graph_type": str(resolved["model"]["graph"]["type"]),
@@ -1107,6 +1226,9 @@ def main() -> None:
         "prior_scale": float(resolved["model"]["prior"]["scale"]),
         "prior_jitter": float(resolved["model"]["prior"]["jitter"]),
         "state_pathway": model_config.uses_state_pathway,
+        "spatial_gate_type": str(
+            resolved["model"]["spatial"]["gate_type"]
+        ),
         "spatial_initial_beta": float(
             resolved["model"]["spatial"]["initial_beta"]
         ),
@@ -1238,6 +1360,7 @@ def main() -> None:
                     learning_rates=current_lrs,
                     train=train_values,
                     selection=selection,
+                    config=resolved,
                 )
                 history.append(record)
                 atomic_csv_save(pd.DataFrame(history), run_dir / "history.csv")
@@ -1269,7 +1392,11 @@ def main() -> None:
                     without_improvement += 1
 
                 # Preserve the exact next-epoch schedule in the resume file.
-                _advance_type3_schedule(optimizer, completed_epoch=epoch)
+                _advance_schedule(
+                    optimizer,
+                    training=training,
+                    completed_epoch=epoch,
+                )
                 last_checkpoint = _checkpoint(
                     model=model,
                     optimizer=optimizer,
@@ -1379,6 +1506,9 @@ def main() -> None:
                     None if model.alpha() is None else float(model.alpha().item())
                 ),
                 "final_beta": float(model.beta().item()),
+                "final_beta_trainable": bool(
+                    model.spatial_gate.raw_beta is not None
+                ),
             }
         )
         atomic_json_save(metadata, run_dir / "run_metadata.json")
