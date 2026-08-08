@@ -1183,7 +1183,7 @@ def main() -> None:
         static_prior = build_absolute_correlation_graph_prior(
             train_split,
             expected_asset_cols=asset_cols,
-            threshold=0.18
+            threshold=None
         )
     else:
         raise ValueError(f"Unsupported prior type {prior_type!r}.")
