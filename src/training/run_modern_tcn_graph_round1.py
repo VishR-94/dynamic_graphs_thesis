@@ -165,11 +165,26 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     if grouping not in {"split", "shared"}:
         raise ValueError("training.parameter_grouping must be 'split' or 'shared'.")
     scheduler_name = str(training["scheduler"]).lower()
-    if scheduler_name not in {"modern_tcn_type3", "cosine_annealing"}:
+    if scheduler_name not in {
+        "modern_tcn_type3",
+        "modern_tcn_type3_delayed",
+        "cosine_annealing",
+    }:
         raise ValueError(
-            "training.scheduler must be 'modern_tcn_type3' or "
-            "'cosine_annealing'."
+            "training.scheduler must be 'modern_tcn_type3', "
+            "'modern_tcn_type3_delayed', or 'cosine_annealing'."
         )
+    if scheduler_name == "modern_tcn_type3_delayed":
+        if int(training.get("scheduler_decay_start_epoch", 0)) < 1:
+            raise ValueError(
+                "Delayed type-3 scheduling requires "
+                "scheduler_decay_start_epoch >= 1."
+            )
+        decay_factor = float(training.get("scheduler_decay_factor", 0.0))
+        if not math.isfinite(decay_factor) or not 0.0 < decay_factor <= 1.0:
+            raise ValueError(
+                "scheduler_decay_factor must lie in (0, 1]."
+            )
     if scheduler_name == "cosine_annealing":
         if int(training.get("scheduler_t_max", 0)) <= 0:
             raise ValueError("Cosine annealing requires scheduler_t_max > 0.")
@@ -379,10 +394,25 @@ def _advance_schedule(
 ) -> None:
     scheduler_name = str(training["scheduler"]).lower()
     if scheduler_name == "modern_tcn_type3":
+        # Preserve the historical Round-1 schedule exactly for all existing
+        # configurations and checkpoints.
         multiplier = (
             1.0
             if int(completed_epoch) < 3
             else 0.9 ** (int(completed_epoch) - 3)
+        )
+        eta_min = 0.0
+    elif scheduler_name == "modern_tcn_type3_delayed":
+        # ``decay_start_epoch`` is the final epoch that uses the full base
+        # learning rate.  Because this function runs after a completed
+        # epoch, completing epoch 15 prepares epoch 16 at base_lr * factor.
+        decay_start_epoch = int(training["scheduler_decay_start_epoch"])
+        decay_factor = float(training["scheduler_decay_factor"])
+        multiplier = (
+            1.0
+            if int(completed_epoch) < decay_start_epoch
+            else decay_factor
+            ** (int(completed_epoch) - decay_start_epoch + 1)
         )
         eta_min = 0.0
     elif scheduler_name == "cosine_annealing":
@@ -730,6 +760,12 @@ def _history_record(
         ),
         "optimizer": str(config["training"]["optimizer"]),
         "scheduler": str(config["training"]["scheduler"]),
+        "scheduler_decay_start_epoch": config["training"].get(
+            "scheduler_decay_start_epoch"
+        ),
+        "scheduler_decay_factor": config["training"].get(
+            "scheduler_decay_factor"
+        ),
         "parameter_grouping": str(
             config["training"].get("parameter_grouping", "split")
         ),
@@ -1212,6 +1248,16 @@ def main() -> None:
         "scheduler": str(resolved["training"]["scheduler"]),
         "scheduler_t_max": int(
             resolved["training"].get("scheduler_t_max", 0)
+        ),
+        "scheduler_decay_start_epoch": (
+            None
+            if resolved["training"].get("scheduler_decay_start_epoch") is None
+            else int(resolved["training"]["scheduler_decay_start_epoch"])
+        ),
+        "scheduler_decay_factor": (
+            None
+            if resolved["training"].get("scheduler_decay_factor") is None
+            else float(resolved["training"]["scheduler_decay_factor"])
         ),
         "weight_decay": float(resolved["training"]["weight_decay"]),
         "gradient_clip_norm": float(

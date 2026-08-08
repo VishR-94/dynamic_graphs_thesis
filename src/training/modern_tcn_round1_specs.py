@@ -13,7 +13,7 @@ import pandas as pd
 
 PriorType = Literal["none", "sector", "correlation"]
 Variant = Literal["dynamic_only", "prior_mixture", "prior_mixture_state"]
-OptimisationProfile = Literal["round1", "dimitri"]
+OptimisationProfile = Literal["round1", "dimitri", "round1_delayed_decay"]
 SpatialGateType = Literal["learned_scalar", "none"]
 AblationFamily = Literal[
     "round1_baseline",
@@ -21,6 +21,7 @@ AblationFamily = Literal[
     "no_beta_round1_optimisation",
     "no_beta_dimitri_optimisation",
     "alpha_beta_initialisation_sweep",
+    "alpha_beta_delayed_decay_sweep",
 ]
 
 
@@ -491,6 +492,95 @@ def make_alpha_beta_initialisation_sweep_specs(
         raise ValueError(
             "The requested alpha/beta values produce duplicate run names."
         )
+    return tuple(result)
+
+
+def make_alpha_beta_delayed_decay_sweep_specs(
+    *,
+    alpha_initials: Sequence[float] = (0.25, 0.5, 0.75, 0.85),
+    beta_initials: Sequence[float] = (0.25, 0.5, 0.75),
+    prior_type: Literal["sector", "correlation"] = "sector",
+    context_length: int = 60,
+    stride: int = 15,
+    horizons: Sequence[int] = (1, 5, 15, 30, 60),
+    prior_scale: float = 4.0,
+    prior_jitter: float = 0.02,
+    decay_start_epoch: int = 15,
+    decay_factor: float = 0.9,
+    seed: int = 42,
+) -> tuple[Round1RunSpec, ...]:
+    """Build the final alpha/beta sweep with delayed type-3 decay.
+
+    The architecture, optimiser, base learning rates, batch size, precision,
+    clipping, patience, seed, and test-selection rule are identical to the
+    original alpha/beta sweep.  Only the learning-rate schedule changes:
+    both parameter groups remain at their configured base learning rates
+    through ``decay_start_epoch``; epoch ``decay_start_epoch + 1`` uses one
+    factor of ``decay_factor`` and later epochs continue geometrically.
+    """
+
+    start_epoch = int(decay_start_epoch)
+    factor = float(decay_factor)
+    if start_epoch < 1:
+        raise ValueError("decay_start_epoch must be at least one.")
+    if not math.isfinite(factor) or not 0.0 < factor <= 1.0:
+        raise ValueError("decay_factor must lie in (0, 1].")
+
+    controls = make_alpha_beta_initialisation_sweep_specs(
+        alpha_initials=alpha_initials,
+        beta_initials=beta_initials,
+        prior_type=prior_type,
+        context_length=context_length,
+        stride=stride,
+        horizons=horizons,
+        prior_scale=prior_scale,
+        prior_jitter=prior_jitter,
+        seed=seed,
+    )
+
+    start_tag = str(start_epoch)
+    factor_tag = _float_tag(factor)
+    result: list[Round1RunSpec] = []
+    for control in controls:
+        values = json.loads(json.dumps(control.config))
+        training = values["training"]
+        training["scheduler"] = "modern_tcn_type3_delayed"
+        training["scheduler_decay_start_epoch"] = start_epoch
+        training["scheduler_decay_factor"] = factor
+        training["optimisation_profile"] = "round1_delayed_decay"
+
+        # Replace only the family prefix; every architecture/data/gate value
+        # already encoded by the control run name remains visible.
+        if not control.run_name.startswith("r1ab_"):
+            raise AssertionError(
+                f"Unexpected alpha/beta control name {control.run_name!r}."
+            )
+        run_name = (
+            f"r1abdelay_ds{start_tag}_df{factor_tag}_"
+            + control.run_name.removeprefix("r1ab_")
+        )
+        result.append(
+            Round1RunSpec(
+                run_name=run_name,
+                label=(
+                    control.label
+                    + f" — full LR through epoch {start_epoch}, "
+                    + f"then ×{factor:g} per epoch"
+                ),
+                variant=control.variant,
+                prior_type=control.prior_type,
+                graph_heads=control.graph_heads,
+                graph_hidden_dim=control.graph_hidden_dim,
+                config=values,
+                optimisation_profile="round1_delayed_decay",
+                spatial_gate_type=control.spatial_gate_type,
+                ablation_family="alpha_beta_delayed_decay_sweep",
+            )
+        )
+
+    run_names = [spec.run_name for spec in result]
+    if len(set(run_names)) != len(run_names):
+        raise ValueError("Delayed-decay sweep produced duplicate run names.")
     return tuple(result)
 
 

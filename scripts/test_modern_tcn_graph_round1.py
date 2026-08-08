@@ -28,6 +28,7 @@ from src.models.modern_tcn_graph_round1 import (
     round1_model_config_from_mapping,
 )
 from src.training.modern_tcn_round1_specs import (
+    make_alpha_beta_delayed_decay_sweep_specs,
     make_alpha_beta_initialisation_sweep_specs,
     make_gate_optimisation_ablation_specs,
     make_round1_specs,
@@ -324,6 +325,77 @@ def main() -> None:
             raise AssertionError("Sweep unexpectedly enables graph regularisation.")
         if "a" not in spec.run_name or "b" not in spec.run_name:
             raise AssertionError("Sweep run names do not encode both gate values.")
+
+    # Final delayed-decay sweep: same one-head R1-C model/grid, but full
+    # backbone/graph learning rates through epoch 15 and geometric decay
+    # beginning in epoch 16.
+    delayed_specs = make_alpha_beta_delayed_decay_sweep_specs(
+        alpha_initials=(0.25, 0.85),
+        beta_initials=(0.25, 0.75),
+        prior_type="sector",
+        context_length=44,
+        stride=9,
+        horizons=(1, 4),
+        decay_start_epoch=15,
+        decay_factor=0.9,
+    )
+    if len(delayed_specs) != 4:
+        raise AssertionError("Unexpected delayed-decay sweep cardinality.")
+    for spec in delayed_specs:
+        _validate_config(spec.config)
+        training = spec.config["training"]
+        if training["scheduler"] != "modern_tcn_type3_delayed":
+            raise AssertionError("Delayed sweep did not use the new schedule.")
+        if training["scheduler_decay_start_epoch"] != 15:
+            raise AssertionError("Delayed sweep lost its decay start epoch.")
+        if training["scheduler_decay_factor"] != 0.9:
+            raise AssertionError("Delayed sweep lost its decay factor.")
+        if spec.optimisation_profile != "round1_delayed_decay":
+            raise AssertionError("Delayed optimisation profile was not saved.")
+        if spec.ablation_family != "alpha_beta_delayed_decay_sweep":
+            raise AssertionError("Delayed ablation family was not saved.")
+        if "ds15" not in spec.run_name or "df0p9" not in spec.run_name:
+            raise AssertionError("Delayed schedule is absent from the run name.")
+
+    dummy = nn.Parameter(torch.tensor(1.0))
+    delayed_optimizer = torch.optim.Adam(
+        [
+            {
+                "params": [dummy],
+                "lr": 5.0e-4,
+                "base_lr": 5.0e-4,
+                "name": "graph",
+            }
+        ]
+    )
+    delayed_training = delayed_specs[0].config["training"]
+    _advance_schedule(
+        delayed_optimizer,
+        training=delayed_training,
+        completed_epoch=14,
+    )
+    if _learning_rates(delayed_optimizer)["graph"] != 5.0e-4:
+        raise AssertionError("Delayed schedule decayed before epoch 15.")
+    _advance_schedule(
+        delayed_optimizer,
+        training=delayed_training,
+        completed_epoch=15,
+    )
+    first_decay_lr = _learning_rates(delayed_optimizer)["graph"]
+    if first_decay_lr is None or abs(first_decay_lr - 4.5e-4) > 1.0e-12:
+        raise AssertionError(
+            f"Epoch-16 delayed LR is {first_decay_lr}; expected 4.5e-4."
+        )
+    _advance_schedule(
+        delayed_optimizer,
+        training=delayed_training,
+        completed_epoch=16,
+    )
+    second_decay_lr = _learning_rates(delayed_optimizer)["graph"]
+    if second_decay_lr is None or abs(second_decay_lr - 4.05e-4) > 1.0e-12:
+        raise AssertionError(
+            f"Epoch-17 delayed LR is {second_decay_lr}; expected 4.05e-4."
+        )
 
     # Six-head ablation preserves 32 graph dimensions per head.
     standard_specs = make_round1_specs(prior_type="sector")
