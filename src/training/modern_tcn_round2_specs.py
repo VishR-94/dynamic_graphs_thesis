@@ -207,6 +207,14 @@ def _make_spec(
     modern_tcn_graph_dim_per_head: int,
     transformer_graph_dim_per_head: int,
 ) -> Round2RunSpec:
+
+    modern_tcn_d_model = int(
+        base["model"]["temporal_stack"]["modern_tcn"]["d_model"]
+    )
+
+    transformer_d_model = int(
+        base["model"]["temporal_stack"]["transformer"]["d_model"]
+    )
     if temporal_family == "modern_tcn_transformer":
         block_count = 1 + int(num_transformer_blocks)
         temporal_tag = f"mtg_t{int(num_transformer_blocks)}"
@@ -214,12 +222,20 @@ def _make_spec(
             "ModernTCN first block + "
             f"{int(num_transformer_blocks)} Transformer block(s)"
         )
-        block_dims = (32, *([96] * int(num_transformer_blocks)))
+        block_dims = (
+            modern_tcn_d_model,
+            *(
+                [transformer_d_model]
+                * int(num_transformer_blocks)
+            ),
+        )
     elif temporal_family == "transformer_only":
         block_count = int(num_transformer_blocks)
         temporal_tag = f"tr{block_count}"
         temporal_label = f"{block_count} Transformer ST block(s)"
-        block_dims = tuple([96] * block_count)
+        block_dims = tuple(
+            [transformer_d_model] * block_count
+        )
     else:
         raise ValueError(f"Unsupported temporal family {temporal_family!r}.")
     if block_count < 2:
@@ -312,11 +328,6 @@ def make_round2_specs(
 
     if prior_type not in {"sector", "correlation", "none"}:
         raise ValueError("prior_type must be sector, correlation, or none.")
-    if transformer_d_model != 96:
-        # The implementation supports other widths, but Round-2 model labels
-        # and the ModernTCN adapter contract are currently defined around D96.
-        # This is descriptive, not a dataset/window-count execution gate.
-        raise ValueError("Round 2 currently defines Transformer blocks at D=96.")
 
     base = _base_config(
         context_length=context_length,
