@@ -75,6 +75,7 @@ def build_absolute_correlation_graph_prior(
     clean_training_split: Mapping[str, Any],
     *,
     expected_asset_cols: Sequence[str],
+    threshold: float | None = None,
     eps: float = 1.0e-12,
 ) -> Tensor:
     """Build a training-only absolute one-minute Close-return prior.
@@ -110,5 +111,24 @@ def build_absolute_correlation_graph_prior(
         covariance / denominator.clamp_min(eps),
         torch.zeros_like(covariance),
     ).abs()
-    correlation = torch.nan_to_num(correlation, nan=0.0, posinf=0.0, neginf=0.0)
-    return _row_normalise_nonnegative(correlation.float(), eps=eps)
+    correlation = torch.nan_to_num(correlation,nan=0.0,posinf=0.0,neginf=0.0,)
+
+    # Threshold is applied to the absolute correlation values before
+    # removing the diagonal and row-normalising the graph.
+    if threshold is not None:
+        threshold = float(threshold)
+
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                "Correlation threshold must lie between 0 and 1."
+            )
+
+        correlation = correlation.masked_fill(
+            correlation < threshold,
+            0.0,
+        )
+
+    return _row_normalise_nonnegative(
+        correlation.float(),
+        eps=eps,
+    )
