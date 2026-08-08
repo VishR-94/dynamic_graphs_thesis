@@ -4673,6 +4673,99 @@ def detect_run_kind(run_dir: str | Path) -> AnalysisRunKind:
     )
 
 
+def _positive_int_tuple(
+    values: Any,
+    *,
+    name: str,
+) -> tuple[int, ...] | None:
+    """Return an optional positive-integer schedule from saved metadata."""
+
+    if values is None:
+        return None
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError(f"{name} must be a sequence of positive integers.")
+    result = tuple(int(value) for value in values)
+    if not result or any(value <= 0 for value in result):
+        raise ValueError(f"{name} must contain positive integers.")
+    return result
+
+
+def _resolve_graph_schema(
+    *,
+    model_values: Mapping[str, Any],
+    graph_values: Mapping[str, Any],
+    resolved: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> tuple[str, int, tuple[int, ...] | None]:
+    """Resolve graph type/head metadata across historical model schemas.
+
+    Graph Hub analyses saved graph tensors.  Configuration metadata is only
+    used to describe those tensors, so a new runner must not become
+    unreadable merely because it stores a per-block head schedule instead of
+    the historical scalar ``model.graph.num_heads`` field.
+    """
+
+    schedule_sources = (
+        (graph_values.get("num_heads_per_block"), "model.graph.num_heads_per_block"),
+        (graph_values.get("num_heads_per_layer"), "model.graph.num_heads_per_layer"),
+        (graph_values.get("layer_head_counts"), "model.graph.layer_head_counts"),
+        (metadata.get("graph_heads_per_block"), "run_metadata.graph_heads_per_block"),
+        (metadata.get("graph_heads_per_layer"), "run_metadata.graph_heads_per_layer"),
+    )
+    per_layer: tuple[int, ...] | None = None
+    for raw_values, name in schedule_sources:
+        if raw_values is not None:
+            per_layer = _positive_int_tuple(raw_values, name=name)
+            break
+    if per_layer is None:
+        per_block_values = resolved.get("per_block")
+        if isinstance(per_block_values, Mapping):
+            per_layer = _positive_int_tuple(
+                per_block_values.get("num_edge_heads"),
+                name="per_block.num_edge_heads",
+            )
+
+    scalar_heads = graph_values.get("num_heads")
+    if scalar_heads is None:
+        scalar_heads = metadata.get("graph_heads")
+    if scalar_heads is None and per_layer is not None:
+        scalar_heads = per_layer[-1]
+    if scalar_heads is None:
+        raise KeyError(
+            "No graph-head metadata was found. Expected model.graph.num_heads "
+            "or a per-block/per-layer graph-head schedule."
+        )
+    num_heads = int(scalar_heads)
+    if num_heads <= 0:
+        raise ValueError("The final graph-head count must be positive.")
+    if per_layer is not None and per_layer[-1] != num_heads:
+        raise ValueError(
+            "The final per-layer graph-head count does not match the saved "
+            f"scalar head count: {per_layer[-1]} vs {num_heads}."
+        )
+
+    graph_type_value = graph_values.get("type")
+    if graph_type_value is None:
+        graph_type_value = graph_values.get("graph_type")
+    if graph_type_value is None:
+        graph_family = model_values.get(
+            "graph_family",
+            metadata.get("graph_family"),
+        )
+        family_aliases = {
+            "dynamic_only": "dynamic",
+            "prior_state": "static_dynamic_mixture",
+        }
+        graph_type_value = family_aliases.get(
+            str(graph_family),
+            graph_family,
+        )
+    if graph_type_value is None:
+        graph_type_value = metadata.get("graph_type", "unknown")
+
+    return str(graph_type_value), num_heads, per_layer
+
+
 def load_unified_run_info(run_dir: str | Path) -> UnifiedRunInfo:
     """Load run metadata without assuming a continuous or tokenized model."""
 
@@ -4741,26 +4834,12 @@ def load_unified_run_info(run_dir: str | Path) -> UnifiedRunInfo:
     if not horizons or any(value <= 0 for value in horizons):
         raise ValueError("Evaluation horizons must be positive integers.")
 
-    per_layer_head_values = graph_values.get("num_heads_per_block")
-    if per_layer_head_values is None:
-        per_layer_head_values = graph_values.get("num_heads_per_layer")
-    if per_layer_head_values is None:
-        per_block_values = resolved.get("per_block")
-        if isinstance(per_block_values, Mapping):
-            per_layer_head_values = per_block_values.get("num_edge_heads")
-    num_heads_per_layer = (
-        None
-        if per_layer_head_values is None
-        else tuple(int(value) for value in per_layer_head_values)
+    graph_type, num_heads, num_heads_per_layer = _resolve_graph_schema(
+        model_values=model_values,
+        graph_values=graph_values,
+        resolved=resolved,
+        metadata=metadata,
     )
-    if num_heads_per_layer is not None:
-        if not num_heads_per_layer or any(value <= 0 for value in num_heads_per_layer):
-            raise ValueError("Per-layer graph-head counts must be positive integers.")
-        if int(num_heads_per_layer[-1]) != int(graph_values["num_heads"]):
-            raise ValueError(
-                "The final per-layer graph-head count does not match graph.num_heads: "
-                f"{num_heads_per_layer[-1]} vs {graph_values['num_heads']}."
-            )
 
     return UnifiedRunInfo(
         run_dir=run_path,
@@ -4769,9 +4848,9 @@ def load_unified_run_info(run_dir: str | Path) -> UnifiedRunInfo:
         run_metadata=metadata,
         asset_cols=asset_cols,
         horizons=horizons,
-        graph_type=str(graph_values["type"]),
+        graph_type=graph_type,
         num_nodes=num_nodes,
-        num_heads=int(graph_values["num_heads"]),
+        num_heads=num_heads,
         num_heads_per_layer=num_heads_per_layer,
         add_self_loops=bool(graph_values.get("add_self_loops", False)),
         selection_metric=selection_metric,
@@ -5263,10 +5342,17 @@ def select_graph_snapshot(
     )
     absolute_index = int(row["Global window index"])
 
-    if component == "selected" and layer != -1:
-        per_layer = graph.get("per_layer")
+    if layer != -1:
+        per_layer_key = {
+            "selected": "per_layer",
+            "base": "per_layer_base",
+            "dynamic": "per_layer_dynamic",
+        }[component]
+        per_layer = graph.get(per_layer_key)
         if not isinstance(per_layer, Sequence):
-            raise ValueError("Saved graph artefact does not contain per_layer.")
+            raise ValueError(
+                f"Saved graph artefact does not contain {per_layer_key}."
+            )
         layer_index = _normalise_layer_index(layer, len(per_layer))
         values = per_layer[layer_index]
     else:
@@ -6055,6 +6141,10 @@ def make_unified_model_summary_table(run_dir: str | Path) -> pd.DataFrame:
         graph = model["graph"]
         training = resolved.get("training", {})
         basedygraph = resolved.get("basedygraph_financial")
+        round2 = (
+            metadata.get("model_family") == "modern_tcn_graph_round2"
+            or isinstance(model.get("temporal_stack"), Mapping)
+        )
 
         if isinstance(basedygraph, Mapping):
             regularisation = basedygraph.get("regularisation", {})
@@ -6092,6 +6182,61 @@ def make_unified_model_summary_table(run_dir: str | Path) -> pd.DataFrame:
                     ("Target-entropy weight", regularisation.get("target_entropy_weight")),
                     ("Temporal-smoothness weight", regularisation.get("temporal_smooth_weight")),
                     ("Backbone learning rate", training.get("learning_rate")),
+                ]
+            )
+        elif round2:
+            temporal_stack = model.get("temporal_stack", {})
+            if not isinstance(temporal_stack, Mapping):
+                temporal_stack = {}
+            modern = temporal_stack.get("modern_tcn", {})
+            if not isinstance(modern, Mapping):
+                modern = {}
+            transformer = temporal_stack.get("transformer", {})
+            if not isinstance(transformer, Mapping):
+                transformer = {}
+            spatial = model.get("spatial", {})
+            if not isinstance(spatial, Mapping):
+                spatial = {}
+            prior = model.get("prior", {})
+            if not isinstance(prior, Mapping):
+                prior = {}
+            loss = training.get("loss", {})
+            if not isinstance(loss, Mapping):
+                loss = {}
+            rows.extend(
+                [
+                    ("Input representation", resolved["data"].get("input_representation")),
+                    ("Temporal stack family", temporal_stack.get("family")),
+                    ("Interlaced ST blocks", metadata.get("num_st_blocks", (
+                        None
+                        if info.num_heads_per_layer is None
+                        else len(info.num_heads_per_layer)
+                    ))),
+                    ("ModernTCN hidden dimension", modern.get("d_model")),
+                    ("ModernTCN blocks", modern.get("num_blocks")),
+                    ("ModernTCN patch / stride", f"{modern.get('patch_size')} / {modern.get('patch_stride')}"),
+                    ("ModernTCN large / small kernel", f"{modern.get('large_kernel')} / {modern.get('small_kernel')}"),
+                    ("Transformer hidden dimension", transformer.get("d_model")),
+                    ("Transformer layers per ST block", transformer.get("num_layers")),
+                    ("Transformer temporal heads", transformer.get("num_heads")),
+                    ("Transformer FF multiplier", transformer.get("feedforward_multiplier")),
+                    ("Transformer dropout", transformer.get("dropout")),
+                    ("Graph family", model.get("graph_family")),
+                    ("Graph type", info.graph_type),
+                    ("Graph heads by block", list(info.num_heads_per_layer or (info.num_heads,))),
+                    ("Graph hidden dimensions by block", graph.get("hidden_dims_per_block")),
+                    ("Graph activations by block", graph.get("activations_per_block")),
+                    ("Prior type", prior.get("type")),
+                    ("Prior scale", prior.get("scale")),
+                    ("Prior jitter", prior.get("jitter")),
+                    ("State pathway", metadata.get("state_pathway")),
+                    ("Initial graph alpha", graph.get("initial_alpha")),
+                    ("Spatial gate", spatial.get("gate_type")),
+                    ("Initial spatial beta", spatial.get("initial_beta")),
+                    ("Output representation", model.get("output_representation")),
+                    ("Training loss", loss.get("type")),
+                    ("Backbone learning rate", training.get("learning_rate")),
+                    ("Graph learning rate", training.get("graph_learning_rate")),
                 ]
             )
         else:
@@ -6783,18 +6928,23 @@ def _normalise_graph_payload(
                 name=key,
             )
 
-    per_layer = graph.get("per_layer")
-    if isinstance(per_layer, Sequence) and not isinstance(per_layer, (str, bytes)):
+    for key in ("per_layer", "per_layer_base", "per_layer_dynamic"):
+        per_layer = graph.get(key)
+        if not (
+            isinstance(per_layer, Sequence)
+            and not isinstance(per_layer, (str, bytes))
+        ):
+            continue
         if (
             info.num_heads_per_layer is not None
             and len(per_layer) != len(info.num_heads_per_layer)
         ):
             raise ValueError(
-                "Saved per-layer graph count does not match the configured "
+                f"Saved {key} graph count does not match the configured "
                 f"head-count schedule: {len(per_layer)} vs "
                 f"{len(info.num_heads_per_layer)}."
             )
-        graph["per_layer"] = tuple(
+        graph[key] = tuple(
             None
             if values is None
             else _normalise_saved_graph_tensor(
@@ -6806,7 +6956,7 @@ def _normalise_graph_payload(
                     if info.num_heads_per_layer is None
                     else info.num_heads_per_layer[index]
                 ),
-                name=f"per_layer[{index}]",
+                name=f"{key}[{index}]",
             )
             for index, values in enumerate(per_layer)
         )
@@ -8488,10 +8638,17 @@ def _graph_component_tensor(
             f"No {artifacts.split} graph artefact exists for {artifacts.info.run_dir}."
         )
     graph = artifacts.graph_artifacts
-    if component == "selected" and int(layer) != -1:
-        per_layer = graph.get("per_layer")
+    if int(layer) != -1:
+        per_layer_key = {
+            "selected": "per_layer",
+            "base": "per_layer_base",
+            "dynamic": "per_layer_dynamic",
+        }[component]
+        per_layer = graph.get(per_layer_key)
         if not isinstance(per_layer, Sequence) or isinstance(per_layer, (str, bytes)):
-            raise ValueError("Saved graph artefact does not contain per_layer graphs.")
+            raise ValueError(
+                f"Saved graph artefact does not contain {per_layer_key} graphs."
+            )
         layer_index = _normalise_layer_index(int(layer), len(per_layer))
         values = per_layer[layer_index]
     else:

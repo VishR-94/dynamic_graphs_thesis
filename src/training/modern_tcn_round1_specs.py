@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
@@ -19,6 +20,7 @@ AblationFamily = Literal[
     "dimitri_optimisation",
     "no_beta_round1_optimisation",
     "no_beta_dimitri_optimisation",
+    "alpha_beta_initialisation_sweep",
 ]
 
 
@@ -380,6 +382,115 @@ def make_gate_optimisation_ablation_specs(
         )
     if len(result) != 9 or len({spec.run_name for spec in result}) != 9:
         raise AssertionError("Expected nine unique gate/optimisation ablations.")
+    return tuple(result)
+
+
+def _float_tag(value: float) -> str:
+    """Return a compact filesystem-safe tag for a finite float."""
+
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Sweep values must be finite.")
+    return f"{number:g}".replace("-", "m").replace(".", "p")
+
+
+def make_alpha_beta_initialisation_sweep_specs(
+    *,
+    alpha_initials: Sequence[float] = (0.5, 0.25, 0.15),
+    beta_initials: Sequence[float] = (0.25, 0.5, 0.75),
+    prior_type: Literal["sector", "correlation"] = "sector",
+    context_length: int = 60,
+    stride: int = 15,
+    horizons: Sequence[int] = (1, 5, 15, 30, 60),
+    prior_scale: float = 4.0,
+    prior_jitter: float = 0.02,
+    seed: int = 42,
+) -> tuple[Round1RunSpec, ...]:
+    """Build a flexible initial-alpha × initial-beta sweep for R1-C.
+
+    Every specification uses the one-head ModernTCN prior-mixture-state
+    architecture, the original Round-1 optimiser/scheduler, learned scalar
+    alpha and beta gates, and no graph regularisation.  The supplied values
+    are *initialisations*; both gates remain trainable.
+    """
+
+    alpha_values = tuple(float(value) for value in alpha_initials)
+    beta_values = tuple(float(value) for value in beta_initials)
+    if not alpha_values or not beta_values:
+        raise ValueError("alpha_initials and beta_initials must be non-empty.")
+    if len(set(alpha_values)) != len(alpha_values):
+        raise ValueError("alpha_initials contains duplicate values.")
+    if len(set(beta_values)) != len(beta_values):
+        raise ValueError("beta_initials contains duplicate values.")
+    for name, values in (
+        ("alpha_initials", alpha_values),
+        ("beta_initials", beta_values),
+    ):
+        invalid = [value for value in values if not 0.0 < value < 1.0]
+        if invalid:
+            raise ValueError(
+                f"{name} values must lie strictly between zero and one; "
+                f"received {invalid}."
+            )
+
+    base_specs = make_round1_specs(
+        prior_type=prior_type,
+        context_length=context_length,
+        stride=stride,
+        horizons=horizons,
+        prior_scale=prior_scale,
+        prior_jitter=prior_jitter,
+        seed=seed,
+    )
+    source = next(
+        spec for spec in base_specs if spec.variant == "prior_mixture_state"
+    )
+    prior_tag = "sector" if prior_type == "sector" else "abscorr"
+    horizon_tag = "-".join(str(int(value)) for value in horizons)
+    suffix = (
+        f"{prior_tag}_state_g1_gh32_"
+        f"ps{_float_tag(prior_scale)}_"
+        f"pj{_float_tag(prior_jitter)}_"
+        f"c{int(context_length)}_s{int(stride)}_h{horizon_tag}"
+    )
+
+    result: list[Round1RunSpec] = []
+    for alpha_initial in alpha_values:
+        for beta_initial in beta_values:
+            values = json.loads(json.dumps(source.config))
+            values["model"]["graph"]["initial_alpha"] = float(alpha_initial)
+            values["model"]["spatial"]["initial_beta"] = float(beta_initial)
+            values["model"]["graph"]["gate_type"] = "learned_scalar"
+            values["model"]["spatial"]["gate_type"] = "learned_scalar"
+            values["training"]["optimisation_profile"] = "round1"
+
+            alpha_tag = _float_tag(alpha_initial)
+            beta_tag = _float_tag(beta_initial)
+            result.append(
+                Round1RunSpec(
+                    run_name=(
+                        f"r1ab_a{alpha_tag}_b{beta_tag}_{suffix}"
+                    ),
+                    label=(
+                        "R1-C alpha/beta initialisation sweep — "
+                        f"alpha={alpha_initial:g}, beta={beta_initial:g}"
+                    ),
+                    variant="prior_mixture_state",
+                    prior_type=prior_type,
+                    graph_heads=1,
+                    graph_hidden_dim=32,
+                    config=values,
+                    optimisation_profile="round1",
+                    spatial_gate_type="learned_scalar",
+                    ablation_family="alpha_beta_initialisation_sweep",
+                )
+            )
+
+    run_names = [spec.run_name for spec in result]
+    if len(set(run_names)) != len(run_names):
+        raise ValueError(
+            "The requested alpha/beta values produce duplicate run names."
+        )
     return tuple(result)
 
 

@@ -355,6 +355,119 @@ def _write_basedygraph_continuous_run(root: Path) -> Path:
         )
     return run
 
+
+def _write_round2_continuous_run(root: Path) -> Path:
+    """Write a Round-2 run whose graph schema has only per-block heads."""
+
+    run = root / "round2_prior_state"
+    run.mkdir(parents=True)
+    config = {
+        "data": {
+            "horizons": list(HORIZONS),
+            "target_channel": "close",
+            "context_length": 60,
+            "input_representation": "raw",
+        },
+        "model": {
+            "output_representation": "normalised_close",
+            "graph_family": "prior_state",
+            "temporal_stack": {
+                "family": "transformer_only",
+                "num_transformer_blocks": 2,
+                "modern_tcn": {"d_model": 32},
+                "transformer": {
+                    "d_model": 96,
+                    "num_layers": 1,
+                    "num_heads": 4,
+                    "feedforward_multiplier": 2,
+                    "dropout": 0.0,
+                },
+            },
+            "graph": {
+                "num_heads_per_block": [2, 1],
+                "hidden_dims_per_block": [64, 96],
+                "activations_per_block": ["softmax", "sparsemax"],
+                "initial_alpha": 0.25,
+                "add_self_loops": False,
+            },
+            "spatial": {
+                "feedforward_multiplier": 2,
+                "dropout": 0.0,
+                "gate_type": "learned_scalar",
+                "initial_beta": 0.5,
+            },
+            "prior": {"type": "sector", "scale": 4.0, "jitter": 0.02},
+        },
+        "training": {
+            "selection_metric": "mean_all_horizon_cumulative_log_change_mae",
+            "learning_rate": 2.5e-4,
+            "graph_learning_rate": 5.0e-4,
+            "loss": {"type": "cumulative_log_change_mae"},
+        },
+    }
+    _save_json(run / "resolved_config.json", config)
+    _save_json(
+        run / "run_metadata.json",
+        {
+            "status": "completed",
+            "asset_cols": list(ASSETS),
+            "best_epoch": 3,
+            "model_family": "modern_tcn_graph_round2",
+            "graph_family": "prior_state",
+            "graph_heads_per_block": [2, 1],
+            "num_st_blocks": 2,
+            "state_pathway": True,
+            "trainable_parameter_count": 6789,
+            "project_git_commit": "ghi",
+        },
+    )
+    _write_history(run)
+    prediction = _prediction_result()
+    final_values = _graph_values(dynamic=True)
+    first_values = torch.cat(
+        [final_values, final_values.roll(shifts=1, dims=-1)],
+        dim=1,
+    )
+    first_base = first_values[0].clone()
+    final_base = final_values[0].clone()
+    graph = {
+        "graph_type": "prior_state",
+        "graph_orientation": "A[target, source]",
+        "asset_cols": list(ASSETS),
+        "num_layers": 2,
+        "num_heads": 1,
+        "num_heads_per_layer": [2, 1],
+        "selected_layer": 1,
+        "selected": final_values,
+        "dynamic": final_values,
+        "base": final_base,
+        "per_layer": (first_values, final_values),
+        "per_layer_dynamic": (first_values, final_values),
+        "per_layer_base": (first_base, final_base),
+        "alpha": torch.tensor([0.3]),
+        "alpha_per_layer": (torch.tensor([0.2]), torch.tensor([0.3])),
+        "beta": torch.tensor([0.48]),
+        "beta_per_layer": torch.tensor([0.45, 0.48]),
+        "dates": list(DATES),
+    }
+
+    torch.save(prediction, run / "best_validation_predictions.pt")
+    torch.save(graph, run / "best_validation_graphs.pt")
+    _metric_table().to_csv(run / "best_validation_metric_table.csv", index=False)
+    for split in ("train", "test"):
+        directory = run / "analysis" / split
+        directory.mkdir(parents=True)
+        torch.save(
+            {"epoch": 3, "prediction_result": prediction},
+            directory / "predictions.pt",
+        )
+        torch.save(
+            {"epoch": 3, "graph_artifacts": graph},
+            directory / "graphs.pt",
+        )
+        _metric_table().to_csv(directory / "metric_table.csv", index=False)
+    return run
+
 def _token_config() -> dict:
     return {
         "models": {
@@ -504,6 +617,7 @@ def main() -> None:
         correlation = _write_continuous_run(root, "continuous_correlation", "fixed", 2.0e-5)
         token = _write_token_run(root)
         basedygraph = _write_basedygraph_continuous_run(root)
+        round2 = _write_round2_continuous_run(root)
         arbitrary = _write_continuous_run(
             root, "weighted_loss_dynamic_experiment", "dynamic", 3.0e-5
         )
@@ -528,8 +642,14 @@ def main() -> None:
             "continuous_correlation",
             "tokenized_dynamic",
             "continuous_basedygraph",
+            "round2_prior_state",
             "weighted_loss_dynamic_experiment",
         }
+        round2_row = discovered.loc[
+            discovered["Folder"].eq("round2_prior_state")
+        ].iloc[0]
+        assert round2_row["Issue"] is None
+        assert round2_row["Graph type"] == "static_dynamic_mixture"
         assert resolve_model_folder("continuous_dynamic", models_root=root) == dynamic.resolve()
 
         token_paths = resolve_evaluation_artifact_paths(
@@ -630,6 +750,7 @@ def main() -> None:
             "Continuous correlation": correlation,
             "Tokenized dynamic": token,
             "Continuous BaseDyGraph": basedygraph,
+            "Round 2 prior-state": round2,
         }
         policies = {"Tokenized dynamic": "auto"}
         audit = make_model_artifact_audit(models, split="validation", policies=policies)
@@ -644,6 +765,8 @@ def main() -> None:
         assert architecture.loc["Graph activations by layer", "Continuous BaseDyGraph"] == [
             "softmax", "softmax", "softmax", "sparsemax"
         ]
+        assert architecture.loc["Graph heads by block", "Round 2 prior-state"] == [2, 1]
+        assert architecture.loc["Transformer hidden dimension", "Round 2 prior-state"] == 96
         metrics = make_model_metric_comparison(models, split="validation", policies=policies)
         assert len(metrics) == (len(models) - 1) * len(HORIZONS) + 1
         style_model_metric_comparison(metrics, caption="test")._repr_html_()
@@ -688,6 +811,30 @@ def main() -> None:
         ) <= len(ASSETS) - 1
         all_graph.adjacency_figure.clf()
         all_graph.frequency_figure.clf()
+
+        round2_layer = analyse_graph(
+            round2,
+            split="train",
+            component="selected",
+            layer=0,
+            head="mean",
+            cluster=False,
+        )
+        assert round2_layer.graph.layer == 0
+        round2_layer.adjacency_figure.clf()
+        round2_layer.frequency_figure.clf()
+
+        round2_static_layer = analyse_graph(
+            round2,
+            split="train",
+            component="base",
+            layer=0,
+            head=1,
+            cluster=False,
+        )
+        assert round2_static_layer.graph.layer == 0
+        round2_static_layer.adjacency_figure.clf()
+        round2_static_layer.frequency_figure.clf()
 
         sector_grouped_graph = analyse_graph(
             dynamic,

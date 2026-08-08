@@ -28,6 +28,7 @@ from src.models.modern_tcn_graph_round1 import (
     round1_model_config_from_mapping,
 )
 from src.training.modern_tcn_round1_specs import (
+    make_alpha_beta_initialisation_sweep_specs,
     make_gate_optimisation_ablation_specs,
     make_round1_specs,
     make_six_head_ablation_spec,
@@ -287,6 +288,42 @@ def main() -> None:
             spec.config["model"]["spatial"]["gate_type"] != "none"
         ):
             raise AssertionError("No-beta spec retained a learned beta gate.")
+
+    # Alpha/beta initialisation sweep is flexible and changes only the two
+    # learned-gate starting values on the one-head R1-C architecture.
+    alpha_beta_specs = make_alpha_beta_initialisation_sweep_specs(
+        alpha_initials=(0.5, 0.2),
+        beta_initials=(0.25, 0.75),
+        prior_type="sector",
+        context_length=44,
+        stride=9,
+        horizons=(1, 4),
+    )
+    if len(alpha_beta_specs) != 4:
+        raise AssertionError("Unexpected alpha/beta sweep cardinality.")
+    observed_pairs = {
+        (
+            float(spec.config["model"]["graph"]["initial_alpha"]),
+            float(spec.config["model"]["spatial"]["initial_beta"]),
+        )
+        for spec in alpha_beta_specs
+    }
+    if observed_pairs != {(0.5, 0.25), (0.5, 0.75), (0.2, 0.25), (0.2, 0.75)}:
+        raise AssertionError(f"Unexpected sweep pairs: {observed_pairs}.")
+    for spec in alpha_beta_specs:
+        _validate_config(spec.config)
+        if spec.variant != "prior_mixture_state":
+            raise AssertionError("Sweep must retain the R1-C state pathway.")
+        if spec.graph_heads != 1 or spec.graph_hidden_dim != 32:
+            raise AssertionError("Sweep unexpectedly changes graph capacity.")
+        if spec.config["training"]["scheduler"] != "modern_tcn_type3":
+            raise AssertionError("Sweep changed the Round-1 schedule.")
+        if spec.config["model"]["graph_regularisation"][
+            "graph_target_entropy_reg"
+        ] != 0.0:
+            raise AssertionError("Sweep unexpectedly enables graph regularisation.")
+        if "a" not in spec.run_name or "b" not in spec.run_name:
+            raise AssertionError("Sweep run names do not encode both gate values.")
 
     # Six-head ablation preserves 32 graph dimensions per head.
     standard_specs = make_round1_specs(prior_type="sector")
