@@ -5073,3 +5073,567 @@ def style_s1_topk_locf_reconstruction_table(
         .set_caption(caption)
     )
 
+
+
+def _token_corruption_top_ids(
+    encoded_data: Mapping[str, Any],
+    *,
+    token_key: str,
+    top_k: int,
+    vocabulary_size: int = 1024,
+) -> torch.Tensor:
+    """Return the most frequent valid token IDs with deterministic ties."""
+    if token_key not in {"s1", "s2"}:
+        raise ValueError("token_key must be 's1' or 's2'.")
+    if top_k < 2 or top_k > vocabulary_size:
+        raise ValueError(
+            "top_k must lie between 2 and vocabulary_size."
+        )
+
+    values = torch.as_tensor(
+        encoded_data[token_key],
+        dtype=torch.long,
+    )
+    valid_mask = torch.as_tensor(
+        encoded_data["valid_mask"],
+        dtype=torch.bool,
+    )
+
+    if values.ndim != 3:
+        raise ValueError(
+            f"encoded_data[{token_key!r}] must have shape "
+            "[session, bar, asset]."
+        )
+    if tuple(valid_mask.shape) != tuple(values.shape[:2]):
+        raise ValueError(
+            "encoded valid_mask does not align with the final token stream."
+        )
+
+    valid_values = values[
+        valid_mask.unsqueeze(-1).expand_as(values)
+    ]
+    if valid_values.numel() == 0:
+        raise ValueError("The encoded cache has no valid tokens.")
+    if int(valid_values.min()) < 0 or int(valid_values.max()) >= vocabulary_size:
+        raise ValueError(
+            f"Valid {token_key} IDs must lie in [0, {vocabulary_size - 1}]."
+        )
+
+    counts = torch.bincount(
+        valid_values,
+        minlength=vocabulary_size,
+    )
+    observed = [
+        token_id
+        for token_id in range(vocabulary_size)
+        if int(counts[token_id]) > 0
+    ]
+    if len(observed) < top_k:
+        raise ValueError(
+            f"Only {len(observed)} distinct {token_key} IDs are observed; "
+            f"cannot form a top-{top_k} replacement set."
+        )
+
+    observed.sort(
+        key=lambda token_id: (
+            -int(counts[token_id]),
+            token_id,
+        )
+    )
+    return torch.tensor(
+        observed[:top_k],
+        dtype=torch.long,
+    )
+
+
+def _token_corruption_replacement_table(
+    top_ids: torch.Tensor,
+    *,
+    vocabulary_size: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build per-original-ID replacement options excluding that ID."""
+    top_ids = torch.as_tensor(top_ids, dtype=torch.long).flatten()
+    if top_ids.numel() < 2:
+        raise ValueError("At least two replacement IDs are required.")
+    if torch.unique(top_ids).numel() != top_ids.numel():
+        raise ValueError("Replacement IDs must be unique.")
+
+    option_count = int(top_ids.numel())
+    options = torch.full(
+        (vocabulary_size, option_count),
+        fill_value=-1,
+        dtype=torch.long,
+    )
+    counts = torch.empty(
+        vocabulary_size,
+        dtype=torch.long,
+    )
+
+    for token_id in range(vocabulary_size):
+        eligible = top_ids[top_ids != token_id]
+        counts[token_id] = int(eligible.numel())
+        options[token_id, : eligible.numel()] = eligible
+
+    if torch.any(counts < 1):
+        raise RuntimeError(
+            "At least one token ID has no eligible replacement."
+        )
+    return options, counts
+
+
+def _token_corruption_draw_replacements(
+    original: torch.Tensor,
+    uniform_draws: torch.Tensor,
+    *,
+    options: torch.Tensor,
+    option_counts: torch.Tensor,
+) -> torch.Tensor:
+    """Draw one allowed replacement for every selected original token."""
+    original = original.to(torch.long)
+    uniform_draws = uniform_draws.to(torch.float64)
+
+    counts = option_counts[original]
+    ranks = torch.floor(
+        uniform_draws * counts.to(torch.float64)
+    ).to(torch.long)
+    ranks = torch.minimum(ranks, counts - 1)
+    replacement = options[original, ranks]
+
+    if torch.any(replacement < 0):
+        raise RuntimeError("Failed to draw a valid replacement token.")
+    if torch.any(replacement == original):
+        raise RuntimeError(
+            "Token corruption selected the original token as its replacement."
+        )
+    return replacement
+
+
+def _token_corruption_seed(
+    seed: int,
+    *,
+    session_index: int,
+    stream_offset: int,
+) -> int:
+    """Create a stable non-negative seed for one session and random stream."""
+    modulus = (1 << 63) - 1
+    return int(
+        (
+            int(seed)
+            + 1_000_003 * int(session_index)
+            + 97_409 * int(stream_offset)
+        )
+        % modulus
+    )
+
+
+def _build_corrupted_token_cache(
+    encoded_data: Mapping[str, Any],
+    *,
+    corruption_fraction: float,
+    top_s1_ids: torch.Tensor,
+    top_s2_ids: torch.Tensor,
+    seed: int,
+) -> dict[str, Any]:
+    """Corrupt an exact, nested fraction of each rolling token sequence.
+
+    For every [session, rolling context, asset] sequence, the same randomly
+    ranked positions are selected for s1 and s2. The s1 and s2 replacements
+    are drawn independently from their own stream's top-frequency IDs. A
+    selected replacement is guaranteed to differ from the original ID.
+    """
+    fraction = float(corruption_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("corruption_fraction must lie strictly in (0, 1).")
+
+    context_s1 = torch.as_tensor(encoded_data["context_s1"])
+    context_s2 = torch.as_tensor(encoded_data["context_s2"])
+    if context_s1.shape != context_s2.shape or context_s1.ndim != 4:
+        raise ValueError(
+            "context_s1 and context_s2 must share shape [S, K, T, N]."
+        )
+
+    (
+        num_sessions,
+        num_contexts,
+        context_length,
+        num_assets,
+    ) = context_s1.shape
+    num_corrupted_positions = int(round(fraction * context_length))
+    num_corrupted_positions = min(
+        context_length,
+        max(1, num_corrupted_positions),
+    )
+
+    corrupted_s1 = context_s1.clone()
+    corrupted_s2 = context_s2.clone()
+
+    s1_options, s1_option_counts = _token_corruption_replacement_table(
+        top_s1_ids
+    )
+    s2_options, s2_option_counts = _token_corruption_replacement_table(
+        top_s2_ids
+    )
+
+    for session_index in range(num_sessions):
+        # [K, T, N] -> [K, N, T], so the final axis is one token sequence.
+        original_s1 = context_s1[session_index].to(torch.long).permute(
+            0, 2, 1
+        ).contiguous()
+        original_s2 = context_s2[session_index].to(torch.long).permute(
+            0, 2, 1
+        ).contiguous()
+
+        mask_generator = torch.Generator(device="cpu")
+        mask_generator.manual_seed(
+            _token_corruption_seed(
+                seed,
+                session_index=session_index,
+                stream_offset=0,
+            )
+        )
+        position_scores = torch.rand(
+            (num_contexts, num_assets, context_length),
+            generator=mask_generator,
+            dtype=torch.float32,
+        )
+        selected_positions = torch.argsort(
+            position_scores,
+            dim=-1,
+        )[..., :num_corrupted_positions]
+
+        s1_generator = torch.Generator(device="cpu")
+        s1_generator.manual_seed(
+            _token_corruption_seed(
+                seed,
+                session_index=session_index,
+                stream_offset=1,
+            )
+        )
+        s1_uniform = torch.rand(
+            (num_contexts, num_assets, context_length),
+            generator=s1_generator,
+            dtype=torch.float32,
+        ).gather(-1, selected_positions)
+
+        s2_generator = torch.Generator(device="cpu")
+        s2_generator.manual_seed(
+            _token_corruption_seed(
+                seed,
+                session_index=session_index,
+                stream_offset=2,
+            )
+        )
+        s2_uniform = torch.rand(
+            (num_contexts, num_assets, context_length),
+            generator=s2_generator,
+            dtype=torch.float32,
+        ).gather(-1, selected_positions)
+
+        selected_s1 = original_s1.gather(-1, selected_positions)
+        selected_s2 = original_s2.gather(-1, selected_positions)
+        replacement_s1 = _token_corruption_draw_replacements(
+            selected_s1,
+            s1_uniform,
+            options=s1_options,
+            option_counts=s1_option_counts,
+        )
+        replacement_s2 = _token_corruption_draw_replacements(
+            selected_s2,
+            s2_uniform,
+            options=s2_options,
+            option_counts=s2_option_counts,
+        )
+
+        session_s1 = original_s1.clone()
+        session_s2 = original_s2.clone()
+        session_s1.scatter_(-1, selected_positions, replacement_s1)
+        session_s2.scatter_(-1, selected_positions, replacement_s2)
+
+        corrupted_s1[session_index] = session_s1.permute(
+            0, 2, 1
+        ).to(context_s1.dtype)
+        corrupted_s2[session_index] = session_s2.permute(
+            0, 2, 1
+        ).to(context_s2.dtype)
+
+
+    origin_indices = torch.as_tensor(
+        encoded_data["origin_indices"],
+        dtype=torch.long,
+    )
+    final_s1 = torch.as_tensor(encoded_data["s1"]).clone()
+    final_s2 = torch.as_tensor(encoded_data["s2"]).clone()
+    final_s1[:, origin_indices] = corrupted_s1[:, :, -1]
+    final_s2[:, origin_indices] = corrupted_s2[:, :, -1]
+
+    output = dict(encoded_data)
+    output.update(
+        {
+            "kind": "kronos_causal_rolling_tokens_random_corruption",
+            "context_s1": corrupted_s1,
+            "context_s2": corrupted_s2,
+            "s1": final_s1,
+            "s2": final_s2,
+            "token_corruption": {
+                "fraction": fraction,
+                "percent": 100.0 * fraction,
+                "positions_per_context": num_corrupted_positions,
+                "context_length": context_length,
+                "top_k_replacements": int(top_s1_ids.numel()),
+                "top_s1_ids": [int(value) for value in top_s1_ids],
+                "top_s2_ids": [int(value) for value in top_s2_ids],
+                "seed": int(seed),
+                "position_selection": (
+                    "exact random positions per rolling-context/asset; "
+                    "nested across corruption fractions for one seed"
+                ),
+                "coarse_mode": "corrupt s1 at selected positions",
+                "full_mode": (
+                    "corrupt s1 and s2 at the same selected positions; "
+                    "stream-specific replacements"
+                ),
+                "replacement_rule": (
+                    "uniform over the stream-specific top-frequency IDs "
+                    "after excluding the original token"
+                ),
+            },
+        }
+    )
+    return output
+
+
+def _token_corruption_fraction_tag(fraction: float) -> str:
+    percent = 100.0 * float(fraction)
+    if abs(percent - round(percent)) < 1.0e-9:
+        return f"{int(round(percent)):02d}pct"
+    return (
+        f"{percent:.4f}"
+        .rstrip("0")
+        .rstrip(".")
+        .replace(".", "p")
+        + "pct"
+    )
+
+
+def _validate_token_corruption_cache(
+    cache: Mapping[str, Any],
+    *,
+    source: Mapping[str, Any],
+    fraction: float,
+    top_s1_ids: torch.Tensor,
+    top_s2_ids: torch.Tensor,
+    seed: int,
+) -> None:
+    """Validate only the contract needed to safely reuse a saved variant."""
+    metadata = cache.get("token_corruption")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("Saved corrupted cache has no token_corruption metadata.")
+    if abs(float(metadata.get("fraction", -1.0)) - float(fraction)) > 1.0e-12:
+        raise ValueError("Saved corrupted cache uses a different fraction.")
+    if int(metadata.get("seed", -1)) != int(seed):
+        raise ValueError("Saved corrupted cache uses a different seed.")
+    if list(metadata.get("top_s1_ids", [])) != [
+        int(value) for value in top_s1_ids
+    ]:
+        raise ValueError("Saved corrupted cache uses different top s1 IDs.")
+    if list(metadata.get("top_s2_ids", [])) != [
+        int(value) for value in top_s2_ids
+    ]:
+        raise ValueError("Saved corrupted cache uses different top s2 IDs.")
+
+    for key in ("context_s1", "context_s2", "s1", "s2"):
+        if tuple(torch.as_tensor(cache[key]).shape) != tuple(
+            torch.as_tensor(source[key]).shape
+        ):
+            raise ValueError(
+                f"Saved corrupted cache has an unexpected {key} shape."
+            )
+
+
+def compute_token_corruption_reconstruction_metrics(
+    split: Mapping[str, Any],
+    encoded_data: Mapping[str, Any],
+    *,
+    corruption_fractions: Sequence[float] = (
+        0.10,
+        0.20,
+        0.30,
+        0.40,
+        0.50,
+    ),
+    output_dir: str | Path,
+    tokenizer: Any | None = None,
+    tokenizer_config: Mapping[str, Any] | None = None,
+    top_k_replacements: int = 10,
+    seed: int = 42,
+    window_batch_size: int = 8,
+    series_batch_size: int = 93,
+    reuse_existing: bool = True,
+    show_progress: bool = True,
+) -> pd.DataFrame:
+    """Measure decoder sensitivity to random coarse/fine token errors.
+
+    Each rolling causal context is treated as one sequence. For every asset
+    and rolling context, exactly ``round(fraction * context_length)`` token
+    positions are selected. The position ranking is shared by s1 and s2 and
+    is nested across fractions for a fixed seed. At each selected position:
+
+    * s1 is replaced by a uniformly chosen, different ID from the ten most
+      frequent valid s1 IDs;
+    * s2 is replaced independently using the corresponding top s2 IDs.
+
+    The coarse reconstruction uses only the corrupted s1 sequence. The full
+    reconstruction uses both corrupted streams. Original context means and
+    standard deviations are retained, isolating the effect of token errors
+    from changes in continuous side information.
+
+    The top-frequency sets are calculated once from the uncorrupted final
+    valid token streams, so overlapping rolling contexts do not duplicate
+    observations when defining the replacement vocabulary.
+    """
+    fractions = tuple(float(value) for value in corruption_fractions)
+    if not fractions:
+        raise ValueError("corruption_fractions must not be empty.")
+    if len(set(fractions)) != len(fractions):
+        raise ValueError("corruption_fractions must not contain duplicates.")
+    if any(not 0.0 < value < 1.0 for value in fractions):
+        raise ValueError("Every corruption fraction must lie in (0, 1).")
+    if window_batch_size <= 0 or series_batch_size <= 0:
+        raise ValueError(
+            "window_batch_size and series_batch_size must be positive."
+        )
+
+    output_path = Path(output_dir).expanduser().resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    top_s1_ids = _token_corruption_top_ids(
+        encoded_data,
+        token_key="s1",
+        top_k=int(top_k_replacements),
+    )
+    top_s2_ids = _token_corruption_top_ids(
+        encoded_data,
+        token_key="s2",
+        top_k=int(top_k_replacements),
+    )
+
+    active_tokenizer = tokenizer
+    rows: list[dict[str, Any]] = []
+    manifest: list[dict[str, Any]] = []
+
+    for fraction in fractions:
+        started = perf_counter()
+        tag = _token_corruption_fraction_tag(fraction)
+        encoded_path = output_path / (
+            f"encoded_kronos_val_corrupt_{tag}_top{top_k_replacements}_"
+            f"seed{int(seed)}.pt"
+        )
+        decoded_path = output_path / (
+            f"decoded_kronos_val_corrupt_{tag}_top{top_k_replacements}_"
+            f"seed{int(seed)}.pt"
+        )
+
+        encoded_loaded = reuse_existing and encoded_path.is_file()
+        decoded_loaded = reuse_existing and decoded_path.is_file()
+
+        if encoded_loaded:
+            corrupted_encoded = _load_torch_mapping(encoded_path)
+            _validate_token_corruption_cache(
+                corrupted_encoded,
+                source=encoded_data,
+                fraction=fraction,
+                top_s1_ids=top_s1_ids,
+                top_s2_ids=top_s2_ids,
+                seed=seed,
+            )
+        else:
+            corrupted_encoded = _build_corrupted_token_cache(
+                encoded_data,
+                corruption_fraction=fraction,
+                top_s1_ids=top_s1_ids,
+                top_s2_ids=top_s2_ids,
+                seed=seed,
+            )
+            _atomic_torch_save(corrupted_encoded, encoded_path)
+
+        if decoded_loaded:
+            corrupted_decoded = _load_torch_mapping(decoded_path)
+        else:
+            active_tokenizer = _load_tokenizer_for_missing_variants(
+                tokenizer=active_tokenizer,
+                tokenizer_config=tokenizer_config,
+                series_batch_size=series_batch_size,
+            )
+            corrupted_decoded = decode_causal_split(
+                active_tokenizer,
+                corrupted_encoded,
+                window_batch_size=window_batch_size,
+                series_batch_size=series_batch_size,
+                show_progress=show_progress,
+            )
+            corrupted_decoded["token_corruption"] = dict(
+                corrupted_encoded["token_corruption"]
+            )
+            _atomic_torch_save(corrupted_decoded, decoded_path)
+
+        metrics = compute_reconstruction_metrics(
+            split,
+            corrupted_encoded,
+            corrupted_decoded,
+            include_rolling_mean_baseline=False,
+        )
+        metadata = corrupted_encoded["token_corruption"]
+
+        for representation, values in metrics.iterrows():
+            rows.append(
+                {
+                    "Corruption (%)": float(metadata["percent"]),
+                    "Reconstruction": str(representation),
+                    **values.to_dict(),
+                }
+            )
+
+        if encoded_loaded and decoded_loaded:
+            status = "loaded encoded and decoded corruption caches"
+        elif encoded_loaded:
+            status = "loaded encoded; created decoded corruption cache"
+        else:
+            status = "created encoded and decoded corruption caches"
+
+        elapsed_minutes = (perf_counter() - started) / 60.0
+        manifest.append(
+            {
+                "fraction": fraction,
+                "encoded_path": str(encoded_path),
+                "decoded_path": str(decoded_path),
+                "status": status,
+                "elapsed_minutes": elapsed_minutes,
+            }
+        )
+        print(
+            f"{100.0 * fraction:.0f}% corruption: {status}; "
+            f"elapsed={elapsed_minutes:.2f} min"
+        )
+
+        del corrupted_encoded
+        del corrupted_decoded
+
+    result = pd.DataFrame(rows)
+    result["Reconstruction"] = pd.Categorical(
+        result["Reconstruction"],
+        categories=["Coarse (s1)", "Full (s1 + s2)"],
+        ordered=True,
+    )
+    result = (
+        result.sort_values(["Corruption (%)", "Reconstruction"])
+        .set_index(["Corruption (%)", "Reconstruction"])
+    )
+    result.attrs["top_s1_ids"] = [int(value) for value in top_s1_ids]
+    result.attrs["top_s2_ids"] = [int(value) for value in top_s2_ids]
+    result.attrs["seed"] = int(seed)
+    result.attrs["cache_manifest"] = manifest
+    result.attrs["corruption_semantics"] = (
+        "exact nested position corruption per rolling-context/asset; "
+        "coarse corrupts s1; full corrupts s1 and s2"
+    )
+    return result
