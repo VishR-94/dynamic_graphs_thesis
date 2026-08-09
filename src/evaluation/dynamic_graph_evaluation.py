@@ -8967,6 +8967,7 @@ def plot_selected_graph(
     cluster: bool = False,
     cluster_method: str = "average",
     company_profiles_path: str | Path | None = None,
+    heatmap_cap_top_k: int = 0,
     figsize: tuple[float, float] = (13.0, 11.0),
     tick_fontsize: float = 8.0,
     ax: Axes | None = None,
@@ -8981,6 +8982,13 @@ def plot_selected_graph(
 
     ``cluster_method`` is retained only for backward call compatibility and is
     ignored when sector grouping is requested.
+
+    ``heatmap_cap_top_k`` is a display-only colour-scale control.  The default
+    value ``0`` preserves the ordinary maximum-edge colour scale.  A positive
+    value ignores that many largest finite off-diagonal entries when choosing
+    ``vmax``; those entries are visually saturated at the next-highest value.
+    The adjacency returned by this function, and every metric/table calculated
+    from it, always retain the original uncapped weights.
     """
 
     del cluster_method
@@ -9005,7 +9013,17 @@ def plot_selected_graph(
     if not graph.add_self_loops:
         np.fill_diagonal(plotted_values, np.nan)
     finite = plotted_values[np.isfinite(plotted_values)]
-    maximum = float(np.max(finite)) if finite.size else 1.0
+    uncapped_maximum = float(np.max(finite)) if finite.size else 1.0
+    cap_count = max(int(heatmap_cap_top_k), 0)
+    applied_cap_count = 0
+    maximum = uncapped_maximum
+    if cap_count > 0 and finite.size > cap_count:
+        # The (k+1)-th largest finite displayed edge becomes the colourbar
+        # maximum. Matplotlib saturates all larger values at that colour.
+        candidate = float(np.partition(finite, -(cap_count + 1))[-(cap_count + 1)])
+        if np.isfinite(candidate) and candidate > 0.0:
+            maximum = candidate
+            applied_cap_count = cap_count
     if not np.isfinite(maximum) or maximum <= 0.0:
         maximum = 1.0
 
@@ -9041,15 +9059,26 @@ def plot_selected_graph(
     time_text = (
         f" — {graph.time_window_description}" if graph.time_window_description else ""
     )
+    cap_text = (
+        "\n"
+        f"display-only colour cap: top {applied_cap_count} edge(s) saturated "
+        f"at {maximum:.6g}; true maximum={uncapped_maximum:.6g}"
+        if applied_cap_count > 0
+        else ""
+    )
     axes.set_title(
         f"{graph.run_name} — {graph.split} / {graph.policy}\n"
         f"{graph.selection_description}{time_text}"
         f"{' — sector-grouped' if cluster else ''}\n"
         f"entropy of displayed adjacency={graph.displayed_mean_row_entropy:.4f}; "
         f"mean window entropy={graph.mean_window_row_entropy:.4f}"
+        f"{cap_text}"
     )
     colourbar = figure.colorbar(image, ax=axes, fraction=0.046, pad=0.03)
-    colourbar.set_label("Adjacency weight")
+    colourbar.set_label(
+        "Adjacency weight"
+        + (" (display capped)" if applied_cap_count > 0 else "")
+    )
     figure.tight_layout()
     plotted = pd.DataFrame(matrix, index=labels, columns=labels)
     plotted.index.name = "Target"
@@ -9109,10 +9138,17 @@ def analyse_graph(
     direction: NeighbourDirection = "impacted_by",
     cluster: bool = False,
     company_profiles_path: str | Path | None = None,
+    heatmap_cap_top_k: int = 0,
     random_seed: int = 42,
     models_root: str | Path | None = None,
 ) -> GraphAnalysisReport:
-    """Run the complete actual-adjacency analysis for one graph selection."""
+    """Run the complete actual-adjacency analysis for one graph selection.
+
+    ``heatmap_cap_top_k`` affects only the heatmap colour scale.  For example,
+    ``heatmap_cap_top_k=2`` saturates the two largest off-diagonal cells at the
+    third-largest value while preserving the original graph for every metric,
+    connection table, returned tensor and saved artefact.
+    """
 
     graph = select_graph(
         model,
@@ -9133,6 +9169,7 @@ def analyse_graph(
         graph,
         cluster=cluster,
         company_profiles_path=company_profiles_path,
+        heatmap_cap_top_k=heatmap_cap_top_k,
     )
     frequency_figure, frequency_axes = plot_top_source_frequency(
         frequency,

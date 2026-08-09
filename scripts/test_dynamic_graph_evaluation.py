@@ -812,6 +812,30 @@ def main() -> None:
         all_graph.adjacency_figure.clf()
         all_graph.frequency_figure.clf()
 
+        capped_graph = analyse_graph(
+            dynamic,
+            split="train",
+            day=None,
+            window=None,
+            top_n=2,
+            cluster=False,
+            heatmap_cap_top_k=2,
+        )
+        displayed = capped_graph.graph.adjacency.to_numpy(dtype=np.float64).copy()
+        np.fill_diagonal(displayed, np.nan)
+        finite_displayed = displayed[np.isfinite(displayed)]
+        expected_vmax = float(np.sort(finite_displayed)[-3])
+        observed_vmin, observed_vmax = capped_graph.adjacency_axes.images[0].get_clim()
+        assert observed_vmin == 0.0
+        assert np.isclose(observed_vmax, expected_vmax)
+        assert np.isclose(
+            capped_graph.plotted_adjacency.to_numpy(dtype=np.float64).max(),
+            all_graph.plotted_adjacency.to_numpy(dtype=np.float64).max(),
+        )
+        assert "display-only colour cap" in capped_graph.adjacency_axes.get_title()
+        capped_graph.adjacency_figure.clf()
+        capped_graph.frequency_figure.clf()
+
         round2_layer = analyse_graph(
             round2,
             split="train",
