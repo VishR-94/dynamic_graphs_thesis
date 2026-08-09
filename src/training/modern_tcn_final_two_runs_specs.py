@@ -6,8 +6,8 @@ The helper in this module deliberately reuses the winning Round-1 delayed-
 decay alpha/beta configuration and changes only the forecast/loss protocol for
 these last two diagnostic runs:
 
-1. one-step training followed by autoregressive 60-minute rollout;
-2. parallel five-horizon training with horizon-scaled loss.
+1. parallel five-horizon training with horizon-scaled loss;
+2. close-only one-step training followed by autoregressive 60-minute rollout.
 """
 
 from dataclasses import replace
@@ -99,7 +99,7 @@ def make_final_two_run_specs(
     reference_mae: Sequence[float] = DEFAULT_HORIZON_REFERENCE_MAE,
     seed: int = 42,
 ) -> tuple[Round1RunSpec, Round1RunSpec]:
-    """Return autoregressive and horizon-weighted parallel run specs."""
+    """Return weighted-parallel then close-only autoregressive run specs."""
 
     horizons = tuple(int(value) for value in horizons)
     if horizons != tuple(sorted(set(horizons))):
@@ -135,28 +135,6 @@ def make_final_two_run_specs(
         f"c{int(context_length)}_s{int(stride)}_h{horizon_tag}"
     )
 
-    autoregressive_config = _deepcopy_mapping(base.config)
-    autoregressive_config["training"]["forecast_strategy"] = "autoregressive"
-    autoregressive_config["training"]["one_step_training_stride"] = int(
-        one_step_training_stride
-    )
-    autoregressive_config["training"]["autoregressive_rollout_length"] = int(
-        max(horizons)
-    )
-    # Recurrent free-running evaluation is deliberately performed in FP32.
-    # The model is still trained with the winning mixed-precision protocol,
-    # but repeatedly feeding predictions back through FP16 Q/K matmuls can
-    # overflow even when the corresponding FP32 values are finite.
-    autoregressive_config["training"][
-        "autoregressive_rollout_mixed_precision"
-    ] = False
-    autoregressive_config["training"]["selection_metric"] = (
-        "autoregressive_mean_five_horizon_cumulative_log_change_mae"
-    )
-    autoregressive_config["training"]["optimisation_profile"] = (
-        "round1_delayed_decay_autoregressive"
-    )
-
     weighted_config = _deepcopy_mapping(base.config)
     weighted_config["training"]["forecast_strategy"] = "parallel_weighted"
     weighted_config["training"]["loss"]["horizon_weighting"] = (
@@ -173,18 +151,42 @@ def make_final_two_run_specs(
         "round1_delayed_decay_parallel_weighted"
     )
 
-    autoregressive = replace(
-        base,
-        run_name=(
-            "final_autoreg_one_step_stride"
-            f"{int(one_step_training_stride)}_roll{int(max(horizons))}_"
-            f"{shared_suffix}"
-        ),
-        label=(
-            "Final ablation — one-step training, autoregressive 60-minute rollout"
-        ),
-        config=autoregressive_config,
+    # A valid recurrent model must feed back exactly the state that it predicts.
+    # This variant therefore consumes Close only, predicts the next one-step
+    # cumulative log change directly, and reconstructs the next Close through
+    # P_{t+1} = P_t * exp(r_{t+1}).  Unlike the earlier OHLCV bridge, no Open,
+    # High, Low or Volume value is fabricated during rollout.
+    autoregressive_config = _deepcopy_mapping(base.config)
+    autoregressive_config["data"]["input_channels"] = ["close"]
+    autoregressive_config["model"]["output_representation"] = (
+        "cumulative_log_change"
     )
+    autoregressive_config["model"]["output_head_initialisation"] = "zero"
+    autoregressive_config["training"]["forecast_strategy"] = (
+        "autoregressive_close_only"
+    )
+    autoregressive_config["training"]["one_step_training_stride"] = int(
+        one_step_training_stride
+    )
+    autoregressive_config["training"]["autoregressive_rollout_length"] = int(
+        max(horizons)
+    )
+    autoregressive_config["training"][
+        "autoregressive_rollout_mixed_precision"
+    ] = False
+    autoregressive_config["training"]["autoregressive_feedback_channels"] = [
+        "close"
+    ]
+    autoregressive_config["training"]["autoregressive_target_representation"] = (
+        "one_step_cumulative_log_change"
+    )
+    autoregressive_config["training"]["selection_metric"] = (
+        "autoregressive_close_only_mean_five_horizon_cumulative_log_change_mae"
+    )
+    autoregressive_config["training"]["optimisation_profile"] = (
+        "round1_delayed_decay_autoregressive_close_only"
+    )
+
     weighted = replace(
         base,
         run_name=f"final_parallel_weighted_{shared_suffix}",
@@ -194,7 +196,21 @@ def make_final_two_run_specs(
         ),
         config=weighted_config,
     )
-    return autoregressive, weighted
+    autoregressive = replace(
+        base,
+        run_name=(
+            "final_close_only_autoreg_one_step_stride"
+            f"{int(one_step_training_stride)}_roll{int(max(horizons))}_"
+            f"{shared_suffix}"
+        ),
+        label=(
+            "Final ablation — Close-only one-step log-return training and "
+            "autoregressive 60-minute Close rollout"
+        ),
+        config=autoregressive_config,
+    )
+    # Weighted parallel intentionally runs first in the accompanying notebook.
+    return weighted, autoregressive
 
 
 def save_specs(path: Path, specs: Sequence[Round1RunSpec]) -> None:

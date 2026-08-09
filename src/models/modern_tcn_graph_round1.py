@@ -568,8 +568,12 @@ def round1_model_config_from_mapping(
         horizons=tuple(int(item) for item in data["horizons"]),
         input_channels=tuple(str(item) for item in data["input_channels"]),
         target_channel=str(data["target_channel"]),
-        output_representation="normalised_close",
-        output_head_initialisation="default",
+        output_representation=str(
+            model.get("output_representation", "normalised_close")
+        ),
+        output_head_initialisation=str(
+            model.get("output_head_initialisation", "default")
+        ),
         temporal=ContinuousTemporalConfig(
             type="modern_tcn",
             d_model=int(temporal["d_model"]),

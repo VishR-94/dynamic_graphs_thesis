@@ -5,10 +5,12 @@ from __future__ import annotations
 This runner reuses the winning one-block ModernTCN graph architecture and adds
 only two forecast/loss protocols:
 
-* autoregressive: train a one-step model on dense one-step windows and roll it
-  out to 60 minutes at selection/export time;
-* parallel_weighted: train the existing five-horizon head with inverse-reference
-  horizon weights while selecting on the ordinary unweighted five-horizon mean.
+* parallel_weighted: train the existing five-horizon OHLCV-input head with
+  inverse-reference horizon weights while selecting on the ordinary unweighted
+  five-horizon mean;
+* autoregressive_close_only: train a Close-only one-step log-return model on
+  dense one-step windows and roll the predicted Close forward for 60 minutes.
+  The recurrent model never fabricates Open, High, Low, or Volume channels.
 
 The runner remains deliberately test-selected and marks every output as
 ``DO_NOT_REPORT``.
@@ -17,7 +19,6 @@ The runner remains deliberately test-selected and marks every output as
 import argparse
 import copy
 import json
-import math
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,10 +37,6 @@ from src.data.continuous_forecast_dataset import (
 )
 from src.data.load_candle_data import clean_candle_splits, load_candle_splits
 from src.evaluation.metrics import ForecastEvaluator
-from src.evaluation.prediction_transforms import (
-    inverse_window_normalisation,
-    raw_to_cumulative_log_change,
-)
 from src.models.graph_priors import (
     build_absolute_correlation_graph_prior,
     build_sector_graph_prior,
@@ -91,6 +88,10 @@ from src.utils.metric_tables import make_evaluation_table
 ConfigDict = dict[str, Any]
 
 
+AUTOREGRESSIVE_CLOSE_ONLY = "autoregressive_close_only"
+PARALLEL_WEIGHTED = "parallel_weighted"
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train one final ModernTCN graph diagnostic ablation."
@@ -123,7 +124,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def _strategy(config: Mapping[str, Any]) -> str:
-    return str(config["training"].get("forecast_strategy", "parallel_weighted"))
+    return str(config["training"].get("forecast_strategy", PARALLEL_WEIGHTED))
+
+
+def _is_close_only_autoregressive(config: Mapping[str, Any]) -> bool:
+    return _strategy(config) == AUTOREGRESSIVE_CLOSE_ONLY
 
 
 def _model_config_for_strategy(
@@ -132,14 +137,28 @@ def _model_config_for_strategy(
     num_nodes: int,
 ) -> ModernTCNGraphRound1Config:
     values = copy.deepcopy(dict(config))
-    if _strategy(config) == "autoregressive":
+    if _is_close_only_autoregressive(config):
         values["data"] = dict(values["data"])
         values["data"]["horizons"] = [1]
+        input_channels = tuple(
+            str(value) for value in values["data"]["input_channels"]
+        )
+        if input_channels != ("close",):
+            raise ValueError(
+                "Close-only autoregression requires data.input_channels=['close']."
+            )
+        if str(values["model"].get("output_representation")) != (
+            "cumulative_log_change"
+        ):
+            raise ValueError(
+                "Close-only autoregression requires direct cumulative-log-change "
+                "output."
+            )
     return round1_model_config_from_mapping(values, num_nodes=num_nodes)
 
 
 def _training_dataset_config(config: Mapping[str, Any]) -> ContinuousDatasetConfig:
-    if _strategy(config) != "autoregressive":
+    if not _is_close_only_autoregressive(config):
         return _dataset_config(config)
     data = config["data"]
     normalisation = config["normalisation"]
@@ -351,32 +370,63 @@ def _normalise_raw_context(
     return x, target_mean, target_std
 
 
-def _synthetic_next_candle(
-    raw_context: Tensor,
-    next_close: Tensor,
+def _require_strictly_positive_rollout_tensor(
+    name: str,
+    values: Tensor,
     *,
-    input_channels: Sequence[str],
-    eps: float,
+    step: int,
+) -> None:
+    tensor = torch.as_tensor(values)
+    _require_finite_rollout_tensor(name, tensor, step=step)
+    non_positive = tensor <= 0
+    if not torch.any(non_positive):
+        return
+    count = int(non_positive.sum().item())
+    minimum = float(tensor.min().item())
+    raise FloatingPointError(
+        f"Autoregressive rollout produced {count} non-positive values in "
+        f"{name} at step {int(step)}; minimum={minimum:.6g}. No price "
+        "floor or persistence fallback is applied."
+    )
+
+
+def _next_close_from_log_return(
+    previous_close: Tensor,
+    predicted_log_return: Tensor,
+    *,
+    step: int,
 ) -> Tensor:
-    channels = list(input_channels)
-    last = raw_context[:, -1]
-    next_values = last.clone()
-    close = next_close.squeeze(-1).clamp_min(float(eps))
-    previous_close = last[:, :, channels.index("close")].clamp_min(float(eps))
+    """Convert one-step log returns to strictly positive next Close values.
 
-    if "open" in channels:
-        next_values[:, :, channels.index("open")] = previous_close
-    next_values[:, :, channels.index("close")] = close
-    if "high" in channels:
-        high = torch.maximum(previous_close, close)
-        next_values[:, :, channels.index("high")] = high
-    if "low" in channels:
-        low = torch.minimum(previous_close, close)
-        next_values[:, :, channels.index("low")] = low
-    if "volume" in channels:
-        next_values[:, :, channels.index("volume")] = last[:, :, channels.index("volume")].clamp_min(0.0)
-    return next_values
+    The calculation is performed in float64 so the recurrent price state does
+    not accumulate avoidable float32 exponentiation error.  It contains no
+    clipping: a non-finite or non-positive result is reported as model
+    divergence rather than silently replaced by a numerical floor.
+    """
 
+    previous = torch.as_tensor(previous_close, dtype=torch.float64)
+    log_return = torch.as_tensor(predicted_log_return, dtype=torch.float64)
+    if previous.shape != log_return.shape:
+        raise ValueError(
+            "previous_close and predicted_log_return must have matching shapes."
+        )
+    _require_strictly_positive_rollout_tensor(
+        "previous Close",
+        previous,
+        step=step,
+    )
+    _require_finite_rollout_tensor(
+        "predicted one-step log return",
+        log_return,
+        step=step,
+    )
+    next_close = previous * torch.exp(log_return)
+    _require_strictly_positive_rollout_tensor(
+        "reconstructed next Close",
+        next_close,
+        step=step,
+    )
+    return next_close
 
 def _autoregressive_rollout(
     *,
@@ -385,11 +435,32 @@ def _autoregressive_rollout(
     device: torch.device,
     use_amp: bool,
     config: Mapping[str, Any],
-) -> tuple[Tensor, Any]:
+) -> tuple[Tensor, Tensor, Any]:
+    """Roll a Close-only one-step log-return model forward causally.
+
+    ``raw_context`` contains one channel only.  At every step the observed or
+    generated Close history is context-normalised, the model predicts the next
+    one-step cumulative log change, and the next Close is reconstructed as
+    ``previous_close * exp(predicted_log_return)``.  No unmodelled candle field
+    is manufactured.
+    """
+
     data = config["data"]
     normalisation = config["normalisation"]
     input_channels = tuple(str(value) for value in data["input_channels"])
     target_channel = str(data["target_channel"])
+    if input_channels != ("close",) or target_channel != "close":
+        raise ValueError(
+            "Close-only autoregression requires one input/target channel: close."
+        )
+    if str(config["model"].get("output_representation")) != (
+        "cumulative_log_change"
+    ):
+        raise ValueError(
+            "Close-only rollout expects direct one-step cumulative-log-change "
+            "model output."
+        )
+
     horizons = tuple(int(value) for value in data["horizons"])
     rollout_length = int(
         config["training"].get("autoregressive_rollout_length", max(horizons))
@@ -397,28 +468,41 @@ def _autoregressive_rollout(
     if rollout_length < max(horizons):
         raise ValueError("autoregressive_rollout_length is smaller than max horizon.")
 
+    # Retain the recurrent price state in float64.  Only the normalised tensor
+    # passed through the neural network is converted to float32.
     raw_context = torch.as_tensor(batch["context_unnormalised"]).to(
         device=device,
-        dtype=torch.float32,
+        dtype=torch.float64,
         non_blocking=True,
     )
+    expected_axes = (
+        int(config["data"]["context_length"]),
+        int(raw_context.shape[2]),
+        1,
+    )
+    if tuple(raw_context.shape[1:]) != expected_axes:
+        raise ValueError(
+            "Close-only context has unexpected [T,N,C] axes: "
+            f"{tuple(raw_context.shape[1:])}; expected {expected_axes}."
+        )
     context_start = torch.as_tensor(batch["context_start"]).long()
     session_length = torch.as_tensor(batch["session_length"]).long()
-    predictions: list[Tensor] = []
+    close_predictions: list[Tensor] = []
+    log_return_predictions: list[Tensor] = []
     first_output = None
     rollout_use_amp = _autoregressive_rollout_uses_amp(
         config,
         training_amp_enabled=use_amp,
     )
-    _require_finite_rollout_tensor(
-        "initial raw context",
+    _require_strictly_positive_rollout_tensor(
+        "initial Close context",
         raw_context,
         step=0,
     )
 
     for step in range(rollout_length):
         rollout_step = int(step) + 1
-        x_norm, target_mean, target_std = _normalise_raw_context(
+        x_norm, _, _ = _normalise_raw_context(
             raw_context,
             input_channels=input_channels,
             target_channel=target_channel,
@@ -427,15 +511,16 @@ def _autoregressive_rollout(
             clip_min=float(normalisation["clip_min"]),
             clip_max=float(normalisation["clip_max"]),
         )
+        x_model = x_norm.to(dtype=torch.float32)
         _require_finite_rollout_tensor(
-            "normalised model context",
-            x_norm,
+            "normalised Close context",
+            x_model,
             step=rollout_step,
         )
         try:
             with _autocast_context(device, rollout_use_amp):
                 output = model(
-                    x_norm,
+                    x_model,
                     context_start=context_start + int(step),
                     session_length=session_length,
                 )
@@ -443,52 +528,38 @@ def _autoregressive_rollout(
             if "non-finite" not in str(error):
                 raise
             raise FloatingPointError(
-                "Autoregressive model forward became non-finite at "
-                f"rollout step {rollout_step}; rollout_amp="
-                f"{rollout_use_amp}. Normalised input: "
-                f"{_finite_tensor_summary(x_norm)}. Original error: "
-                f"{error}"
+                "Close-only autoregressive model forward became non-finite at "
+                f"rollout step {rollout_step}; rollout_amp={rollout_use_amp}. "
+                f"Normalised input: {_finite_tensor_summary(x_model)}. "
+                f"Original error: {error}"
             ) from error
         if first_output is None:
             first_output = output
+
+        predicted_log_return = output.predictions[:, 0].to(dtype=torch.float64)
         _require_finite_rollout_tensor(
-            "normalised Close prediction",
-            output.predictions,
+            "predicted one-step log return",
+            predicted_log_return,
             step=rollout_step,
         )
-        next_norm = output.predictions[:, 0]
-        next_close = inverse_window_normalisation(
-            y_norm=next_norm.float().unsqueeze(1),
-            target_norm_mean=target_mean,
-            target_norm_std=target_std,
-        )[:, 0].clamp_min(float(normalisation["eps"]))
-        _require_finite_rollout_tensor(
-            "raw Close prediction",
-            next_close,
+        previous_close = raw_context[:, -1]
+        next_close = _next_close_from_log_return(
+            previous_close,
+            predicted_log_return,
             step=rollout_step,
         )
-        predictions.append(next_close)
-        next_candle = _synthetic_next_candle(
-            raw_context,
-            next_close,
-            input_channels=input_channels,
-            eps=float(normalisation["eps"]),
-        )
-        _require_finite_rollout_tensor(
-            "synthetic candle",
-            next_candle,
-            step=rollout_step,
-        )
+        close_predictions.append(next_close)
+        log_return_predictions.append(predicted_log_return)
         raw_context = torch.cat(
-            [raw_context[:, 1:], next_candle.unsqueeze(1)],
+            [raw_context[:, 1:], next_close.unsqueeze(1)],
             dim=1,
         )
 
     if first_output is None:
         raise RuntimeError("Autoregressive rollout produced no steps.")
-    dense = torch.stack(predictions, dim=1)
-    return dense, first_output
-
+    dense_close = torch.stack(close_predictions, dim=1)
+    dense_log_return = torch.stack(log_return_predictions, dim=1)
+    return dense_close, dense_log_return, first_output
 
 def _select_rollout_horizons(dense: Tensor, horizons: Sequence[int]) -> Tensor:
     indices = torch.tensor([int(h) - 1 for h in horizons], device=dense.device)
@@ -502,8 +573,8 @@ def _autoregressive_errors(
     device: torch.device,
     use_amp: bool,
     config: Mapping[str, Any],
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Any]:
-    dense, first_output = _autoregressive_rollout(
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Any]:
+    dense_close, dense_log_return, first_output = _autoregressive_rollout(
         model=model,
         batch=batch,
         device=device,
@@ -511,31 +582,95 @@ def _autoregressive_errors(
         config=config,
     )
     horizons = tuple(int(value) for value in config["data"]["horizons"])
-    predicted_raw = _select_rollout_horizons(dense, horizons).clamp_min(
-        float(config["normalisation"]["eps"])
+    predicted_raw = _select_rollout_horizons(dense_close, horizons)
+    true_raw = torch.as_tensor(batch["y_unnormalised"]).to(
+        device=device,
+        dtype=torch.float64,
+        non_blocking=True,
+    )
+    last = torch.as_tensor(batch["last_context_target"]).to(
+        device=device,
+        dtype=torch.float64,
+        non_blocking=True,
+    )
+    _require_strictly_positive_rollout_tensor(
+        "autoregressive horizon predictions",
+        predicted_raw,
+        step=max(horizons),
+    )
+    _require_strictly_positive_rollout_tensor(
+        "real forecast targets",
+        true_raw,
+        step=0,
+    )
+    _require_strictly_positive_rollout_tensor(
+        "last observed Close",
+        last,
+        step=0,
+    )
+    predicted_change = torch.log(predicted_raw) - torch.log(last.unsqueeze(1))
+    true_change = torch.log(true_raw) - torch.log(last.unsqueeze(1))
+    absolute_error = (predicted_change - true_change).abs()
+    _require_finite_rollout_tensor(
+        "autoregressive cumulative-log-change errors",
+        absolute_error,
+        step=max(horizons),
+    )
+    return (
+        predicted_raw,
+        true_raw,
+        last,
+        absolute_error,
+        dense_close,
+        dense_log_return,
+        first_output,
+    )
+
+def _one_step_log_return_errors(
+    prediction: Tensor,
+    batch: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """Return true one-step log change and absolute direct-head error."""
+
+    predicted_change = torch.as_tensor(prediction).to(
+        device=device,
+        dtype=torch.float32,
     )
     true_raw = torch.as_tensor(batch["y_unnormalised"]).to(
         device=device,
         dtype=torch.float32,
         non_blocking=True,
-    ).clamp_min(float(config["normalisation"]["eps"]))
+    )
     last = torch.as_tensor(batch["last_context_target"]).to(
         device=device,
         dtype=torch.float32,
         non_blocking=True,
-    ).clamp_min(float(config["normalisation"]["eps"]))
-    predicted_change = raw_to_cumulative_log_change(
-        predicted_raw,
-        last,
-        eps=float(config["normalisation"]["eps"]),
     )
-    true_change = raw_to_cumulative_log_change(
+    if tuple(predicted_change.shape) != tuple(true_raw.shape):
+        raise ValueError(
+            "Direct one-step prediction and target shapes differ: "
+            f"{tuple(predicted_change.shape)} versus {tuple(true_raw.shape)}."
+        )
+    _require_strictly_positive_rollout_tensor(
+        "one-step training targets",
         true_raw,
-        last,
-        eps=float(config["normalisation"]["eps"]),
+        step=1,
     )
+    _require_strictly_positive_rollout_tensor(
+        "one-step training last Close",
+        last,
+        step=0,
+    )
+    true_change = torch.log(true_raw) - torch.log(last.unsqueeze(1))
     absolute_error = (predicted_change - true_change).abs()
-    return predicted_raw, true_raw, last, absolute_error, dense, first_output
+    _require_finite_rollout_tensor(
+        "one-step log-return training errors",
+        absolute_error,
+        step=1,
+    )
+    return true_change, absolute_error
 
 
 def _train_epoch_autoregressive_one_step(
@@ -559,7 +694,6 @@ def _train_epoch_autoregressive_one_step(
         pin_memory=device.type == "cuda",
     )
     model.train()
-    eps = float(config["normalisation"]["eps"])
     bps_scale = float(training["loss"]["bps_scale"])
     total_absolute_error = 0.0
     target_count = 0
@@ -589,11 +723,10 @@ def _train_epoch_autoregressive_one_step(
                 context_start=batch["context_start"],
                 session_length=batch["session_length"],
             )
-        _, _, _, absolute_error = _forecast_errors(
+        _, absolute_error = _one_step_log_return_errors(
             output.predictions,
             batch,
             device=device,
-            eps=eps,
         )
         native_loss = absolute_error.mean()
         optimisation_loss = native_loss * bps_scale
@@ -674,7 +807,7 @@ def _evaluate_selection_autoregressive(
             leave=False,
             dynamic_ncols=True,
         ):
-            _, _, _, absolute_error, _, first_output = _autoregressive_errors(
+            _, _, _, absolute_error, _, _, first_output = _autoregressive_errors(
                 model=model,
                 batch=batch,
                 device=device,
@@ -717,6 +850,56 @@ def _evaluate_selection_autoregressive(
     }
 
 
+def _rollout_step_diagnostics(
+    dense_close: Tensor,
+    dense_log_return: Tensor,
+    last_close: Tensor,
+) -> list[dict[str, float | int]]:
+    """Summarise recurrent scale at every rollout step without hiding tails."""
+
+    close = torch.as_tensor(dense_close, dtype=torch.float64)
+    one_step = torch.as_tensor(dense_log_return, dtype=torch.float64)
+    last = torch.as_tensor(last_close, dtype=torch.float64).unsqueeze(1)
+    if close.shape != one_step.shape:
+        raise ValueError("Dense Close and one-step-return paths must match.")
+    if tuple(last.shape[0:1] + last.shape[2:]) != tuple(
+        close.shape[0:1] + close.shape[2:]
+    ):
+        raise ValueError("last_close axes are incompatible with dense rollout.")
+    cumulative = torch.log(close) - torch.log(last)
+    rows: list[dict[str, float | int]] = []
+    for step in range(int(close.shape[1])):
+        raw_values = close[:, step].reshape(-1)
+        one_step_abs = one_step[:, step].abs().reshape(-1)
+        cumulative_abs = cumulative[:, step].abs().reshape(-1)
+        rows.append(
+            {
+                "step": step + 1,
+                "mean_absolute_one_step_log_return": float(
+                    one_step_abs.mean().item()
+                ),
+                "p95_absolute_one_step_log_return": float(
+                    torch.quantile(one_step_abs, 0.95).item()
+                ),
+                "maximum_absolute_one_step_log_return": float(
+                    one_step_abs.max().item()
+                ),
+                "mean_absolute_cumulative_log_change": float(
+                    cumulative_abs.mean().item()
+                ),
+                "p95_absolute_cumulative_log_change": float(
+                    torch.quantile(cumulative_abs, 0.95).item()
+                ),
+                "maximum_absolute_cumulative_log_change": float(
+                    cumulative_abs.max().item()
+                ),
+                "minimum_predicted_close": float(raw_values.min().item()),
+                "maximum_predicted_close": float(raw_values.max().item()),
+            }
+        )
+    return rows
+
+
 def _export_autoregressive_checkpoint(
     *,
     model: ModernTCNGraphRound1Model,
@@ -734,6 +917,7 @@ def _export_autoregressive_checkpoint(
     predictions: list[Tensor] = []
     targets: list[Tensor] = []
     dense_rollouts: list[Tensor] = []
+    dense_log_returns: list[Tensor] = []
     last_values: list[Tensor] = []
     sample_indices: list[Tensor] = []
     origin_indices: list[Tensor] = []
@@ -750,7 +934,15 @@ def _export_autoregressive_checkpoint(
             leave=False,
             dynamic_ncols=True,
         ):
-            predicted_raw, true_raw, last, _, dense, first_output = _autoregressive_errors(
+            (
+                predicted_raw,
+                true_raw,
+                last,
+                _,
+                dense,
+                dense_log_return,
+                first_output,
+            ) = _autoregressive_errors(
                 model=model,
                 batch=batch,
                 device=device,
@@ -760,6 +952,9 @@ def _export_autoregressive_checkpoint(
             predictions.append(predicted_raw.detach().cpu().float())
             targets.append(true_raw.detach().cpu().float())
             dense_rollouts.append(dense.detach().cpu().float())
+            dense_log_returns.append(
+                dense_log_return.detach().cpu().float()
+            )
             last_values.append(last.detach().cpu().float())
             sample_indices.append(torch.as_tensor(batch["sample_idx"]).cpu())
             origin_indices.append(torch.as_tensor(batch["origin_idx"]).cpu())
@@ -805,7 +1000,14 @@ def _export_autoregressive_checkpoint(
         "target_indices": torch.cat(target_indices, dim=0).long(),
         "output_space": "raw",
         "dense_autoregressive_close_path": torch.cat(dense_rollouts, dim=0),
+        "dense_autoregressive_one_step_log_returns": torch.cat(
+            dense_log_returns,
+            dim=0,
+        ),
         "dense_autoregressive_horizons": list(range(1, int(max(horizons)) + 1)),
+        "autoregressive_input_channels": ["close"],
+        "autoregressive_feedback_channels": ["close"],
+        "autoregressive_output_representation": "one_step_cumulative_log_change",
     }
     evaluator = ForecastEvaluator(
         prediction_result=prediction_result,
@@ -851,18 +1053,30 @@ def _export_autoregressive_checkpoint(
         "sample_idx": prediction_result["sample_idx"],
         "origin_idx": prediction_result["origin_idx"],
         "target_indices": prediction_result["target_indices"],
-        "forecast_strategy": "autoregressive",
+        "forecast_strategy": AUTOREGRESSIVE_CLOSE_ONLY,
     }
     selected_summary = graph_component_summary(selected.float())
     static_summary = graph_component_summary(None if saved_static is None else saved_static.float())
     dynamic_summary = graph_component_summary(dynamic.float())
+    dense_close_all = prediction_result["dense_autoregressive_close_path"]
+    dense_log_return_all = prediction_result[
+        "dense_autoregressive_one_step_log_returns"
+    ]
     diagnostics = {
         "split": split_name,
         "checkpoint_epoch": int(checkpoint_epoch),
         "windows": int(prediction_result["y_pred"].shape[0]),
         "horizons": horizons,
         "assets": int(prediction_result["y_pred"].shape[2]),
-        "forecast_strategy": "autoregressive",
+        "forecast_strategy": AUTOREGRESSIVE_CLOSE_ONLY,
+        "input_channels": ["close"],
+        "feedback_channels": ["close"],
+        "output_representation": "one_step_cumulative_log_change",
+        "rollout_step_diagnostics": _rollout_step_diagnostics(
+            dense_close_all,
+            dense_log_return_all,
+            prediction_result["last_context_target"],
+        ),
         "alpha": graph_artifacts["dynamic_alpha"],
         "beta": graph_artifacts["spatial_beta"],
         "spatial_gate_type": graph_artifacts["spatial_gate_type"],
@@ -913,7 +1127,7 @@ def _make_metadata(
         "mixed_precision": use_amp,
         "autoregressive_rollout_mixed_precision": (
             None
-            if _strategy(resolved) != "autoregressive"
+            if not _is_close_only_autoregressive(resolved)
             else _autoregressive_rollout_uses_amp(
                 resolved,
                 training_amp_enabled=use_amp,
@@ -930,7 +1144,18 @@ def _make_metadata(
         "context_length": int(resolved["data"]["context_length"]),
         "stride": int(resolved["data"]["stride"]),
         "horizons": [int(value) for value in resolved["data"]["horizons"]],
+        "input_channels": [
+            str(value) for value in resolved["data"]["input_channels"]
+        ],
+        "output_representation": str(
+            resolved["model"].get("output_representation", "normalised_close")
+        ),
         "forecast_strategy": _strategy(resolved),
+        "autoregressive_feedback_channels": (
+            ["close"]
+            if _is_close_only_autoregressive(resolved)
+            else None
+        ),
         "model_family": "modern_tcn_graph_final_ablation",
         "optimisation_profile": str(resolved["training"].get("optimisation_profile", "round1")),
         "optimizer": str(resolved["training"]["optimizer"]),
@@ -996,8 +1221,11 @@ def main() -> None:
     args = build_argument_parser().parse_args()
     resolved = _load_config(args.config)
     strategy = _strategy(resolved)
-    if strategy not in {"autoregressive", "parallel_weighted"}:
-        raise ValueError("forecast_strategy must be 'autoregressive' or 'parallel_weighted'.")
+    if strategy not in {AUTOREGRESSIVE_CLOSE_ONLY, PARALLEL_WEIGHTED}:
+        raise ValueError(
+            "forecast_strategy must be 'autoregressive_close_only' or "
+            "'parallel_weighted'."
+        )
 
     training = resolved["training"]
     public_data_config = _dataset_config(resolved)
@@ -1033,7 +1261,7 @@ def main() -> None:
     }
     train_dataset = (
         build_continuous_dataset(train_split, config=train_data_config)
-        if strategy == "autoregressive"
+        if strategy == AUTOREGRESSIVE_CLOSE_ONLY
         else public_datasets["train"]
     )
     datasets: dict[str, Dataset] = dict(public_datasets)
@@ -1157,7 +1385,7 @@ def main() -> None:
             for epoch in range(start_epoch, max_epochs + 1):
                 last_epoch = epoch
                 current_lrs = _learning_rates(optimizer)
-                if strategy == "autoregressive":
+                if strategy == AUTOREGRESSIVE_CLOSE_ONLY:
                     train_values = _train_epoch_autoregressive_one_step(
                         model=model,
                         dataset=train_dataset,
@@ -1298,7 +1526,7 @@ def main() -> None:
                 seed=seed + 1000 + split_index,
                 pin_memory=device.type == "cuda",
             )
-            if strategy == "autoregressive":
+            if strategy == AUTOREGRESSIVE_CLOSE_ONLY:
                 exported = _export_autoregressive_checkpoint(
                     model=model,
                     loader=loader,
@@ -1326,6 +1554,21 @@ def main() -> None:
                 )
                 exported["diagnostics"]["forecast_strategy"] = strategy
             _save_export(run_dir, split_name=split_name, values=exported)
+            if strategy == AUTOREGRESSIVE_CLOSE_ONLY:
+                rollout_table = pd.DataFrame(
+                    exported["diagnostics"]["rollout_step_diagnostics"]
+                )
+                rollout_path = (
+                    run_dir
+                    / f"best_{split_name}_rollout_step_diagnostics.csv"
+                )
+                atomic_csv_save(rollout_table, rollout_path)
+                analysis_path = run_dir / "analysis" / split_name
+                analysis_path.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(
+                    rollout_path,
+                    analysis_path / "rollout_step_diagnostics.csv",
+                )
 
         metadata.update(
             {
