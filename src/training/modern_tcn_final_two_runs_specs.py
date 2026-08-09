@@ -143,6 +143,13 @@ def make_final_two_run_specs(
     autoregressive_config["training"]["autoregressive_rollout_length"] = int(
         max(horizons)
     )
+    # Recurrent free-running evaluation is deliberately performed in FP32.
+    # The model is still trained with the winning mixed-precision protocol,
+    # but repeatedly feeding predictions back through FP16 Q/K matmuls can
+    # overflow even when the corresponding FP32 values are finite.
+    autoregressive_config["training"][
+        "autoregressive_rollout_mixed_precision"
+    ] = False
     autoregressive_config["training"]["selection_metric"] = (
         "autoregressive_mean_five_horizon_cumulative_log_change_mae"
     )

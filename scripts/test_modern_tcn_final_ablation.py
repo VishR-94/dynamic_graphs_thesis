@@ -9,6 +9,7 @@ from src.training.modern_tcn_final_two_runs_specs import (
     make_final_two_run_specs,
 )
 from src.training.run_modern_tcn_final_ablation import (
+    _autoregressive_rollout_uses_amp,
     _normalise_raw_context,
     _select_rollout_horizons,
     _synthetic_next_candle,
@@ -18,6 +19,12 @@ from src.training.run_modern_tcn_final_ablation import (
 def test_final_specs() -> None:
     autoreg, weighted = make_final_two_run_specs()
     assert autoreg.config["training"]["forecast_strategy"] == "autoregressive"
+    assert (
+        autoreg.config["training"][
+            "autoregressive_rollout_mixed_precision"
+        ]
+        is False
+    )
     assert autoreg.config["training"]["one_step_training_stride"] == 1
     assert autoreg.config["data"]["horizons"] == [1, 5, 15, 30, 60]
     assert weighted.config["training"]["forecast_strategy"] == "parallel_weighted"
@@ -72,9 +79,40 @@ def test_rollout_helpers() -> None:
     torch.testing.assert_close(selected[:, -1], dense[:, 59])
 
 
+
+def test_rollout_precision_contract() -> None:
+    autoreg, _ = make_final_two_run_specs()
+    config = autoreg.config
+    assert not _autoregressive_rollout_uses_amp(
+        config,
+        training_amp_enabled=True,
+    )
+    assert not _autoregressive_rollout_uses_amp(
+        config,
+        training_amp_enabled=False,
+    )
+
+    opt_in = {
+        **config,
+        "training": {
+            **config["training"],
+            "autoregressive_rollout_mixed_precision": True,
+        },
+    }
+    assert _autoregressive_rollout_uses_amp(
+        opt_in,
+        training_amp_enabled=True,
+    )
+    assert not _autoregressive_rollout_uses_amp(
+        opt_in,
+        training_amp_enabled=False,
+    )
+
+
 def main() -> None:
     test_final_specs()
     test_rollout_helpers()
+    test_rollout_precision_contract()
     print("ModernTCN final ablation contracts passed.")
 
 

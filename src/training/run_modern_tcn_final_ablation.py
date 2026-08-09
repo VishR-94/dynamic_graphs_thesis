@@ -280,6 +280,56 @@ def _train_epoch_weighted_parallel(
     }
 
 
+def _autoregressive_rollout_uses_amp(
+    config: Mapping[str, Any],
+    *,
+    training_amp_enabled: bool,
+) -> bool:
+    """Return whether free-running rollout may use CUDA FP16 autocast.
+
+    Training AMP and rollout AMP are separate decisions.  Autoregressive
+    rollout repeatedly feeds model output back into the next context.  Small
+    scale errors can therefore grow across steps, and FP16 Q/K matmuls can
+    overflow before the same computation would become non-finite in FP32.
+    The default is consequently FP32 rollout, even when training uses AMP.
+    """
+
+    requested = bool(
+        config["training"].get(
+            "autoregressive_rollout_mixed_precision",
+            False,
+        )
+    )
+    return bool(training_amp_enabled and requested)
+
+
+def _finite_tensor_summary(values: Tensor) -> str:
+    tensor = torch.as_tensor(values).detach().float()
+    finite = tensor[torch.isfinite(tensor)]
+    non_finite = int((~torch.isfinite(tensor)).sum().item())
+    if finite.numel() == 0:
+        return f"shape={tuple(tensor.shape)}, finite=0, non_finite={non_finite}"
+    return (
+        f"shape={tuple(tensor.shape)}, finite={finite.numel()}, "
+        f"non_finite={non_finite}, min={float(finite.min().item()):.6g}, "
+        f"max={float(finite.max().item()):.6g}"
+    )
+
+
+def _require_finite_rollout_tensor(
+    name: str,
+    values: Tensor,
+    *,
+    step: int,
+) -> None:
+    if torch.isfinite(values).all():
+        return
+    raise FloatingPointError(
+        f"Autoregressive rollout produced non-finite {name} at step "
+        f"{int(step)}. {_finite_tensor_summary(values)}"
+    )
+
+
 def _normalise_raw_context(
     raw_context: Tensor,
     *,
@@ -356,8 +406,18 @@ def _autoregressive_rollout(
     session_length = torch.as_tensor(batch["session_length"]).long()
     predictions: list[Tensor] = []
     first_output = None
+    rollout_use_amp = _autoregressive_rollout_uses_amp(
+        config,
+        training_amp_enabled=use_amp,
+    )
+    _require_finite_rollout_tensor(
+        "initial raw context",
+        raw_context,
+        step=0,
+    )
 
     for step in range(rollout_length):
+        rollout_step = int(step) + 1
         x_norm, target_mean, target_std = _normalise_raw_context(
             raw_context,
             input_channels=input_channels,
@@ -367,20 +427,46 @@ def _autoregressive_rollout(
             clip_min=float(normalisation["clip_min"]),
             clip_max=float(normalisation["clip_max"]),
         )
-        with _autocast_context(device, use_amp):
-            output = model(
-                x_norm,
-                context_start=context_start + int(step),
-                session_length=session_length,
-            )
+        _require_finite_rollout_tensor(
+            "normalised model context",
+            x_norm,
+            step=rollout_step,
+        )
+        try:
+            with _autocast_context(device, rollout_use_amp):
+                output = model(
+                    x_norm,
+                    context_start=context_start + int(step),
+                    session_length=session_length,
+                )
+        except ValueError as error:
+            if "non-finite" not in str(error):
+                raise
+            raise FloatingPointError(
+                "Autoregressive model forward became non-finite at "
+                f"rollout step {rollout_step}; rollout_amp="
+                f"{rollout_use_amp}. Normalised input: "
+                f"{_finite_tensor_summary(x_norm)}. Original error: "
+                f"{error}"
+            ) from error
         if first_output is None:
             first_output = output
+        _require_finite_rollout_tensor(
+            "normalised Close prediction",
+            output.predictions,
+            step=rollout_step,
+        )
         next_norm = output.predictions[:, 0]
         next_close = inverse_window_normalisation(
             y_norm=next_norm.float().unsqueeze(1),
             target_norm_mean=target_mean,
             target_norm_std=target_std,
         )[:, 0].clamp_min(float(normalisation["eps"]))
+        _require_finite_rollout_tensor(
+            "raw Close prediction",
+            next_close,
+            step=rollout_step,
+        )
         predictions.append(next_close)
         next_candle = _synthetic_next_candle(
             raw_context,
@@ -388,7 +474,15 @@ def _autoregressive_rollout(
             input_channels=input_channels,
             eps=float(normalisation["eps"]),
         )
-        raw_context = torch.cat([raw_context[:, 1:], next_candle.unsqueeze(1)], dim=1)
+        _require_finite_rollout_tensor(
+            "synthetic candle",
+            next_candle,
+            step=rollout_step,
+        )
+        raw_context = torch.cat(
+            [raw_context[:, 1:], next_candle.unsqueeze(1)],
+            dim=1,
+        )
 
     if first_output is None:
         raise RuntimeError("Autoregressive rollout produced no steps.")
@@ -817,6 +911,14 @@ def _make_metadata(
         "project_git_branch": _git_value(["branch", "--show-current"], cwd=project_root),
         "device": str(device),
         "mixed_precision": use_amp,
+        "autoregressive_rollout_mixed_precision": (
+            None
+            if _strategy(resolved) != "autoregressive"
+            else _autoregressive_rollout_uses_amp(
+                resolved,
+                training_amp_enabled=use_amp,
+            )
+        ),
         "asset_cols": list(asset_cols),
         "train_sessions": len(train_split["samples"]),
         "validation_sessions": len(validation_split["samples"]),
