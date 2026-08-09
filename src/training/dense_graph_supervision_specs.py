@@ -150,6 +150,22 @@ def make_dense_graph_supervision_specs(
     modern_training["one_step_training_stride"] = int(
         modern_tcn_training_stride
     )
+    modern_training.update(
+        {
+            "forecast_strategy": "autoregressive_close_only",
+            "autoregressive_rollout_length": int(max(horizons)),
+            "autoregressive_rollout_mixed_precision": False,
+            "autoregressive_feedback_channels": ["close"],
+            "autoregressive_target_representation": (
+                "one_step_cumulative_log_change"
+            ),
+            "selection_horizons": list(horizons),
+            "selection_metric": (
+                "autoregressive_close_only_mean_five_horizon_"
+                "cumulative_log_change_mae"
+            ),
+        }
+    )
 
     basedy_architecture = {
         "d_model": int(d_model),
@@ -297,7 +313,8 @@ def make_dense_graph_supervision_specs(
         "experiment_family": "modern_tcn",
         "data": {
             "context_length": int(context_length),
-            "horizons": [1],
+            "horizons": list(horizons),
+            "reported_horizons": list(horizons),
             "alignment_horizons": list(horizons),
             "export_stride": int(export_stride),
             "input_channels": ["close"],
@@ -369,6 +386,22 @@ def make_dense_graph_supervision_specs(
             },
             "head_dropout": 0.0,
         },
+        "models": {
+            "dynamic_graph": {
+                "d_model": 32,
+                "num_st_blocks": 1,
+                "graph": {
+                    "num_heads": 1,
+                    "num_heads_per_layer": [1],
+                    "hidden_dim": 32,
+                    "activation": "softmax",
+                },
+                "heads": {
+                    "prediction_length": 1,
+                    "evaluation_horizons": list(horizons),
+                },
+            }
+        },
         "training": dict(modern_training),
     }
 
@@ -396,12 +429,13 @@ def make_dense_graph_supervision_specs(
         [
             DenseGraphSupervisionRunSpec(
                 run_name=(
-                    "dense_mtg_close_dynamic_state_g1_h32_"
-                    f"c{int(context_length)}_trainstride{int(modern_tcn_training_stride)}"
+                    "autoreg_mtg_close_dynamic_state_g1_h32_"
+                    f"c{int(context_length)}_trainstride{int(modern_tcn_training_stride)}_"
+                    f"roll{int(max(horizons))}"
                     f"_cfg{_short_config_hash(dynamic)}"
                 ),
                 label=(
-                    "One-block ModernTCN dense one-step — state-aware dynamic graph only"
+                    "One-block ModernTCN autoregressive — state-aware dynamic graph only"
                 ),
                 family="modern_tcn",
                 variant="modern_tcn_dynamic_state",
@@ -409,13 +443,14 @@ def make_dense_graph_supervision_specs(
             ),
             DenseGraphSupervisionRunSpec(
                 run_name=(
-                    "dense_mtg_close_random_static_dynamic_state_"
+                    "autoreg_mtg_close_random_static_dynamic_state_"
                     f"a0p5_b0p5_g1_h32_c{int(context_length)}_"
-                    f"trainstride{int(modern_tcn_training_stride)}"
+                    f"trainstride{int(modern_tcn_training_stride)}_"
+                    f"roll{int(max(horizons))}"
                     f"_cfg{_short_config_hash(random_static)}"
                 ),
                 label=(
-                    "One-block ModernTCN dense one-step — random static + dynamic, state-aware"
+                    "One-block ModernTCN autoregressive — random static + dynamic, state-aware"
                 ),
                 family="modern_tcn",
                 variant="modern_tcn_random_static_dynamic_state",
@@ -476,6 +511,13 @@ def summarise_runs(
     *,
     require_all: bool = True,
 ) -> pd.DataFrame:
+    """Summarise the selected checkpoints without conflating task contracts.
+
+    BaseDyGraph-v1 controls expose only h1.  ModernTCN controls are trained
+    one step ahead but selected after a genuine 60-step Close-only recursive
+    rollout, so their table contains all configured public horizons.
+    """
+
     rows: list[dict[str, Any]] = []
     missing: list[str] = []
     for spec in specs:
@@ -494,25 +536,35 @@ def summarise_runs(
                 f"Expected one best epoch row for {spec.run_name}."
             )
         best = selected.iloc[0]
-        rows.append(
-            {
-                "Run": spec.run_name,
-                "Label": spec.label,
-                "Family": spec.family,
-                "Variant": spec.variant,
-                "Status": metadata.get("status"),
-                "Best epoch": best_epoch,
-                "Epochs completed": int(metadata["epochs_completed"]),
-                "Test h1 Log MAE": float(best["test_h1_log_mae"]),
-                "Train dense Log MAE": float(best["train_dense_log_mae"]),
-                "Final graph entropy": best.get("test_final_graph_entropy"),
-                "Final graph effective neighbours": best.get(
-                    "test_final_graph_effective_neighbours"
-                ),
-                "Alpha": best.get("alpha"),
-                "Beta": best.get("beta"),
-            }
-        )
+        horizons = tuple(int(value) for value in spec.config["data"]["horizons"])
+        row: dict[str, Any] = {
+            "Run": spec.run_name,
+            "Label": spec.label,
+            "Family": spec.family,
+            "Variant": spec.variant,
+            "Status": metadata.get("status"),
+            "Forecast strategy": spec.config["training"].get(
+                "forecast_strategy",
+                "dense_teacher_forced_h1",
+            ),
+            "Best epoch": best_epoch,
+            "Epochs completed": int(metadata["epochs_completed"]),
+            "Selection score": float(best["selection_score"]),
+            "Test h1 Log MAE": float(best["test_h1_log_mae"]),
+            "Train one-step Log MAE": float(best["train_dense_log_mae"]),
+            "Final graph entropy": best.get("test_final_graph_entropy"),
+            "Final graph effective neighbours": best.get(
+                "test_final_graph_effective_neighbours"
+            ),
+            "Alpha": best.get("alpha"),
+            "Beta": best.get("beta"),
+        }
+        for horizon in horizons:
+            column = f"test_cumulative_log_change_mae_h{horizon}"
+            if column in best and not pd.isna(best[column]):
+                row[f"Log MAE — {horizon} min"] = float(best[column])
+        rows.append(row)
+
     if require_all and missing:
         raise FileNotFoundError(
             "Missing completed runs: " + ", ".join(sorted(missing))
@@ -520,6 +572,6 @@ def summarise_runs(
     result = pd.DataFrame(rows)
     if not result.empty:
         result = result.sort_values(
-            ["Test h1 Log MAE", "Run"]
+            ["Selection score", "Run"]
         ).reset_index(drop=True)
     return result

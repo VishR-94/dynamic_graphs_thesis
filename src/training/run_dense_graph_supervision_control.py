@@ -37,7 +37,7 @@ from src.data.dense_graph_supervision_dataset import (
     make_uniform_nonself_graph,
 )
 from src.data.load_candle_data import clean_candle_splits, load_candle_splits
-from src.evaluation.forecast_evaluator import ForecastEvaluator
+from src.evaluation.metrics import ForecastEvaluator
 from src.models.dense_one_step_graph_controls import (
     PINNED_BASEDYGRAPH_COMMIT,
     BaseDyGraphV1ContinuousToPriceDense,
@@ -53,6 +53,10 @@ from src.training.run_dynamic_graph import (
     atomic_torch_save,
     resolve_device,
     set_seed,
+)
+from src.training.run_modern_tcn_final_ablation import (
+    _autoregressive_errors as _close_only_autoregressive_errors,
+    _rollout_step_diagnostics as _close_only_rollout_step_diagnostics,
 )
 from src.utils.metric_tables import make_evaluation_table
 
@@ -99,26 +103,37 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _validate_config(config: Mapping[str, Any]) -> None:
-    for key in ("model_family", "experiment_family", "variant", "data", "model", "training"):
+    for key in (
+        "model_family",
+        "experiment_family",
+        "variant",
+        "data",
+        "model",
+        "training",
+    ):
         if key not in config:
             raise KeyError(f"Missing config field {key!r}.")
     if str(config["model_family"]) != "dense_graph_supervision_control":
         raise ValueError("Unexpected model_family.")
+
     family = str(config["experiment_family"])
     if family not in {"basedygraph_v1", "modern_tcn"}:
         raise ValueError(f"Unsupported experiment_family {family!r}.")
     training = config["training"]
     if str(training["selection_split"]) != "test":
         raise ValueError("These curiosity runs must select on the test split.")
-    if str(training["selection_metric"]) != (
-        "forecast_origin_h1_cumulative_log_change_mae"
-    ):
-        raise ValueError("Unexpected selection metric.")
     if str(training["scheduler"]) != "modern_tcn_type3_delayed":
         raise ValueError("Expected delayed type-3 learning-rate schedule.")
     if int(training["patience"]) <= 0 or int(training["max_epochs"]) <= 0:
         raise ValueError("patience and max_epochs must be positive.")
+
     if family == "basedygraph_v1":
+        if str(training["selection_metric"]) != (
+            "forecast_origin_h1_cumulative_log_change_mae"
+        ):
+            raise ValueError("Unexpected BaseDyGraph selection metric.")
+        if tuple(int(value) for value in config["data"]["horizons"]) != (1,):
+            raise ValueError("BaseDyGraph dense controls expose only h1.")
         architecture = config["model"]["official_basedygraph_v1"]
         if str(architecture["spatial_module_type"]) != "dynamic_graph":
             raise ValueError("BaseDyGraph controls require dynamic_graph.")
@@ -126,13 +141,27 @@ def _validate_config(config: Mapping[str, Any]) -> None:
             raise ValueError("BaseDyGraph v1 uses softmax in every block.")
         if int(architecture["num_st_blocks"]) != 4:
             raise ValueError("The BaseDyGraph controls require four ST blocks.")
-    else:
-        variant = str(config["model"]["variant"])
-        if variant not in {"dynamic_state", "random_static_dynamic_state"}:
-            raise ValueError("Unexpected ModernTCN graph variant.")
-        if tuple(config["data"]["input_channels"]) != ("close",):
-            raise ValueError("The attached dense ModernTCN model is Close-only.")
+        return
 
+    variant = str(config["model"]["variant"])
+    if variant not in {"dynamic_state", "random_static_dynamic_state"}:
+        raise ValueError("Unexpected ModernTCN graph variant.")
+    if tuple(config["data"]["input_channels"]) != ("close",):
+        raise ValueError("Close-only recursive forecasting requires Close-only input.")
+    if str(training.get("forecast_strategy")) != "autoregressive_close_only":
+        raise ValueError("ModernTCN controls must use Close-only autoregressive rollout.")
+    if str(training["selection_metric"]) != (
+        "autoregressive_close_only_mean_five_horizon_"
+        "cumulative_log_change_mae"
+    ):
+        raise ValueError("Unexpected ModernTCN autoregressive selection metric.")
+    horizons = tuple(int(value) for value in config["data"]["horizons"])
+    if horizons != tuple(sorted(set(horizons))) or not horizons or horizons[0] != 1:
+        raise ValueError("ModernTCN public horizons must be unique, increasing, and start at 1.")
+    if int(training["autoregressive_rollout_length"]) < max(horizons):
+        raise ValueError("Autoregressive rollout is shorter than the maximum horizon.")
+    if bool(training.get("autoregressive_rollout_mixed_precision", True)):
+        raise ValueError("Recursive graph rollout must run in FP32.")
 
 def _autocast(device: torch.device, enabled: bool):
     if enabled:
@@ -596,38 +625,72 @@ def _evaluate_selection(
     device: torch.device,
     use_amp: bool,
 ) -> dict[str, Any]:
+    """Evaluate the family-appropriate public forecast contract.
+
+    BaseDyGraph-v1 is a dense teacher-forced h1 model.  ModernTCN is a
+    Close-only one-step model that is recursively rolled forward for the full
+    configured horizon set.  The latter therefore selects on a genuine
+    multi-horizon forecast, not on relabelled one-step errors.
+    """
+
     model.eval()
     family = str(config["experiment_family"])
-    total_error = 0.0
-    total_count = 0
+    horizons = (1,) if family == "basedygraph_v1" else tuple(
+        int(value) for value in config["data"]["horizons"]
+    )
+    horizon_sum = torch.zeros(len(horizons), dtype=torch.float64)
+    horizon_count = torch.zeros(len(horizons), dtype=torch.float64)
     per_layer_parts: list[list[Tensor]] | None = None
     dynamic_parts: list[Tensor] = []
     selected_parts: list[Tensor] = []
-    with torch.no_grad():
+
+    with torch.inference_mode():
         for batch in tqdm(loader, desc="test selection", leave=False):
-            with _autocast(device, use_amp):
-                if str(config["experiment_family"]) == "basedygraph_v1":
+            if family == "basedygraph_v1":
+                with _autocast(device, use_amp):
                     output, _, _, dense_error = _base_batch_values(
                         model,
                         batch,
                         config=config,
                         device=device,
                     )
-                    error = dense_error[:, -1:]
-                    layer_graphs = output.per_layer_graphs
-                    dynamic = output.selected_graph
-                    selected = output.selected_graph
-                else:
-                    output, error = _modern_batch_values(
-                        model,
-                        batch,
-                        device=device,
-                    )
-                    layer_graphs = tuple(output.graph.per_layer)
-                    dynamic = output.graph.dynamic
-                    selected = output.graph.selected
-            total_error += float(error.detach().double().sum().item())
-            total_count += int(error.numel())
+                error = dense_error[:, -1:].detach().double().cpu()
+                layer_graphs = output.per_layer_graphs
+                dynamic = output.selected_graph
+                selected = output.selected_graph
+            else:
+                (
+                    _,
+                    _,
+                    _,
+                    absolute_error,
+                    _,
+                    _,
+                    first_output,
+                ) = _close_only_autoregressive_errors(
+                    model=model,
+                    batch=batch,
+                    device=device,
+                    use_amp=use_amp,
+                    config=config,
+                )
+                error = absolute_error.detach().double().cpu()
+                layer_graphs = tuple(first_output.graph.per_layer)
+                dynamic = first_output.graph.dynamic
+                selected = first_output.graph.selected
+
+            if int(error.shape[1]) != len(horizons):
+                raise RuntimeError(
+                    f"Selection error horizon axis {int(error.shape[1])} "
+                    f"does not match {horizons}."
+                )
+            horizon_sum += error.sum(dim=(0, 2, 3))
+            horizon_count += torch.full(
+                (len(horizons),),
+                float(error.shape[0] * error.shape[2] * error.shape[3]),
+                dtype=torch.float64,
+            )
+
             if per_layer_parts is None:
                 per_layer_parts = [[] for _ in range(len(layer_graphs))]
             for index, graph in enumerate(layer_graphs):
@@ -643,8 +706,18 @@ def _evaluate_selection(
                 dynamic_parts.append(
                     torch.as_tensor(dynamic).detach().cpu().float()
                 )
-    if total_count <= 0 or per_layer_parts is None:
+
+    if torch.any(horizon_count <= 0) or per_layer_parts is None:
         raise RuntimeError("Selection loader produced no examples.")
+    by_horizon_values = horizon_sum / horizon_count
+    by_horizon = {
+        int(horizon): float(value)
+        for horizon, value in zip(
+            horizons,
+            by_horizon_values.tolist(),
+            strict=True,
+        )
+    }
     per_layer = tuple(
         torch.cat(parts, dim=0) if parts else None
         for parts in per_layer_parts
@@ -657,14 +730,16 @@ def _evaluate_selection(
     else:
         final_graph = torch.cat(selected_parts, dim=0)
         dynamic_graph = torch.cat(dynamic_parts, dim=0)
+
     return {
-        "h1_log_mae": total_error / total_count,
+        "selection_score": float(by_horizon_values.mean().item()),
+        "h1_log_mae": float(by_horizon[1]),
+        "by_horizon": by_horizon,
         "per_layer": per_layer,
         "selected_graph": final_graph,
         "dynamic_graph": dynamic_graph,
         "final_graph_summary": _graph_stats(final_graph),
     }
-
 
 def _batch_dates(batch: Mapping[str, Any]) -> list[str]:
     values = batch["day"]
@@ -685,6 +760,8 @@ def _export_split(
     use_amp: bool,
     checkpoint_epoch: int,
 ) -> dict[str, Any]:
+    """Export one selected checkpoint under its true forecast contract."""
+
     loader = _build_loader(
         dataset,
         batch_size=int(config["training"]["export_batch_size"]),
@@ -694,9 +771,15 @@ def _export_split(
     )
     model.eval()
     family = str(config["experiment_family"])
+    horizons = [1] if family == "basedygraph_v1" else [
+        int(value) for value in config["data"]["horizons"]
+    ]
+
     predictions: list[Tensor] = []
     targets: list[Tensor] = []
     lasts: list[Tensor] = []
+    dense_rollouts: list[Tensor] = []
+    dense_log_returns: list[Tensor] = []
     sample_indices: list[Tensor] = []
     origin_indices: list[Tensor] = []
     target_indices: list[Tensor] = []
@@ -708,48 +791,54 @@ def _export_split(
     invalid_prediction_count = 0
     prediction_count = 0
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in tqdm(loader, desc=f"export {split_name}", leave=False):
-            with _autocast(device, use_amp):
-                if str(config["experiment_family"]) == "basedygraph_v1":
+            if family == "basedygraph_v1":
+                with _autocast(device, use_amp):
                     output, predicted_dense, target_dense, _ = _base_batch_values(
                         model,
                         batch,
                         config=config,
                         device=device,
                     )
-                    predicted_raw = predicted_dense[:, -1:]
-                    true_raw = target_dense[:, -1:]
-                    last = torch.as_tensor(batch["last_context_close"]).to(
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    layer_graphs = output.per_layer_graphs
-                    selected_graph = output.selected_graph
-                    dynamic_graph = output.selected_graph
-                    static_graph = None
-                else:
-                    output, _ = _modern_batch_values(
-                        model,
-                        batch,
-                        device=device,
-                    )
-                    predicted_change = output.predictions.float()
-                    last = torch.as_tensor(batch["last_context_target"]).to(
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    predicted_raw = last.unsqueeze(1) * torch.exp(predicted_change)
-                    true_raw = torch.as_tensor(batch["y_unnormalised"])[
-                        :, :1
-                    ].to(
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    layer_graphs = tuple(output.graph.per_layer)
-                    selected_graph = output.graph.selected
-                    dynamic_graph = output.graph.dynamic
-                    static_graph = output.graph.base
+                predicted_raw = predicted_dense[:, -1:]
+                true_raw = target_dense[:, -1:]
+                last = torch.as_tensor(batch["last_context_close"]).to(
+                    device=device,
+                    dtype=torch.float32,
+                )
+                layer_graphs = output.per_layer_graphs
+                selected_graph = output.selected_graph
+                dynamic_graph = output.selected_graph
+                static_graph = None
+                batch_target_indices = torch.as_tensor(
+                    batch["target_indices"]
+                )[:, :1]
+            else:
+                (
+                    predicted_raw,
+                    true_raw,
+                    last,
+                    _,
+                    dense_close,
+                    dense_one_step_log_returns,
+                    first_output,
+                ) = _close_only_autoregressive_errors(
+                    model=model,
+                    batch=batch,
+                    device=device,
+                    use_amp=use_amp,
+                    config=config,
+                )
+                dense_rollouts.append(dense_close.detach().cpu().float())
+                dense_log_returns.append(
+                    dense_one_step_log_returns.detach().cpu().float()
+                )
+                layer_graphs = tuple(first_output.graph.per_layer)
+                selected_graph = first_output.graph.selected
+                dynamic_graph = first_output.graph.dynamic
+                static_graph = first_output.graph.base
+                batch_target_indices = torch.as_tensor(batch["target_indices"])
 
             invalid_prediction_count += int(
                 (~torch.isfinite(predicted_raw) | (predicted_raw <= 0)).sum().item()
@@ -760,9 +849,7 @@ def _export_split(
             lasts.append(last.detach().cpu().float())
             sample_indices.append(torch.as_tensor(batch["sample_idx"]).cpu().long())
             origin_indices.append(torch.as_tensor(batch["origin_idx"]).cpu().long())
-            target_indices.append(
-                torch.as_tensor(batch["target_indices"])[:, :1].cpu().long()
-            )
+            target_indices.append(batch_target_indices.cpu().long())
             dates.extend(_batch_dates(batch))
 
             if per_layer_parts is None:
@@ -806,18 +893,52 @@ def _export_split(
     y_pred = torch.cat(predictions, dim=0)
     y_true = torch.cat(targets, dim=0)
     last_context = torch.cat(lasts, dim=0)
-    prediction_result = {
+    if int(y_pred.shape[1]) != len(horizons):
+        raise RuntimeError(
+            f"Exported prediction horizon axis {int(y_pred.shape[1])} "
+            f"does not match {horizons}."
+        )
+
+    prediction_result: dict[str, Any] = {
         "y_pred": y_pred,
         "y_true": y_true,
         "last_context_target": last_context,
         "channels": ["close"],
-        "horizons": [1],
+        "horizons": horizons,
         "asset_cols": list(asset_cols),
         "sample_idx": torch.cat(sample_indices, dim=0),
         "origin_idx": torch.cat(origin_indices, dim=0),
         "target_indices": torch.cat(target_indices, dim=0),
         "output_space": "raw",
     }
+    rollout_table: pd.DataFrame | None = None
+    if family != "basedygraph_v1":
+        dense_close_all = torch.cat(dense_rollouts, dim=0)
+        dense_log_return_all = torch.cat(dense_log_returns, dim=0)
+        prediction_result.update(
+            {
+                "dense_autoregressive_close_path": dense_close_all,
+                "dense_autoregressive_one_step_log_returns": (
+                    dense_log_return_all
+                ),
+                "dense_autoregressive_horizons": list(
+                    range(1, int(config["training"]["autoregressive_rollout_length"]) + 1)
+                ),
+                "autoregressive_input_channels": ["close"],
+                "autoregressive_feedback_channels": ["close"],
+                "autoregressive_output_representation": (
+                    "one_step_cumulative_log_change"
+                ),
+            }
+        )
+        rollout_table = pd.DataFrame(
+            _close_only_rollout_step_diagnostics(
+                dense_close_all,
+                dense_log_return_all,
+                last_context,
+            )
+        )
+
     evaluator = ForecastEvaluator(
         prediction_result=prediction_result,
         train_split=dict(train_split),
@@ -868,9 +989,7 @@ def _export_split(
     )
     graph_artifacts = {
         "graph_type": (
-            "dynamic"
-            if saved_static is None
-            else "static_dynamic_mixture"
+            "dynamic" if saved_static is None else "static_dynamic_mixture"
         ),
         "graph_orientation": GRAPH_ORIENTATION,
         "orientation": GRAPH_ORIENTATION,
@@ -881,6 +1000,9 @@ def _export_split(
         "layer_head_counts": [graph_heads] * layer_count,
         "graph_activations_per_layer": ["softmax"] * layer_count,
         "selected_layer": layer_count - 1,
+        # For recursive models these are the graphs inferred from the fully
+        # observed forecast-origin context.  Synthetic rollout-step graphs are
+        # deliberately not presented as observed-data Graph Hub artefacts.
         "selected": selected,
         "per_layer": per_layer,
         "base": saved_static,
@@ -889,9 +1011,7 @@ def _export_split(
         ),
         "dynamic": dynamic,
         "per_layer_dynamic": (
-            per_layer
-            if family == "basedygraph_v1"
-            else (dynamic,)
+            per_layer if family == "basedygraph_v1" else (dynamic,)
         ),
         "alpha": alpha,
         "alpha_per_layer": tuple(
@@ -911,24 +1031,35 @@ def _export_split(
         "sample_idx": prediction_result["sample_idx"],
         "origin_idx": prediction_result["origin_idx"],
         "target_indices": prediction_result["target_indices"],
-        "diagonal_policy": "eligible in scorer softmax; no extra identity matrix",
+        "forecast_strategy": (
+            "dense_teacher_forced_h1"
+            if family == "basedygraph_v1"
+            else "autoregressive_close_only"
+        ),
+        "diagonal_policy": (
+            "eligible in scorer softmax; no extra identity matrix"
+        ),
     }
     selected_summary = _graph_stats(selected.float())
     static_summary = _graph_stats(
         None if saved_static is None else saved_static.float()
     )
     dynamic_summary = _graph_stats(dynamic.float())
-    diagnostics = {
+    diagnostics: dict[str, Any] = {
         "split": split_name,
         "checkpoint_epoch": int(checkpoint_epoch),
         "windows": int(y_pred.shape[0]),
-        "horizons": [1],
+        "horizons": horizons,
         "assets": int(y_pred.shape[2]),
         "input_mode": config["data"].get("input_mode", "continuous_close"),
+        "forecast_strategy": graph_artifacts["forecast_strategy"],
         "dense_training_semantics": (
             "teacher-forced next-Close at every context transition"
             if family == "basedygraph_v1"
-            else "stride-1 one-step Close forecasting windows"
+            else (
+                "stride-1 one-step Close training; free-running recursive "
+                "Close rollout for public h1/h5/h15/h30/h60 forecasts"
+            )
         ),
         "invalid_prediction_fraction": (
             float(invalid_prediction_count) / max(prediction_count, 1)
@@ -951,13 +1082,18 @@ def _export_split(
         ],
         "graph_orientation": GRAPH_ORIENTATION,
     }
+    if rollout_table is not None:
+        diagnostics["rollout_step_diagnostics"] = rollout_table.to_dict(
+            orient="records"
+        )
+
     return {
         "prediction_result": prediction_result,
         "graph_artifacts": graph_artifacts,
         "metric_table": metric_table,
         "diagnostics": diagnostics,
+        "rollout_step_diagnostics": rollout_table,
     }
-
 
 def _save_export(
     run_dir: Path,
@@ -981,12 +1117,25 @@ def _save_export(
     atomic_csv_save(values["metric_table"], metric_path)
     atomic_json_save(values["diagnostics"], diagnostics_path)
 
+    rollout_table = values.get("rollout_step_diagnostics")
+    rollout_path: Path | None = None
+    if isinstance(rollout_table, pd.DataFrame):
+        rollout_path = (
+            run_dir / f"best_{split_name}_rollout_step_diagnostics.csv"
+        )
+        atomic_csv_save(rollout_table, rollout_path)
+
     analysis_dir = run_dir / "analysis" / split_name
     analysis_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(prediction_path, analysis_dir / "predictions.pt")
     shutil.copy2(graph_path, analysis_dir / "graphs.pt")
     shutil.copy2(metric_path, analysis_dir / "metric_table.csv")
     shutil.copy2(diagnostics_path, analysis_dir / "diagnostics.json")
+    if rollout_path is not None:
+        shutil.copy2(
+            rollout_path,
+            analysis_dir / "rollout_step_diagnostics.csv",
+        )
 
 
 def _init_wandb(args: argparse.Namespace, config: Mapping[str, Any]):
@@ -1073,7 +1222,13 @@ def main() -> None:
         "selection_metric": config["training"]["selection_metric"],
         "asset_cols": asset_cols,
         "context_length": int(config["data"]["context_length"]),
-        "reported_horizons": [1],
+        "reported_horizons": [
+            int(value) for value in config["data"]["horizons"]
+        ],
+        "forecast_strategy": config["training"].get(
+            "forecast_strategy",
+            "dense_teacher_forced_h1",
+        ),
         "train_windows": len(training_datasets["train"]),
         "export_train_windows": len(export_datasets["train"]),
         "validation_windows": len(export_datasets["validation"]),
@@ -1092,7 +1247,9 @@ def main() -> None:
             )
             * len(asset_cols)
         ),
-        "forecast_origin_selection_horizon": 1,
+        "selection_horizons": [
+            int(value) for value in config["data"]["horizons"]
+        ],
         "optimizer": config["training"]["optimizer"],
         "scheduler": config["training"]["scheduler"],
         "learning_rate": float(config["training"]["learning_rate"]),
@@ -1143,6 +1300,21 @@ def main() -> None:
                     else float(model.alpha().item())
                 ),
                 "initial_beta": float(model.beta().item()),
+                "one_step_training_stride": int(
+                    config["training"]["one_step_training_stride"]
+                ),
+                "autoregressive_rollout_length": int(
+                    config["training"]["autoregressive_rollout_length"]
+                ),
+                "autoregressive_rollout_mixed_precision": bool(
+                    config["training"].get(
+                        "autoregressive_rollout_mixed_precision",
+                        False,
+                    )
+                ),
+                "autoregressive_feedback_channels": list(
+                    config["training"]["autoregressive_feedback_channels"]
+                ),
             }
         )
 
@@ -1265,7 +1437,7 @@ def main() -> None:
                 "graph_learning_rate": graph_lr,
                 "train_dense_log_mae": float(training_values["dense_log_mae"]),
                 "test_h1_log_mae": float(selection["h1_log_mae"]),
-                "selection_score": float(selection["h1_log_mae"]),
+                "selection_score": float(selection["selection_score"]),
                 "alpha": alpha,
                 "beta": beta,
                 "test_final_graph_entropy": selection["final_graph_summary"].get(
@@ -1275,6 +1447,10 @@ def main() -> None:
                     "final_graph_summary"
                 ].get("mean_effective_neighbours"),
             }
+            for horizon, value in selection["by_horizon"].items():
+                row[
+                    f"test_cumulative_log_change_mae_h{int(horizon)}"
+                ] = float(value)
             for index, graph in enumerate(selection["per_layer"]):
                 summary = _graph_stats(graph)
                 row[f"block_{index}_selected_entropy"] = summary.get(
@@ -1286,11 +1462,11 @@ def main() -> None:
             history.append(row)
             atomic_csv_save(pd.DataFrame(history), run_dir / "history.csv")
 
-            improved = float(selection["h1_log_mae"]) < (
+            improved = float(selection["selection_score"]) < (
                 best_score - float(config["training"]["min_delta"])
             )
             if improved:
-                best_score = float(selection["h1_log_mae"])
+                best_score = float(selection["selection_score"])
                 best_epoch = int(epoch)
                 epochs_without_improvement = 0
             else:
@@ -1313,11 +1489,15 @@ def main() -> None:
 
             if wandb_run is not None:
                 wandb_run.log(row, step=epoch)
+            horizon_text = ", ".join(
+                f"h{int(horizon)}={float(value):.8f}"
+                for horizon, value in selection["by_horizon"].items()
+            )
             print(
-                f"Epoch {epoch}: train dense Log MAE="
+                f"Epoch {epoch}: train one-step Log MAE="
                 f"{training_values['dense_log_mae']:.8f}; "
-                f"test h1 Log MAE={selection['h1_log_mae']:.8f}; "
-                f"alpha={alpha}; beta={beta}"
+                f"test selection={selection['selection_score']:.8f}; "
+                f"{horizon_text}; alpha={alpha}; beta={beta}"
             )
             if epochs_without_improvement >= int(config["training"]["patience"]):
                 break

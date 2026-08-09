@@ -9,6 +9,7 @@ causality, graph depth, row stochasticity, and gradient flow.
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 import json
 import tempfile
 
@@ -37,6 +38,9 @@ from src.models.dense_one_step_graph_controls import (
 )
 from src.training.dense_graph_supervision_specs import (
     make_dense_graph_supervision_specs,
+)
+from src.training.run_dense_graph_supervision_control import (
+    _evaluate_selection,
 )
 
 
@@ -91,6 +95,26 @@ def _spec_contract() -> tuple:
         raise AssertionError("Random-static ModernTCN state pathway changed.")
     if random_static.config["model"]["prior"]["type"] != "random":
         raise AssertionError("Random-static control acquired an economic prior.")
+    for spec in specs[:2]:
+        if tuple(spec.config["data"]["horizons"]) != (1,):
+            raise AssertionError("BaseDyGraph dense controls must remain h1-only.")
+        if spec.config["training"]["selection_metric"] != (
+            "forecast_origin_h1_cumulative_log_change_mae"
+        ):
+            raise AssertionError("BaseDyGraph selection contract changed.")
+    for spec in specs[2:]:
+        if tuple(spec.config["data"]["horizons"]) != (1, 5, 15, 30, 60):
+            raise AssertionError("ModernTCN recursive horizons changed.")
+        if spec.config["training"].get("forecast_strategy") != (
+            "autoregressive_close_only"
+        ):
+            raise AssertionError("ModernTCN control is no longer autoregressive.")
+        if spec.config["training"]["autoregressive_rollout_length"] != 60:
+            raise AssertionError("ModernTCN recursive rollout length changed.")
+        if spec.config["training"][
+            "autoregressive_rollout_mixed_precision"
+        ]:
+            raise AssertionError("Recursive graph rollout must remain FP32.")
     for spec in specs:
         if spec.config["training"]["scheduler_decay_start_epoch"] != 15:
             raise AssertionError("Delayed schedule no longer begins at epoch 15.")
@@ -224,6 +248,83 @@ def _aligned_dataset_contract() -> None:
 
 
 
+class _FakeRecursiveModernTCN(torch.nn.Module):
+    """Persistence-like one-step model for the recursive runner contract."""
+
+    def __init__(self, nodes: int) -> None:
+        super().__init__()
+        self.nodes = int(nodes)
+
+    def alpha(self):
+        return None
+
+    def beta(self):
+        return torch.tensor(0.5)
+
+    def forward(self, x, *, context_start, session_length):
+        del context_start, session_length
+        batch = int(x.shape[0])
+        graph = torch.full(
+            (batch, 1, self.nodes, self.nodes),
+            1.0 / self.nodes,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        graph_values = SimpleNamespace(
+            selected=graph,
+            dynamic=graph,
+            base=None,
+            per_layer=(graph,),
+        )
+        return SimpleNamespace(
+            predictions=torch.zeros(
+                batch, 1, self.nodes, 1, dtype=x.dtype, device=x.device
+            ),
+            graph=graph_values,
+        )
+
+
+def _autoregressive_selection_contract(specs: tuple) -> None:
+    """Verify that Models 3/4 really roll one-step outputs to h60."""
+
+    config = json.loads(json.dumps(specs[2].config))
+    batch_size = 2
+    nodes = 3
+    horizons = tuple(int(value) for value in config["data"]["horizons"])
+    batch = {
+        "context_unnormalised": torch.full(
+            (batch_size, 60, nodes, 1), 100.0
+        ),
+        "y_unnormalised": torch.full(
+            (batch_size, len(horizons), nodes, 1), 100.0
+        ),
+        "last_context_target": torch.full((batch_size, nodes, 1), 100.0),
+        "context_start": torch.zeros(batch_size, dtype=torch.long),
+        "session_length": torch.full((batch_size,), 390, dtype=torch.long),
+        "sample_idx": torch.arange(batch_size),
+        "origin_idx": torch.tensor([59, 74]),
+        "target_indices": torch.tensor(
+            [[59 + horizon for horizon in horizons],
+             [74 + horizon for horizon in horizons]],
+            dtype=torch.long,
+        ),
+        "day": ["2024-10-01", "2024-10-02"],
+    }
+    result = _evaluate_selection(
+        model=_FakeRecursiveModernTCN(nodes),
+        loader=[batch],
+        config=config,
+        device=torch.device("cpu"),
+        use_amp=False,
+    )
+    if tuple(result["by_horizon"]) != horizons:
+        raise AssertionError("Recursive selection did not score all public horizons.")
+    if result["selection_score"] != 0.0:
+        raise AssertionError("Zero-return persistence rollout should have zero error.")
+    if len(result["per_layer"]) != 1:
+        raise AssertionError("Recursive selection lost the forecast-origin graph.")
+
+
 def _graph_hub_schema_contract(specs: tuple) -> None:
     """Verify that every new run schema and graph payload is Graph-Hub readable."""
 
@@ -239,6 +340,7 @@ def _graph_hub_schema_contract(specs: tuple) -> None:
             run_dir = root / spec.run_name
             run_dir.mkdir(parents=True)
             config = json.loads(json.dumps(spec.config))
+            horizons = tuple(int(value) for value in spec.config["data"]["horizons"])
             metadata = {
                 "status": "completed",
                 "best_epoch": 1,
@@ -249,7 +351,8 @@ def _graph_hub_schema_contract(specs: tuple) -> None:
                     if spec.variant == "modern_tcn_random_static_dynamic_state"
                     else "dynamic"
                 ),
-                "selection_metric": "forecast_origin_h1_cumulative_log_change_mae",
+                "selection_metric": spec.config["training"]["selection_metric"],
+                "reported_horizons": list(horizons),
             }
             (run_dir / "resolved_config.json").write_text(
                 json.dumps(config), encoding="utf-8"
@@ -259,15 +362,23 @@ def _graph_hub_schema_contract(specs: tuple) -> None:
             )
 
             prediction_result = {
-                "y_pred": torch.full((windows, 1, nodes, 1), 101.0),
-                "y_true": torch.full((windows, 1, nodes, 1), 101.5),
+                "y_pred": torch.full(
+                    (windows, len(horizons), nodes, 1), 101.0
+                ),
+                "y_true": torch.full(
+                    (windows, len(horizons), nodes, 1), 101.5
+                ),
                 "last_context_target": torch.full((windows, nodes, 1), 100.0),
                 "channels": ["close"],
-                "horizons": [1],
+                "horizons": list(horizons),
                 "asset_cols": asset_cols,
                 "sample_idx": torch.tensor([0, 1]),
                 "origin_idx": torch.tensor([59, 74]),
-                "target_indices": torch.tensor([[60], [75]]),
+                "target_indices": torch.tensor(
+                    [[59 + horizon for horizon in horizons],
+                     [74 + horizon for horizon in horizons]],
+                    dtype=torch.long,
+                ),
                 "output_space": "raw",
             }
             layer_count = 4 if spec.family == "basedygraph_v1" else 1
@@ -315,16 +426,19 @@ def _graph_hub_schema_contract(specs: tuple) -> None:
                 [
                     {
                         "metric": "cumulative_log_change_mae",
-                        "horizon": 1,
+                        "horizon": horizon,
                         "channel": "close",
                         "value": 0.001,
                     }
+                    for horizon in horizons
                 ]
             ).to_csv(run_dir / "best_test_metric_table.csv", index=False)
 
             info = load_unified_run_info(run_dir)
-            if info.run_kind != "continuous" or info.horizons != (1,):
-                raise AssertionError("Dense control is not a continuous h1 Graph-Hub run.")
+            if info.run_kind != "continuous" or info.horizons != horizons:
+                raise AssertionError(
+                    "Graph Hub did not preserve the run-specific horizon contract."
+                )
             artifacts = load_evaluation_artifacts(
                 run_dir,
                 split="test",
@@ -519,6 +633,7 @@ def main() -> None:
     specs = _spec_contract()
     _helper_contract()
     _aligned_dataset_contract()
+    _autoregressive_selection_contract(specs)
     _graph_hub_schema_contract(specs)
     basedygraph_ran = _optional_basedygraph_forward(specs, repository)
     modern_ran = _optional_modern_forward(specs, repository)
