@@ -29,6 +29,9 @@ from src.evaluation.dynamic_graph_evaluation import (
     load_unified_run_info,
     select_graph,
 )
+from src.models.basedygraph_official_adapter import (
+    load_official_basedygraph_architecture_modules,
+)
 from src.models.dense_one_step_graph_controls import (
     BaseDyGraphV1ContinuousToPriceDense,
     BaseDyGraphV1TokenToPriceDense,
@@ -43,6 +46,57 @@ from src.training.run_dense_graph_supervision_control import (
     _evaluate_selection,
 )
 
+
+
+def _architecture_loader_dependency_contract() -> None:
+    """The plain BaseDyGraph backbone must not import real Lightning/HF."""
+
+    with tempfile.TemporaryDirectory() as directory_text:
+        directory = Path(directory_text)
+        (directory / "utilities.py").write_text(
+            "class ModelConfig:\n    pass\n",
+            encoding="utf-8",
+        )
+        (directory / "modules.py").write_text(
+            "from utilities import *\n",
+            encoding="utf-8",
+        )
+        (directory / "model.py").write_text(
+            "import torch.nn as nn\n"
+            "import lightning.pytorch as pl\n"
+            "from utilities import *\n"
+            "from modules import *\n"
+            "class DiscreteSTGraphBackbone(nn.Module):\n"
+            "    def __init__(self, cfg=None):\n"
+            "        super().__init__()\n"
+            "        self.proj = nn.Linear(2, 2)\n"
+            "class NextStateHead(nn.Module):\n"
+            "    def __init__(self, d_model, states):\n"
+            "        super().__init__()\n"
+            "        self.proj = nn.Linear(d_model, states)\n"
+            "class DiscreteSTGraphLightningModule(pl.LightningModule):\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n",
+            encoding="utf-8",
+        )
+
+        modules = load_official_basedygraph_architecture_modules(
+            directory,
+            require_pinned_commit=False,
+        )
+        backbone = modules.model.DiscreteSTGraphBackbone()
+        if sum(parameter.numel() for parameter in backbone.parameters()) != 6:
+            raise AssertionError("Architecture-only loader changed the backbone.")
+
+        try:
+            modules.model.DiscreteSTGraphLightningModule()
+        except RuntimeError as error:
+            if "architecture-only" not in str(error):
+                raise
+        else:
+            raise AssertionError(
+                "Architecture-only loader allowed the Lightning wrapper."
+            )
 
 def _assert_graph(graph: torch.Tensor, *, batch: int, heads: int, nodes: int) -> None:
     expected = (batch, heads, nodes, nodes)
@@ -630,6 +684,7 @@ def _optional_modern_forward(specs: tuple, repository: Path) -> bool:
 
 def main() -> None:
     repository = Path(__file__).resolve().parents[1]
+    _architecture_loader_dependency_contract()
     specs = _spec_contract()
     _helper_contract()
     _aligned_dataset_contract()

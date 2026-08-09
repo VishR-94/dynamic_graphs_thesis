@@ -31,7 +31,7 @@ from src.models.basedygraph_official_adapter import (
     PINNED_BASEDYGRAPH_COMMIT,
     OfficialBaseDyGraphRunConfig,
     build_official_model_config,
-    load_official_basedygraph_modules,
+    load_official_basedygraph_architecture_modules,
 )
 from src.models.continuous_forecaster import (
     ContinuousForecasterConfig,
@@ -152,13 +152,14 @@ class _DenseBaseDyGraphV1PriceBase(nn.Module):
         super().__init__()
         config.validate()
         self.config = config
-        self.official_modules = load_official_basedygraph_modules(
+        self.official_modules = load_official_basedygraph_architecture_modules(
             external_source_dir,
             require_pinned_commit=True,
         )
         self.official_config = build_official_model_config(
             config.official_run_config(),
             external_source_dir=external_source_dir,
+            official_modules=self.official_modules,
         )
         self.backbone = self.official_modules.model.DiscreteSTGraphBackbone(
             self.official_config

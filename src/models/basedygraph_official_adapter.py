@@ -268,6 +268,139 @@ def _load_official_modules_cached(source_dir_text: str) -> OfficialBaseDyGraphMo
     )
 
 
+
+class _ArchitectureOnlyLightningModule(nn.Module):
+    """Import-only stand-in for ``lightning.pytorch.LightningModule``.
+
+    The official BaseDyGraph ``model.py`` places the plain-PyTorch backbone
+    classes and the optional Lightning training wrapper in the same file.  The
+    dense financial controls use only ``DiscreteSTGraphBackbone`` and
+    ``NextStateHead``; importing the real Lightning package would unnecessarily
+    pull in torchmetrics and Transformers.  Instantiating the official
+    Lightning wrapper through this architecture-only loader is intentionally
+    rejected so the shim cannot silently be used as a trainer.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise RuntimeError(
+            "The architecture-only BaseDyGraph loader cannot instantiate the "
+            "official Lightning training wrapper. Use "
+            "load_official_basedygraph_modules() for that legacy path."
+        )
+
+
+def _restore_sys_module(name: str, previous: object, missing: object) -> None:
+    if previous is missing:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = previous  # type: ignore[assignment]
+
+
+@lru_cache(maxsize=4)
+def _load_official_architecture_modules_cached(
+    source_dir_text: str,
+) -> OfficialBaseDyGraphModules:
+    """Load the official architecture without importing real Lightning.
+
+    ``external/BaseDyGraph/src/model.py`` imports ``lightning.pytorch`` only
+    because the same source file also defines an optional training wrapper.
+    The architecture classes used by the project are ordinary ``nn.Module``
+    classes.  During source execution we therefore provide a temporary import
+    shim solely so Python can define the unused Lightning subclass.  The
+    official architecture source itself is executed unchanged.
+    """
+
+    source_dir = Path(source_dir_text).resolve()
+    namespace = (
+        "_pinned_basedygraph_architecture_"
+        + hashlib.sha256(str(source_dir).encode("utf-8")).hexdigest()[:12]
+    )
+    loaded_names: list[str] = []
+
+    def load_file(filename: str, suffix: str) -> ModuleType:
+        module_name = f"{namespace}_{suffix}"
+        file_path = source_dir / filename
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not create an import spec for {file_path}.")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        loaded_names.append(module_name)
+        spec.loader.exec_module(module)
+        return module
+
+    missing = object()
+    previous = {
+        name: sys.modules.get(name, missing)
+        for name in (
+            "utilities",
+            "modules",
+            "lightning",
+            "lightning.pytorch",
+        )
+    }
+
+    lightning_package = ModuleType("lightning")
+    lightning_package.__path__ = []  # type: ignore[attr-defined]
+    lightning_pytorch = ModuleType("lightning.pytorch")
+    lightning_pytorch.LightningModule = _ArchitectureOnlyLightningModule
+    lightning_package.pytorch = lightning_pytorch  # type: ignore[attr-defined]
+
+    try:
+        utilities = load_file("utilities.py", "utilities")
+        sys.modules["utilities"] = utilities
+
+        modules = load_file("modules.py", "modules")
+        sys.modules["modules"] = modules
+
+        sys.modules["lightning"] = lightning_package
+        sys.modules["lightning.pytorch"] = lightning_pytorch
+        model = load_file("model.py", "model")
+    except Exception:
+        for module_name in loaded_names:
+            sys.modules.pop(module_name, None)
+        raise
+    finally:
+        for name, prior in previous.items():
+            _restore_sys_module(name, prior, missing)
+
+    _assert_module_origin(utilities, source_dir, "utilities")
+    _assert_module_origin(modules, source_dir, "modules")
+    _assert_module_origin(model, source_dir, "model")
+
+    return OfficialBaseDyGraphModules(
+        utilities=utilities,
+        modules=modules,
+        model=model,
+        source_dir=source_dir,
+        commit=_git_commit(source_dir),
+    )
+
+
+def load_official_basedygraph_architecture_modules(
+    external_source_dir: str | Path | None = None,
+    *,
+    require_pinned_commit: bool = True,
+) -> OfficialBaseDyGraphModules:
+    """Load the pinned plain-PyTorch BaseDyGraph architecture only."""
+
+    source_dir = _resolve_external_source_dir(external_source_dir)
+    loaded = _load_official_architecture_modules_cached(str(source_dir))
+
+    if require_pinned_commit:
+        if loaded.commit is None:
+            raise RuntimeError(
+                "Could not resolve the BaseDyGraph submodule commit at "
+                f"{source_dir}. Run `git submodule update --init --recursive`."
+            )
+        if loaded.commit != PINNED_BASEDYGRAPH_COMMIT:
+            raise RuntimeError(
+                "BaseDyGraph submodule commit mismatch. Expected "
+                f"{PINNED_BASEDYGRAPH_COMMIT}, observed {loaded.commit}."
+            )
+    return loaded
+
+
 def load_official_basedygraph_modules(
     external_source_dir: str | Path | None = None,
     *,
@@ -298,11 +431,16 @@ def build_official_model_config(
     run_config: OfficialBaseDyGraphRunConfig,
     *,
     external_source_dir: str | Path | None = None,
+    official_modules: OfficialBaseDyGraphModules | None = None,
 ) -> Any:
     """Construct the official ``ModelConfig`` with every field explicit."""
 
     run_config.validate()
-    official = load_official_basedygraph_modules(external_source_dir)
+    official = (
+        official_modules
+        if official_modules is not None
+        else load_official_basedygraph_modules(external_source_dir)
+    )
 
     return official.utilities.ModelConfig(
         num_states=run_config.num_states,

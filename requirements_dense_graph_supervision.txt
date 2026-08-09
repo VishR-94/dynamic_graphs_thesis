@@ -1,0 +1,11 @@
+# Dependencies used by dense_graph_supervision_controls.ipynb.
+# PyTorch is supplied by the selected Colab CUDA runtime.
+numpy
+pandas
+matplotlib
+scikit-learn
+tqdm
+wandb
+scipy
+pyyaml
+einops==0.8.1
