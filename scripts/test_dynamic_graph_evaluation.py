@@ -14,6 +14,8 @@ import torch
 matplotlib.use("Agg")
 
 from src.evaluation.dynamic_graph_evaluation import (
+    analyse_coarse_token_predictive_distribution,
+    analyse_coarse_token_topk,
     analyse_graph,
     analyse_graph_entropy,
     analyse_graph_window,
@@ -608,6 +610,193 @@ def _write_token_run(root: Path) -> Path:
     return run
 
 
+
+def _write_artifact_first_token_run(
+    root: Path,
+    *,
+    name: str,
+    prediction_mode: str,
+) -> Path:
+    """Write the compact token artefacts used by new token runners."""
+
+    run = root / name
+    run.mkdir(parents=True)
+    public_horizons = (1,) if prediction_mode == "dense_one_step" else HORIZONS
+    config = {
+        "model_family": "official_basedygraph_v1_token_comparison",
+        "data": {
+            "context_length": 60,
+            "prediction_length": 60,
+            "evaluation_horizons": list(HORIZONS),
+            "input_token_stream": "s1",
+            "target_token_stream": "s1",
+        },
+        "model": {"prediction_mode": prediction_mode},
+        "models": {
+            "dynamic_graph": {
+                "num_nodes": len(ASSETS),
+                "d_model": 96,
+                "num_st_blocks": 4,
+                # Deliberately omit TCN-only ``dilations``.  Graph Hub must
+                # not require it for a Transformer model.
+                "temporal": {
+                    "type": "transformer",
+                    "d_model": 96,
+                    "num_layers": 1,
+                    "num_heads": 4,
+                    "feedforward_multiplier": 2,
+                    "dropout": 0.0,
+                },
+                "graph": {
+                    "type": "dynamic",
+                    "num_heads": 1,
+                    "num_heads_per_layer": [1, 1, 1, 1],
+                    "hidden_dim": 96,
+                    "activation": "softmax",
+                    "add_self_loops": False,
+                },
+                "heads": {
+                    "evaluation_horizons": list(public_horizons),
+                    "prediction_length": 60,
+                    "future_token_mode": "coarse_only",
+                    "s1_vocabulary_size": 1024,
+                },
+                "future_predictor": {
+                    "type": (
+                        "official_dense_next_state_head"
+                        if prediction_mode == "dense_one_step"
+                        else "structured_parallel"
+                    ),
+                    "num_layers": 0 if prediction_mode == "dense_one_step" else 1,
+                },
+            }
+        },
+        "training": {
+            "selection_metric": (
+                "dense_teacher_forced_mean_top1_accuracy"
+                if prediction_mode == "dense_one_step"
+                else "mean_top1_accuracy_over_all_future_steps"
+            )
+        },
+    }
+    _save_json(run / "resolved_config.json", config)
+    _save_json(
+        run / "run_metadata.json",
+        {
+            "status": "completed",
+            "asset_cols": list(ASSETS),
+            "best_epoch": 4,
+            "model_family": "official_basedygraph_v1_token_comparison",
+            "graph_type": "dynamic",
+            "graph_heads": 1,
+            "graph_heads_per_layer": [1, 1, 1, 1],
+        },
+    )
+    _write_history(run, token=True)
+
+    windows = len(DATES)
+    saved_k = 10
+    for split in ("train", "test"):
+        directory = run / "analysis" / split
+        directory.mkdir(parents=True)
+        target_dense = torch.zeros(
+            windows,
+            60,
+            len(ASSETS),
+            dtype=torch.int16,
+        )
+        if prediction_mode == "dense_one_step":
+            public_target = target_dense[:, -1:]
+            public_prediction = public_target.clone()
+        else:
+            positions = torch.tensor([value - 1 for value in HORIZONS])
+            public_target = target_dense.index_select(1, positions)
+            public_prediction = public_target.clone()
+        prediction = {
+            "y_pred": public_prediction.unsqueeze(-1),
+            "y_true": public_target.unsqueeze(-1),
+            "last_context_target": torch.zeros(
+                windows, len(ASSETS), 1, dtype=torch.int16
+            ),
+            "channels": ["s1"],
+            "horizons": list(public_horizons),
+            "asset_cols": list(ASSETS),
+            "sample_idx": torch.arange(windows),
+            "origin_idx": torch.tensor([59, 74, 59, 74]),
+            "target_indices": torch.zeros(
+                windows, len(public_horizons), dtype=torch.long
+            ),
+            "output_space": "token_id",
+        }
+        torch.save(
+            {"epoch": 4, "prediction_result": prediction},
+            directory / "predictions.pt",
+        )
+        graph = _graphs("dynamic")
+        graph["per_layer"] = tuple(
+            graph["selected"].clone() for _ in range(4)
+        )
+        torch.save(
+            {"epoch": 4, "graph_artifacts": graph},
+            directory / "graphs.pt",
+        )
+        pd.DataFrame(
+            [
+                {
+                    "metric": "coarse_s1_top1_accuracy",
+                    "horizon": int(horizon),
+                    "channel": "s1",
+                    "value": 1.0,
+                }
+                for horizon in public_horizons
+            ]
+        ).to_csv(directory / "metric_table.csv", index=False)
+
+        top_ids = torch.arange(saved_k).reshape(1, 1, 1, saved_k)
+        top_ids = top_ids.expand(
+            windows,
+            len(public_horizons),
+            len(ASSETS),
+            saved_k,
+        ).clone()
+        top_probabilities = torch.linspace(0.20, 0.02, saved_k)
+        top_probabilities = (
+            top_probabilities
+            / top_probabilities.sum()
+            * 0.80
+        ).reshape(1, 1, 1, saved_k).expand_as(top_ids).clone()
+        token_artifacts = {
+            "predicted_s1": target_dense.clone(),
+            "target_s1": (
+                public_target.clone()
+                if prediction_mode == "dense_one_step"
+                else target_dense.clone()
+            ),
+            "dense_target_s1": target_dense.clone(),
+            "top10_s1_ids_at_reported_horizons": top_ids.to(torch.int16),
+            "top10_s1_probabilities_at_reported_horizons": (
+                top_probabilities.to(torch.float16)
+            ),
+            "true_s1_probability_at_reported_horizons": torch.full(
+                (
+                    windows,
+                    len(public_horizons),
+                    len(ASSETS),
+                ),
+                0.20,
+                dtype=torch.float16,
+            ),
+            "evaluation_horizons": list(public_horizons),
+            "prediction_length": 60,
+            "prediction_mode": prediction_mode,
+            "asset_cols": list(ASSETS),
+        }
+        torch.save(
+            {"epoch": 4, "token_artifacts": token_artifacts},
+            directory / "tokens.pt",
+        )
+    return run
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "models_to_use"
@@ -618,6 +807,16 @@ def main() -> None:
         token = _write_token_run(root)
         basedygraph = _write_basedygraph_continuous_run(root)
         round2 = _write_round2_continuous_run(root)
+        token_parallel = _write_artifact_first_token_run(
+            root,
+            name="artifact_token_parallel",
+            prediction_mode="parallel_60",
+        )
+        token_dense = _write_artifact_first_token_run(
+            root,
+            name="artifact_token_dense",
+            prediction_mode="dense_one_step",
+        )
         arbitrary = _write_continuous_run(
             root, "weighted_loss_dynamic_experiment", "dynamic", 3.0e-5
         )
@@ -643,6 +842,8 @@ def main() -> None:
             "tokenized_dynamic",
             "continuous_basedygraph",
             "round2_prior_state",
+            "artifact_token_parallel",
+            "artifact_token_dense",
             "weighted_loss_dynamic_experiment",
         }
         round2_row = discovered.loc[
@@ -651,6 +852,52 @@ def main() -> None:
         assert round2_row["Issue"] is None
         assert round2_row["Graph type"] == "static_dynamic_mixture"
         assert resolve_model_folder("continuous_dynamic", models_root=root) == dynamic.resolve()
+
+        # New token models are analysed from saved compact artefacts.  They do
+        # not expose the legacy DynamicGraphTokenForecaster schema and omit the
+        # irrelevant TCN-only ``dilations`` key.
+        saved_topk = analyse_coarse_token_topk(
+            token_parallel,
+            split="test",
+            top_k_values=(1, 2, 5, 10),
+            horizons=HORIZONS,
+            max_windows=None,
+        )
+        assert tuple(saved_topk.index) == HORIZONS
+        assert saved_topk.attrs["source"] == "saved_selected_checkpoint_top10"
+        saved_distribution = analyse_coarse_token_predictive_distribution(
+            token_parallel,
+            split="test",
+            horizon=1,
+            bars=(
+                "mean_probability",
+                "hard_prediction_frequency",
+                "training_target_frequency",
+            ),
+            max_windows=None,
+        )
+        assert saved_distribution["probability_distribution_is_truncated"] is True
+        assert saved_distribution["saved_probability_top_k"] == 10
+        dense_h1 = analyse_coarse_token_topk(
+            token_dense,
+            split="test",
+            horizons=(1,),
+        )
+        assert tuple(dense_h1.index) == (1,)
+        try:
+            analyse_coarse_token_topk(
+                token_dense,
+                split="test",
+                horizons=(1, 5),
+            )
+        except ValueError as error:
+            assert "teacher-forced" in str(error)
+            assert "only public forecast horizon is h=1" in str(error)
+        else:
+            raise AssertionError(
+                "Dense one-step transitions were incorrectly labelled as "
+                "future horizons."
+            )
 
         token_paths = resolve_evaluation_artifact_paths(
             token,

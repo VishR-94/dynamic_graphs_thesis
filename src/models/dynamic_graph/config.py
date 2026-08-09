@@ -141,11 +141,17 @@ def build_model_config(
     temporal_values = dict(
         model["temporal"]
     )
+    # ``dilations`` is required only by the TCN temporal encoder.  Several
+    # newer token-model analysis mirrors use Transformer or ModernTCN
+    # backbones and therefore omit this irrelevant field.  Retain the typed
+    # dataclass default rather than making every unrelated schema duplicate a
+    # TCN-only setting merely to be readable by evaluation utilities.
     temporal_values["dilations"] = tuple(
         int(value)
-        for value in temporal_values[
-            "dilations"
-        ]
+        for value in temporal_values.get(
+            "dilations",
+            (1, 2, 4),
+        )
     )
 
     # Keep the YAML readable while retaining one immutable typed temporal

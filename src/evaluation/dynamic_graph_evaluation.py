@@ -9756,6 +9756,289 @@ def analyse_sampled_path_example(
     )
 
 
+
+def _distribution_entropy_from_probabilities(values: Tensor) -> float:
+    values = torch.as_tensor(values, dtype=torch.float64)
+    positive = values > 0
+    if not bool(positive.any()):
+        return 0.0
+    selected = values[positive]
+    return float(-(selected * selected.log()).sum().item())
+
+
+def _analyse_saved_token_predictive_distribution(
+    run_dir: Path,
+    *,
+    split: EvaluationSplitInput | str,
+    policy: str | None,
+    asset: str | int | None,
+    horizon: int,
+    window_indices: Sequence[int] | None,
+    max_windows: int | None,
+    plot_top_n: int,
+    figsize: tuple[float, float],
+) -> dict[str, Any] | None:
+    """Build a compact predictive-distribution report from saved top-10 data.
+
+    The exact full 1,024-way probability tensor is intentionally not saved by
+    the new runners.  The returned mean-probability series is therefore the
+    exact average contribution of tokens while they are inside the saved top-10
+    set; omitted tail probability is left unassigned and its captured mass is
+    reported explicitly.  Hard and training frequencies remain exact.
+    """
+
+    try:
+        evaluation = load_evaluation_artifacts(
+            run_dir,
+            split=split,
+            policy=policy,
+        )
+    except FileNotFoundError:
+        return None
+    token_artifacts = evaluation.token_artifacts
+    if token_artifacts is None:
+        return None
+    raw_top_ids = token_artifacts.get(
+        "top10_s1_ids_at_reported_horizons"
+    )
+    raw_top_probabilities = token_artifacts.get(
+        "top10_s1_probabilities_at_reported_horizons"
+    )
+    if raw_top_ids is None or raw_top_probabilities is None:
+        return None
+    top_ids = torch.as_tensor(raw_top_ids).long()
+    top_probabilities = torch.as_tensor(raw_top_probabilities).float()
+    if top_ids.ndim != 4 or tuple(top_ids.shape) != tuple(top_probabilities.shape):
+        raise ValueError(
+            "Saved top-10 token IDs/probabilities must share shape [W,H,N,K]."
+        )
+    reported_horizons = _saved_token_horizons(
+        token_artifacts,
+        evaluation.info.horizons,
+    )
+    requested_horizon = int(horizon)
+    if requested_horizon not in reported_horizons:
+        prediction_mode = str(token_artifacts.get("prediction_mode", ""))
+        if prediction_mode == "dense_one_step":
+            raise ValueError(
+                "This dense teacher-forced BaseDyGraph run has only one public "
+                "forecast horizon (h=1).  Its other 59 outputs are context "
+                "transition positions, not future horizons."
+            )
+        raise ValueError(
+            f"Saved probability summaries exist only at horizons "
+            f"{reported_horizons}; received h={requested_horizon}."
+        )
+    horizon_position = reported_horizons.index(requested_horizon)
+    top_ids = top_ids[:, horizon_position]
+    top_probabilities = top_probabilities[:, horizon_position]
+    targets = _saved_token_targets_for_horizons(
+        token_artifacts,
+        requested_horizons=(requested_horizon,),
+        reported_horizons=reported_horizons,
+    )[:, 0]
+    if tuple(top_ids.shape[:2]) != tuple(targets.shape):
+        raise ValueError(
+            "Saved top-10 probability and target tensors are incompatible."
+        )
+
+    selected = _select_saved_token_window_indices(
+        int(top_ids.shape[0]),
+        window_indices=window_indices,
+        max_windows=max_windows,
+    )
+    selected_tensor = torch.tensor(selected, dtype=torch.long)
+    top_ids = top_ids.index_select(0, selected_tensor)
+    top_probabilities = top_probabilities.index_select(0, selected_tensor)
+    targets = targets.index_select(0, selected_tensor)
+
+    asset_index, asset_label = _resolve_saved_token_asset(
+        asset,
+        evaluation.info.asset_cols,
+    )
+    if asset_index is not None:
+        top_ids = top_ids[:, asset_index : asset_index + 1]
+        top_probabilities = top_probabilities[:, asset_index : asset_index + 1]
+        targets = targets[:, asset_index : asset_index + 1]
+
+    training = load_evaluation_artifacts(
+        run_dir,
+        split="train",
+        policy=None,
+    )
+    if training.token_artifacts is None:
+        raise FileNotFoundError(
+            "No saved training token artefact exists for the selected model."
+        )
+    training_reported = _saved_token_horizons(
+        training.token_artifacts,
+        training.info.horizons,
+    )
+    training_targets = _saved_token_targets_for_horizons(
+        training.token_artifacts,
+        requested_horizons=(requested_horizon,),
+        reported_horizons=training_reported,
+    )[:, 0]
+    if asset_index is not None:
+        training_targets = training_targets[:, asset_index : asset_index + 1]
+
+    vocabulary_size = max(
+        1024,
+        int(top_ids.max().item()) + 1,
+        int(targets.max().item()) + 1,
+        int(training_targets.max().item()) + 1,
+    )
+    flat_ids = top_ids.reshape(-1, int(top_ids.shape[-1]))
+    flat_probabilities = top_probabilities.reshape(
+        -1,
+        int(top_probabilities.shape[-1]),
+    )
+    observations = int(flat_ids.shape[0])
+    probability_sum = torch.zeros(vocabulary_size, dtype=torch.float64)
+    probability_sum.scatter_add_(
+        0,
+        flat_ids.reshape(-1),
+        flat_probabilities.reshape(-1).to(torch.float64),
+    )
+    mean_probability_contribution = probability_sum / max(observations, 1)
+    hard_ids = flat_ids[:, 0]
+    hard_counts = torch.bincount(hard_ids, minlength=vocabulary_size).double()
+    hard_frequency = hard_counts / max(observations, 1)
+    flat_training = training_targets.reshape(-1).long()
+    training_counts = torch.bincount(
+        flat_training,
+        minlength=vocabulary_size,
+    ).double()
+    training_frequency = training_counts / max(int(flat_training.numel()), 1)
+    captured_mass = float(flat_probabilities.sum(dim=-1).mean().item())
+    hard_entropy = _distribution_entropy_from_probabilities(hard_frequency)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "Checkpoint": "best",
+                "Asset": asset_label,
+                "Horizon": requested_horizon,
+                "Evaluation split": evaluation.split,
+                "Policy": evaluation.policy,
+                "Evaluation windows": len(selected),
+                "Evaluation predictions": observations,
+                "Training targets": int(flat_training.numel()),
+                "Saved probability depth": int(top_ids.shape[-1]),
+                "Mean probability mass captured by saved top-k (%)": (
+                    100.0 * captured_mass
+                ),
+                "Mean maximum token probability (%)": float(
+                    100.0 * flat_probabilities[:, 0].mean().item()
+                ),
+                "Hard-prediction entropy (nats)": hard_entropy,
+                "Hard-prediction effective vocabulary": float(
+                    np.exp(hard_entropy)
+                ),
+                "Distinct hard-predicted tokens": int((hard_counts > 0).sum()),
+                "Largest hard-prediction share (%)": float(
+                    hard_frequency.max().item() * 100.0
+                ),
+                "Probability note": (
+                    "Mean probability bars are exact saved top-k contributions; "
+                    "tail probability outside the saved top-k is omitted."
+                ),
+            }
+        ]
+    )
+
+    predicted_ids = torch.nonzero(hard_counts > 0).flatten()
+    token_table = pd.DataFrame(
+        {
+            "Token ID": predicted_ids.numpy(),
+            "Predicted Count": hard_counts[predicted_ids].long().numpy(),
+            "Predicted Frequency (%)": (
+                hard_frequency[predicted_ids].numpy() * 100.0
+            ),
+            "Mean Saved Top-k Probability Contribution (%)": (
+                mean_probability_contribution[predicted_ids].numpy() * 100.0
+            ),
+            "Training Target Count": training_counts[predicted_ids].long().numpy(),
+            "Training Target Frequency (%)": (
+                training_frequency[predicted_ids].numpy() * 100.0
+            ),
+        }
+    ).sort_values(
+        ["Predicted Frequency (%)", "Token ID"],
+        ascending=[False, True],
+        ignore_index=True,
+    )
+
+    ranking = torch.argsort(
+        mean_probability_contribution,
+        descending=True,
+    )
+    shown = min(int(plot_top_n), vocabulary_size)
+    shown_ids = ranking[:shown].numpy()
+    x = np.arange(shown)
+    width = 0.27
+    figure, axes = plt.subplots(figsize=figsize)
+    axes.bar(
+        x - width,
+        mean_probability_contribution[shown_ids].numpy() * 100.0,
+        width,
+        label=f"Mean saved top-{int(top_ids.shape[-1])} probability contribution",
+    )
+    axes.bar(
+        x,
+        hard_frequency[shown_ids].numpy() * 100.0,
+        width,
+        label="Hard argmax frequency",
+    )
+    axes.bar(
+        x + width,
+        training_frequency[shown_ids].numpy() * 100.0,
+        width,
+        label="Training target frequency",
+    )
+    axes.set_xticks(x)
+    axes.set_xticklabels(shown_ids, rotation=90)
+    axes.set_xlabel("Coarse token ID")
+    axes.set_ylabel("Percentage")
+    axes.set_title(
+        "Coarse-token predictive distribution from saved selected-checkpoint artefacts\n"
+        f"split={evaluation.split}; asset={asset_label}; horizon={requested_horizon}"
+    )
+    axes.legend()
+    figure.tight_layout()
+    plt.close(figure)
+
+    token_index = pd.Index(
+        np.arange(vocabulary_size),
+        name="Token ID",
+    )
+    return {
+        "summary": summary,
+        "token_table": token_table,
+        "mean_predictive_distribution": pd.Series(
+            mean_probability_contribution.numpy(),
+            index=token_index,
+            name="Mean saved top-k probability contribution",
+        ),
+        "hard_prediction_distribution": pd.Series(
+            hard_frequency.numpy(),
+            index=token_index,
+            name="Hard prediction frequency",
+        ),
+        "training_target_distribution": pd.Series(
+            training_frequency.numpy(),
+            index=token_index,
+            name="Training target frequency",
+        ),
+        "validation_window_indices": selected,
+        "evaluation_window_indices": selected,
+        "probability_mass_coverage": captured_mass,
+        "probability_distribution_is_truncated": True,
+        "saved_probability_top_k": int(top_ids.shape[-1]),
+        "figure": figure,
+        "axes": axes,
+    }
+
 def analyse_coarse_token_predictive_distribution(
     model: str | Path,
     *,
@@ -9779,11 +10062,16 @@ def analyse_coarse_token_predictive_distribution(
     random_seed: int = 42,
     figsize: tuple[float, float] = (16.0, 5.5),
 ) -> dict[str, Any]:
-    """Plot selectable model/argmax/training/sampled coarse-token frequencies.
+    """Plot selectable coarse-token distributions for one saved checkpoint.
 
-    The fourth distribution uses the *saved* ten sampled paths at the chosen
-    evaluation horizon; it never launches a new sampling run.  All four bars
-    therefore refer to the same asset, horizon, and selected window subset.
+    For new token runners this function is artefact-first: it consumes the
+    compact selected-checkpoint top-10 summaries and does not reconstruct an
+    architecture-specific model.  Historical runs without those artefacts use
+    the legacy checkpoint-inference fallback.
+
+    ``sampled_frequency`` is loaded only when that bar is requested.  Models
+    that have not yet undergone the expensive sampled-decoding phase can still
+    display the other three distributions.
     """
 
     allowed = {
@@ -9800,101 +10088,167 @@ def analyse_coarse_token_predictive_distribution(
         raise ValueError(f"Unknown token-distribution bars: {sorted(unknown)}")
 
     run_dir = resolve_model_folder(model)
-    info = load_run_info(run_dir)
+    unified_info = load_unified_run_info(run_dir)
     resolved_split = normalise_evaluation_split(split)
     selected_asset = asset
     if isinstance(asset, str) and asset.strip().lower() == "random":
         selected_asset = _resolve_random_asset(
             "random",
-            info.asset_cols,
+            unified_info.asset_cols,
             random_seed=random_seed,
         )
-    cache_path = resolve_token_cache_path(split=resolved_split)
-    training_cache_path = resolve_token_cache_path(split="train")
-    base = analyse_token_predictive_distribution(
-        run_dir,
-        asset=selected_asset,
-        horizon=int(horizon),
-        source=source,
-        validation_cache_path=cache_path,
-        training_cache_path=training_cache_path,
-        window_indices=window_indices,
-        max_windows=max_windows,
-        batch_size=batch_size,
-        device=device,
-        use_amp=use_amp,
-        plot_top_n=plot_top_n,
-        figsize=figsize,
-    )
+
+    base: dict[str, Any] | None = None
+    if source == "best":
+        base = _analyse_saved_token_predictive_distribution(
+            run_dir,
+            split=resolved_split,
+            policy=policy,
+            asset=selected_asset,
+            horizon=int(horizon),
+            window_indices=window_indices,
+            max_windows=max_windows,
+            plot_top_n=plot_top_n,
+            figsize=figsize,
+        )
+
+    if base is None:
+        # Historical fallback.  New BaseDyGraph-v1/Round-2 token models never
+        # enter this branch because they save compact token summaries.
+        legacy_info = load_run_info(run_dir)
+        cache_path = resolve_token_cache_path(split=resolved_split)
+        training_cache_path = resolve_token_cache_path(split="train")
+        base = analyse_token_predictive_distribution(
+            run_dir,
+            asset=selected_asset,
+            horizon=int(horizon),
+            source=source,
+            validation_cache_path=cache_path,
+            training_cache_path=training_cache_path,
+            window_indices=window_indices,
+            max_windows=max_windows,
+            batch_size=batch_size,
+            device=device,
+            use_amp=use_amp,
+            plot_top_n=plot_top_n,
+            figsize=figsize,
+        )
+        del legacy_info
 
     artifacts = load_evaluation_artifacts(
         run_dir,
         split=resolved_split,
         policy=policy,
     )
-    if artifacts.token_artifacts is None:
-        raise FileNotFoundError(
-            f"No saved token artefact exists for {resolved_split}/{artifacts.policy}."
-        )
-    sampled_values = artifacts.token_artifacts.get("sampled_s1_evaluation")
-    if sampled_values is None:
-        raise KeyError("Saved token artefact has no sampled_s1_evaluation tensor.")
-    sampled = torch.as_tensor(sampled_values).long()
-    if sampled.ndim != 4:
-        raise ValueError("sampled_s1_evaluation must have shape [S,W,H,N].")
-    if int(horizon) not in artifacts.info.horizons:
-        raise ValueError(
-            f"Sampled-token frequencies are saved only at evaluation horizons "
-            f"{artifacts.info.horizons}; received {horizon}."
-        )
-    horizon_index = artifacts.info.horizons.index(int(horizon))
-    selected_indices = torch.as_tensor(
-        base["validation_window_indices"],
-        dtype=torch.long,
-    )
-    sampled = sampled.index_select(1, selected_indices)[:, :, horizon_index]
-    if selected_asset is None:
-        scoped_sampled = sampled
-    elif isinstance(selected_asset, int) and not isinstance(selected_asset, bool):
-        scoped_sampled = sampled[:, :, int(selected_asset) : int(selected_asset) + 1]
-    else:
-        asset_name = str(selected_asset)
-        if asset_name not in info.asset_cols:
-            raise ValueError(f"Asset {asset_name!r} is unavailable.")
-        asset_index = info.asset_cols.index(asset_name)
-        scoped_sampled = sampled[:, :, asset_index : asset_index + 1]
-    flat_sampled = scoped_sampled.reshape(-1)
     vocabulary_size = len(base["mean_predictive_distribution"])
-    sampled_counts = torch.bincount(flat_sampled, minlength=vocabulary_size).double()
-    sampled_frequency = sampled_counts / max(int(flat_sampled.numel()), 1)
     token_index = base["mean_predictive_distribution"].index
-    sampled_series = pd.Series(
-        sampled_frequency.numpy(),
-        index=token_index,
-        name="Sampled token frequency",
-    )
 
-    distributions = {
+    sampled_series: pd.Series | None = None
+    if "sampled_frequency" in selected_bars:
+        if artifacts.token_artifacts is None:
+            raise FileNotFoundError(
+                f"No saved token artefact exists for "
+                f"{resolved_split}/{artifacts.policy}."
+            )
+        sampled_values = artifacts.token_artifacts.get(
+            "sampled_s1_evaluation"
+        )
+        if sampled_values is None:
+            raise FileNotFoundError(
+                "sampled_frequency was requested, but this model has no "
+                "saved sampled_s1_evaluation tensor.  Run sampled decoding "
+                "for the selected model or remove 'sampled_frequency' from bars."
+            )
+        sampled = torch.as_tensor(sampled_values).long()
+        if sampled.ndim != 4:
+            raise ValueError(
+                "sampled_s1_evaluation must have shape [S,W,H,N]."
+            )
+        sampled_horizons = _saved_token_horizons(
+            artifacts.token_artifacts,
+            artifacts.info.horizons,
+        )
+        if int(horizon) not in sampled_horizons:
+            raise ValueError(
+                "Sampled-token frequencies are saved only at horizons "
+                f"{sampled_horizons}; received {horizon}."
+            )
+        horizon_index = sampled_horizons.index(int(horizon))
+        selected_indices = torch.as_tensor(
+            base.get(
+                "evaluation_window_indices",
+                base["validation_window_indices"],
+            ),
+            dtype=torch.long,
+        )
+        sampled = sampled.index_select(1, selected_indices)[
+            :, :, horizon_index
+        ]
+        asset_index, _ = _resolve_saved_token_asset(
+            selected_asset,
+            unified_info.asset_cols,
+        )
+        if asset_index is not None:
+            sampled = sampled[
+                :, :, asset_index : asset_index + 1
+            ]
+        flat_sampled = sampled.reshape(-1)
+        sampled_counts = torch.bincount(
+            flat_sampled,
+            minlength=vocabulary_size,
+        ).double()
+        sampled_frequency = sampled_counts / max(
+            int(flat_sampled.numel()),
+            1,
+        )
+        sampled_series = pd.Series(
+            sampled_frequency.numpy(),
+            index=token_index,
+            name="Sampled token frequency",
+        )
+
+    distributions: dict[str, pd.Series] = {
         "mean_probability": base["mean_predictive_distribution"],
         "hard_prediction_frequency": base["hard_prediction_distribution"],
         "training_target_frequency": base["training_target_distribution"],
-        "sampled_frequency": sampled_series,
     }
+    if sampled_series is not None:
+        distributions["sampled_frequency"] = sampled_series
+
+    probability_label = (
+        f"Mean saved top-{base.get('saved_probability_top_k')} "
+        "probability contribution"
+        if base.get("probability_distribution_is_truncated")
+        else "Mean model probability"
+    )
     labels = {
-        "mean_probability": "Mean model probability",
+        "mean_probability": probability_label,
         "hard_prediction_frequency": "Hard argmax frequency",
         "training_target_frequency": "Training target frequency",
         "sampled_frequency": "Actual sampled frequency",
     }
+
     ranking = np.zeros(vocabulary_size, dtype=np.float64)
     for key in selected_bars:
-        ranking = np.maximum(ranking, distributions[key].to_numpy(dtype=np.float64))
-    shown_ids = np.argsort(ranking)[::-1][: min(int(plot_top_n), vocabulary_size)]
+        if key not in distributions:
+            raise RuntimeError(
+                f"Distribution {key!r} was requested but could not be loaded."
+            )
+        ranking = np.maximum(
+            ranking,
+            distributions[key].to_numpy(dtype=np.float64),
+        )
+    shown_ids = np.argsort(ranking)[::-1][
+        : min(int(plot_top_n), vocabulary_size)
+    ]
 
     figure, axes = plt.subplots(figsize=figsize)
     x = np.arange(len(shown_ids))
     width = 0.82 / len(selected_bars)
-    offsets = (np.arange(len(selected_bars)) - (len(selected_bars) - 1) / 2.0) * width
+    offsets = (
+        np.arange(len(selected_bars))
+        - (len(selected_bars) - 1) / 2.0
+    ) * width
     for offset, key in zip(offsets, selected_bars, strict=True):
         axes.bar(
             x + offset,
@@ -9909,22 +10263,43 @@ def analyse_coarse_token_predictive_distribution(
     asset_label = str(base["summary"].iloc[0]["Asset"])
     axes.set_title(
         "Coarse-token predictive and sampled distributions\n"
-        f"split={resolved_split}; policy={artifacts.policy}; asset={asset_label}; "
-        f"horizon={int(horizon)} min"
+        f"split={resolved_split}; policy={artifacts.policy}; "
+        f"asset={asset_label}; horizon={int(horizon)} min"
     )
     axes.legend()
     axes.grid(True, axis="y", alpha=0.20)
     figure.tight_layout()
 
-    table = pd.DataFrame(
-        {
-            "Token ID": np.arange(vocabulary_size),
-            "Mean model probability (%)": distributions["mean_probability"].to_numpy() * 100.0,
-            "Hard argmax frequency (%)": distributions["hard_prediction_frequency"].to_numpy() * 100.0,
-            "Training target frequency (%)": distributions["training_target_frequency"].to_numpy() * 100.0,
-            "Actual sampled frequency (%)": sampled_series.to_numpy() * 100.0,
-        }
-    ).sort_values("Actual sampled frequency (%)", ascending=False).reset_index(drop=True)
+    table_values: dict[str, Any] = {
+        "Token ID": np.arange(vocabulary_size),
+        (
+            "Mean saved top-k probability contribution (%)"
+            if base.get("probability_distribution_is_truncated")
+            else "Mean model probability (%)"
+        ): distributions["mean_probability"].to_numpy() * 100.0,
+        "Hard argmax frequency (%)": distributions[
+            "hard_prediction_frequency"
+        ].to_numpy()
+        * 100.0,
+        "Training target frequency (%)": distributions[
+            "training_target_frequency"
+        ].to_numpy()
+        * 100.0,
+    }
+    if sampled_series is not None:
+        table_values["Actual sampled frequency (%)"] = (
+            sampled_series.to_numpy() * 100.0
+        )
+    table = pd.DataFrame(table_values)
+    sort_column = (
+        "Actual sampled frequency (%)"
+        if sampled_series is not None
+        else "Hard argmax frequency (%)"
+    )
+    table = table.sort_values(
+        sort_column,
+        ascending=False,
+    ).reset_index(drop=True)
 
     result = dict(base)
     result.update(
@@ -9941,10 +10316,346 @@ def analyse_coarse_token_predictive_distribution(
     return result
 
 
+
+def _select_saved_token_window_indices(
+    window_count: int,
+    *,
+    window_indices: Sequence[int] | None,
+    max_windows: int | None,
+) -> tuple[int, ...]:
+    """Select saved-token windows without reconstructing a model or dataset."""
+
+    if int(window_count) <= 0:
+        raise ValueError("Saved token artefact contains no windows.")
+    if window_indices is not None:
+        selected = tuple(int(value) for value in window_indices)
+        if not selected:
+            raise ValueError("window_indices must not be empty.")
+    elif max_windows is None or int(max_windows) >= int(window_count):
+        selected = tuple(range(int(window_count)))
+    else:
+        count = int(max_windows)
+        if count <= 0:
+            raise ValueError("max_windows must be positive or None.")
+        selected = tuple(
+            int(value)
+            for value in np.linspace(
+                0,
+                int(window_count) - 1,
+                num=count,
+                dtype=np.int64,
+            )
+        )
+    if len(set(selected)) != len(selected):
+        raise ValueError("Selected saved-token window indices are not unique.")
+    if min(selected) < 0 or max(selected) >= int(window_count):
+        raise IndexError("A saved-token window index is out of range.")
+    return selected
+
+
+def _resolve_saved_token_asset(
+    asset: str | int | None,
+    asset_cols: Sequence[str],
+) -> tuple[int | None, str]:
+    """Resolve an optional ticker/index against a saved asset order."""
+
+    labels = tuple(str(value) for value in asset_cols)
+    if asset is None:
+        return None, "All assets"
+    if isinstance(asset, int) and not isinstance(asset, bool):
+        index = int(asset)
+        if not 0 <= index < len(labels):
+            raise IndexError(f"Asset index {index} is out of range.")
+        return index, labels[index]
+    if isinstance(asset, str):
+        if asset not in labels:
+            raise KeyError(f"Unknown asset {asset!r}.")
+        return labels.index(asset), asset
+    raise TypeError("asset must be None, a ticker, or a zero-based integer index.")
+
+
+def _saved_token_horizons(
+    token_artifacts: Mapping[str, Any],
+    fallback: Sequence[int],
+) -> tuple[int, ...]:
+    raw = token_artifacts.get("evaluation_horizons", fallback)
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise TypeError("Saved token evaluation_horizons must be a sequence.")
+    values = tuple(int(value) for value in raw)
+    if not values or values != tuple(sorted(set(values))):
+        raise ValueError(
+            "Saved token evaluation_horizons must be non-empty, unique, "
+            "and increasing."
+        )
+    return values
+
+
+def _saved_token_targets_for_horizons(
+    token_artifacts: Mapping[str, Any],
+    *,
+    requested_horizons: Sequence[int],
+    reported_horizons: Sequence[int],
+) -> Tensor:
+    """Return saved s1 targets as [W,H,N] for requested public horizons."""
+
+    requested = tuple(int(value) for value in requested_horizons)
+    reported = tuple(int(value) for value in reported_horizons)
+    candidates = (
+        token_artifacts.get("target_s1"),
+        token_artifacts.get("dense_target_s1"),
+    )
+    for raw in candidates:
+        if raw is None:
+            continue
+        values = torch.as_tensor(raw).long()
+        if values.ndim != 3:
+            continue
+        if int(values.shape[1]) == len(reported):
+            positions = [reported.index(value) for value in requested]
+            return values.index_select(
+                1,
+                torch.tensor(positions, dtype=torch.long),
+            )
+        if requested and int(values.shape[1]) >= max(requested):
+            positions = [value - 1 for value in requested]
+            return values.index_select(
+                1,
+                torch.tensor(positions, dtype=torch.long),
+            )
+    raise KeyError(
+        "Saved token artefacts do not contain target_s1/dense_target_s1 "
+        "with a horizon axis compatible with the requested public horizons."
+    )
+
+
+def _analyse_saved_coarse_token_topk(
+    run_dir: Path,
+    *,
+    split: EvaluationSplitInput | str,
+    policy: str | None,
+    asset: str | int | None,
+    window_indices: Sequence[int] | None,
+    max_windows: int | None,
+    top_k_values: Sequence[int],
+    horizons: Sequence[int] | None,
+) -> pd.DataFrame | None:
+    """Compute exact top-k diagnostics from selected-checkpoint artefacts.
+
+    New token runners intentionally save compact top-10 IDs/probabilities
+    instead of the enormous full [W,60,N,1024] logit tensor.  Those IDs are
+    sufficient for exact top-k accuracy for every requested k <= 10 and avoid
+    reconstructing an architecture-specific model inside Graph Hub.
+    """
+
+    try:
+        evaluation = load_evaluation_artifacts(
+            run_dir,
+            split=split,
+            policy=policy,
+        )
+    except FileNotFoundError:
+        return None
+    token_artifacts = evaluation.token_artifacts
+    if token_artifacts is None:
+        return None
+    raw_top_ids = token_artifacts.get(
+        "top10_s1_ids_at_reported_horizons"
+    )
+    if raw_top_ids is None:
+        return None
+    top_ids = torch.as_tensor(raw_top_ids).long()
+    if top_ids.ndim != 4:
+        raise ValueError(
+            "top10_s1_ids_at_reported_horizons must have shape [W,H,N,K]."
+        )
+
+    reported_horizons = _saved_token_horizons(
+        token_artifacts,
+        evaluation.info.horizons,
+    )
+    requested_horizons = (
+        reported_horizons
+        if horizons is None
+        else tuple(int(value) for value in horizons)
+    )
+    if not requested_horizons or len(set(requested_horizons)) != len(
+        requested_horizons
+    ):
+        raise ValueError("horizons must be non-empty and unique.")
+    unavailable = [
+        value for value in requested_horizons if value not in reported_horizons
+    ]
+    if unavailable:
+        prediction_mode = str(
+            token_artifacts.get("prediction_mode", "")
+        )
+        if prediction_mode == "dense_one_step":
+            raise ValueError(
+                "This is a dense teacher-forced one-step BaseDyGraph run. "
+                "Its 60 output positions are context-to-next-token transitions, "
+                "not free-running future horizons.  The only public forecast "
+                "horizon is h=1.  Use horizons=(1,) here; use the parallel_60 "
+                "control for h=1,5,15,30,60 future-horizon accuracy."
+            )
+        raise ValueError(
+            "Saved compact top-k artefacts are available only at public "
+            f"horizons {reported_horizons}; unavailable={unavailable}."
+        )
+
+    top_ks = tuple(int(value) for value in top_k_values)
+    saved_k = int(top_ids.shape[-1])
+    if not top_ks or len(set(top_ks)) != len(top_ks):
+        raise ValueError("top_k_values must be non-empty and unique.")
+    if any(value < 1 or value > saved_k for value in top_ks):
+        raise ValueError(
+            f"Saved compact logits support exact top-k only for k in "
+            f"[1,{saved_k}]; received {top_ks}."
+        )
+
+    horizon_positions = [
+        reported_horizons.index(value) for value in requested_horizons
+    ]
+    top_ids = top_ids.index_select(
+        1,
+        torch.tensor(horizon_positions, dtype=torch.long),
+    )
+    targets = _saved_token_targets_for_horizons(
+        token_artifacts,
+        requested_horizons=requested_horizons,
+        reported_horizons=reported_horizons,
+    )
+    if tuple(top_ids.shape[:3]) != tuple(targets.shape):
+        raise ValueError(
+            "Saved top-k IDs and targets have incompatible shapes: "
+            f"{tuple(top_ids.shape)} vs {tuple(targets.shape)}."
+        )
+
+    selected = _select_saved_token_window_indices(
+        int(top_ids.shape[0]),
+        window_indices=window_indices,
+        max_windows=max_windows,
+    )
+    selected_tensor = torch.tensor(selected, dtype=torch.long)
+    top_ids = top_ids.index_select(0, selected_tensor)
+    targets = targets.index_select(0, selected_tensor)
+
+    asset_index, asset_label = _resolve_saved_token_asset(
+        asset,
+        evaluation.info.asset_cols,
+    )
+    if asset_index is not None:
+        top_ids = top_ids[:, :, asset_index : asset_index + 1]
+        targets = targets[:, :, asset_index : asset_index + 1]
+
+    training = load_evaluation_artifacts(
+        run_dir,
+        split="train",
+        policy=None,
+    )
+    if training.token_artifacts is None:
+        raise FileNotFoundError(
+            "The selected checkpoint has no saved training token artefact, "
+            "so the training-frequency marginal baseline cannot be computed."
+        )
+    training_reported_horizons = _saved_token_horizons(
+        training.token_artifacts,
+        training.info.horizons,
+    )
+    training_targets = _saved_token_targets_for_horizons(
+        training.token_artifacts,
+        requested_horizons=requested_horizons,
+        reported_horizons=training_reported_horizons,
+    )
+    if asset_index is not None:
+        training_targets = training_targets[
+            :, :, asset_index : asset_index + 1
+        ]
+
+    rows: dict[tuple[str, str], list[float]] = {}
+    marginal_values: dict[int, dict[str, float]] = {}
+    marginal_ids: dict[int, list[int]] = {}
+    for horizon_index, horizon in enumerate(requested_horizons):
+        evaluation_target = targets[:, horizon_index].reshape(-1)
+        evaluation_top_ids = top_ids[:, horizon_index].reshape(
+            -1,
+            saved_k,
+        )
+        train_target = training_targets[:, horizon_index].reshape(-1)
+        vocabulary_size = max(
+            int(evaluation_top_ids.max().item()) + 1,
+            int(evaluation_target.max().item()) + 1,
+            int(train_target.max().item()) + 1,
+            1024,
+        )
+        counts = torch.bincount(
+            train_target,
+            minlength=vocabulary_size,
+        )
+        token_ids = np.arange(vocabulary_size, dtype=np.int64)
+        order = torch.from_numpy(
+            np.lexsort((token_ids, -counts.cpu().numpy())).copy()
+        ).long()
+        marginal_ids[int(horizon)] = order[: max(top_ks)].tolist()
+        marginal_values[int(horizon)] = {}
+        for k in top_ks:
+            model_accuracy = float(
+                evaluation_top_ids[:, :k]
+                .eq(evaluation_target.unsqueeze(-1))
+                .any(dim=-1)
+                .float()
+                .mean()
+                .item()
+                * 100.0
+            )
+            marginal_accuracy = float(
+                evaluation_target.unsqueeze(-1)
+                .eq(order[:k].reshape(1, -1))
+                .any(dim=-1)
+                .float()
+                .mean()
+                .item()
+                * 100.0
+            )
+            rows.setdefault((f"Top-{k}", "Model Accuracy (%)"), []).append(
+                model_accuracy
+            )
+            rows.setdefault(
+                (f"Top-{k}", "Excess vs Marginal (pp)"), []
+            ).append(model_accuracy - marginal_accuracy)
+            marginal_values[int(horizon)][f"Top-{k}"] = marginal_accuracy
+
+    table = pd.DataFrame(
+        rows,
+        index=pd.Index(
+            requested_horizons,
+            name="Future horizon (minutes)",
+        ),
+    )
+    table.columns = pd.MultiIndex.from_tuples(
+        table.columns,
+        names=("Candidate set", "Metric"),
+    )
+    table.attrs.update(
+        {
+            "run_directory": str(evaluation.info.run_dir),
+            "checkpoint": "best",
+            "split": evaluation.split,
+            "policy": evaluation.policy,
+            "asset": asset_label,
+            "evaluation_windows": len(selected),
+            "validation_windows": len(selected),
+            "marginal_baseline_accuracy_percent": marginal_values,
+            "training_top_token_ids_by_horizon": marginal_ids,
+            "source": "saved_selected_checkpoint_top10",
+        }
+    )
+    return table
+
 def analyse_coarse_token_topk(
     model: str | Path,
     *,
     split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
     asset: str | int | Literal["random"] | None = None,
     source: MetricsSource = "best",
     window_indices: Sequence[int] | None = None,
@@ -9956,16 +10667,41 @@ def analyse_coarse_token_topk(
     horizons: Sequence[int] | None = None,
     random_seed: int = 42,
 ) -> pd.DataFrame:
-    """Split-aware wrapper for the existing coarse-token top-K diagnostic."""
+    """Return coarse-token top-k accuracy from saved selected artefacts.
+
+    New token runners use architecture-specific model classes and save compact
+    top-10 predictions for the selected checkpoint.  Graph Hub consumes those
+    artefacts directly rather than trying to rebuild every run as the historical
+    ``DynamicGraphTokenForecaster``.  Legacy runs without compact artefacts keep
+    the previous inference fallback.
+    """
 
     run_dir = resolve_model_folder(model)
-    info = load_run_info(run_dir)
+    unified_info = load_unified_run_info(run_dir)
     resolved_asset = asset
     if isinstance(asset, str) and asset.strip().lower() == "random":
         resolved_asset = _resolve_random_asset(
-            "random", info.asset_cols, random_seed=random_seed
+            "random", unified_info.asset_cols, random_seed=random_seed
         )
     resolved_split = normalise_evaluation_split(split)
+
+    if source == "best":
+        saved = _analyse_saved_coarse_token_topk(
+            run_dir,
+            split=resolved_split,
+            policy=policy,
+            asset=resolved_asset,
+            window_indices=window_indices,
+            max_windows=max_windows,
+            top_k_values=top_k_values,
+            horizons=horizons,
+        )
+        if saved is not None:
+            return saved
+
+    # Historical fallback for runs that predate selected-checkpoint token
+    # artefacts.  This path intentionally remains available, but it is not used
+    # for the new Round-2/BaseDyGraph-v1 token models.
     result = analyse_s1_topk_accuracy_by_horizon(
         run_dir,
         asset=resolved_asset,
@@ -9981,4 +10717,6 @@ def analyse_coarse_token_topk(
         horizons=horizons,
     )
     result.attrs["split"] = resolved_split
+    result.attrs["policy"] = policy
+    result.attrs["source"] = "legacy_checkpoint_reinference"
     return result
