@@ -4656,14 +4656,32 @@ def detect_run_kind(run_dir: str | Path) -> AnalysisRunKind:
     run_path = _resolve_run_dir(run_dir)
     resolved = _load_json(run_path / "resolved_config.json")
 
+    models = resolved.get("models")
+    model_family = str(resolved.get("model_family", "")).lower()
+    data_values = resolved.get("data")
+    token_schema = (
+        isinstance(models, Mapping)
+        and isinstance(models.get("dynamic_graph"), Mapping)
+    )
+    token_data = (
+        isinstance(data_values, Mapping)
+        and (
+            data_values.get("input_token_stream") is not None
+            or data_values.get("target_token_stream") is not None
+        )
+    )
+
+    # New token-space runners retain a detailed top-level ``model`` mapping
+    # for their own constructor while also writing the established
+    # ``models.dynamic_graph`` analysis mirror.  Prefer the explicit token
+    # identity before applying the historical continuous-schema fallback.
+    if token_schema and ("token" in model_family or token_data):
+        return "token"
+
     if isinstance(resolved.get("model"), Mapping):
         return "continuous"
 
-    models = resolved.get("models")
-    if (
-        isinstance(models, Mapping)
-        and isinstance(models.get("dynamic_graph"), Mapping)
-    ):
+    if token_schema:
         return "token"
 
     raise ValueError(
@@ -6600,17 +6618,22 @@ def _candidate_artifact_layouts(
 
     candidates: list[EvaluationArtifactPaths] = []
 
-    # Canonical frozen-analysis layout.  The inference/baseline notebooks are
-    # expected to write one of these directories for train, validation and test.
+    # Canonical frozen-analysis layout.  An explicit inference policy must
+    # never be shadowed by the split's base/best bundle.  The old ordering
+    # checked ``analysis/<split>/predictions.pt`` first even when callers
+    # requested ``temperature_1``, so sampled-path lookups silently loaded the
+    # argmax bundle and then reported that no sampled paths existed.
     canonical_direct = run_dir / "analysis" / split
-    candidates.append(
-        _artifact_paths_in_directory(
-            canonical_direct,
-            split=split,
-            policy=policy,
-            prefix="",
+    base_policies = {"best", f"best_{split}", "default"}
+    if policy in base_policies:
+        candidates.append(
+            _artifact_paths_in_directory(
+                canonical_direct,
+                split=split,
+                policy=policy,
+                prefix="",
+            )
         )
-    )
     candidates.append(
         _artifact_paths_in_directory(
             canonical_direct / policy,
@@ -6620,15 +6643,17 @@ def _candidate_artifact_layouts(
         )
     )
 
-    # Direct split-labelled files in the model root.
-    candidates.append(
-        _artifact_paths_in_directory(
-            run_dir,
-            split=split,
-            policy=policy,
-            prefix=f"{split}_",
+    # Direct split-labelled files in the model root are also base-policy
+    # artefacts and must not override an explicitly requested temperature.
+    if policy in base_policies:
+        candidates.append(
+            _artifact_paths_in_directory(
+                run_dir,
+                split=split,
+                policy=policy,
+                prefix=f"{split}_",
+            )
         )
-    )
 
     # Historical best-checkpoint layouts.  Validation is the established
     # production spelling; train/training are accepted for final-checkpoint
@@ -6742,8 +6767,9 @@ def resolve_evaluation_artifact_paths(
     if requested == "":
         raise ValueError("policy cannot be an empty string; use None for automatic selection.")
 
+    automatic_request = requested in {None, "auto", "selected_temperature"}
     selected = _selected_temperature_policy(run_path, resolved_split)
-    if requested in {None, "auto", "selected_temperature"}:
+    if automatic_request:
         if selected is not None:
             requested = selected
         elif resolved_split == "validation" and (
@@ -6790,7 +6816,58 @@ def resolve_evaluation_artifact_paths(
                 tokens=(candidate.tokens if candidate.tokens and candidate.tokens.is_file() else None),
             )
 
-    checked = "\n".join(f"  - {candidate.predictions}" for candidate in candidates)
+    # Historical selected-temperature manifests sometimes cover validation
+    # only, while train/test retain the canonical direct analysis bundle.  In
+    # automatic mode, fall back to that direct bundle only after the selected
+    # policy-specific paths have been exhausted.  An explicitly requested
+    # policy remains strict and never falls back silently.
+    fallback_candidates: list[EvaluationArtifactPaths] = []
+    if automatic_request and requested not in {"default", "best"}:
+        fallback_candidates = _candidate_artifact_layouts(
+            run_path,
+            split=resolved_split,
+            policy="default",
+        )
+        for candidate in fallback_candidates:
+            if candidate.predictions.is_file():
+                return EvaluationArtifactPaths(
+                    run_dir=run_path,
+                    split=candidate.split,
+                    policy=(
+                        "best"
+                        if candidate.policy.startswith("best_")
+                        else candidate.policy
+                    ),
+                    policy_dir=candidate.policy_dir,
+                    predictions=candidate.predictions,
+                    graphs=(
+                        candidate.graphs
+                        if candidate.graphs and candidate.graphs.is_file()
+                        else None
+                    ),
+                    metrics=(
+                        candidate.metrics
+                        if candidate.metrics and candidate.metrics.is_file()
+                        else None
+                    ),
+                    sampled_paths=(
+                        candidate.sampled_paths
+                        if candidate.sampled_paths
+                        and candidate.sampled_paths.is_file()
+                        else None
+                    ),
+                    tokens=(
+                        candidate.tokens
+                        if candidate.tokens and candidate.tokens.is_file()
+                        else None
+                    ),
+                )
+
+    checked_candidates = [*candidates, *fallback_candidates]
+    checked = "\n".join(
+        f"  - {candidate.predictions}"
+        for candidate in checked_candidates
+    )
     raise FileNotFoundError(
         f"No saved {resolved_split} prediction artefact was found for policy "
         f"{requested!r} in {run_path}. Graph Hub does not run inference. "
