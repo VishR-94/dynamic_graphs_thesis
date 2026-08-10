@@ -54,7 +54,7 @@ def _tiny_model_config(depth: int = 3) -> DenseTransformerDepthConfig:
         position_embedding=False,
         graph_heads_per_block=tuple([2] * (depth - 1) + [1]),
         graph_hidden_dims_per_block=tuple([12] * depth),
-        graph_activations_per_block=(("softmax",) if depth == 1 else tuple(["softmax"] * (depth - 1) + ["sparsemax"])),
+        graph_activations_per_block=tuple(["softmax"] * (depth - 1) + ["sparsemax"]),
         graph_initial_alpha=0.5,
         spatial_initial_beta=0.5,
         spatial_feedforward_multiplier=2,
@@ -107,7 +107,7 @@ def _tiny_mapping(depth: int = 2) -> dict:
                 "activations_per_block": list(
                     model_config.graph_activations_per_block
                 ),
-                "activation": (model_config.graph_activations_per_block[-1]),
+                "activation": "sparsemax",
                 "add_self_loops": False,
                 "initial_alpha": 0.5,
             },
@@ -209,8 +209,7 @@ def _test_grid() -> None:
     for spec in specs:
         depth = spec.depth
         activations = tuple(spec.config["model"]["graph"]["activations_per_block"])
-        expected_activations = (("softmax",) if depth == 1 else tuple(["softmax"] * (depth - 1) + ["sparsemax"]))
-        assert activations == expected_activations
+        assert activations == tuple(["softmax"] * (depth - 1) + ["sparsemax"])
         assert spec.config["model"]["variant"] == "uniform_static_dynamic_state"
         assert spec.config["model"]["prior"]["type"] == "uniform"
         assert "uniformstatic" in spec.run_name

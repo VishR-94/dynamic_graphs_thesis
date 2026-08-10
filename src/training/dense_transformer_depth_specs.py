@@ -195,7 +195,7 @@ def make_dense_transformer_depth_specs(
             depth = int(depth)
             graph_heads = profile.graph_heads(depth)
             graph_hidden_dims = profile.graph_hidden_dims(depth)
-            activations = (("softmax",) if depth == 1 else tuple(["softmax"] * (depth - 1) + ["sparsemax"]))
+            activations = tuple(["softmax"] * (depth - 1) + ["sparsemax"])
             for index, (heads, hidden) in enumerate(
                 zip(graph_heads, graph_hidden_dims, strict=True)
             ):

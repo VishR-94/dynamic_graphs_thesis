@@ -139,21 +139,8 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     activations = tuple(str(value) for value in model["graph"]["activations_per_block"])
     if not (len(heads) == len(widths) == len(activations) == blocks):
         raise ValueError("Per-block graph schedules must match num_st_blocks.")
-    expected_activations = (
-        ("softmax",)
-        if blocks == 1
-        else tuple(
-            ["softmax"] * (blocks - 1)
-            + ["sparsemax"]
-        )
-    )
-
-    if activations != expected_activations:
-        raise ValueError(
-            "Graph activations must be ('softmax',) "
-            "for one block, or softmax in every "
-            "non-final block followed by sparsemax."
-        )
+    if activations[-1] != "sparsemax" or any(value != "softmax" for value in activations[:-1]):
+        raise ValueError("Graph activations must be softmax ... sparsemax.")
     for index, (head_count, width) in enumerate(zip(heads, widths, strict=True)):
         if head_count <= 0 or width <= 0 or width % head_count:
             raise ValueError(

@@ -56,7 +56,7 @@ class DenseTransformerDepthConfig:
 
     graph_heads_per_block: tuple[int, ...] = (1,)
     graph_hidden_dims_per_block: tuple[int, ...] = (64,)
-    graph_activations_per_block: tuple[str, ...] = ("softmax",)
+    graph_activations_per_block: tuple[str, ...] = ("sparsemax",)
     graph_initial_alpha: float = 0.5
 
     spatial_initial_beta: float = 0.5
@@ -126,24 +126,13 @@ class DenseTransformerDepthConfig:
         allowed = {"softmax", "sparsemax"}
         if any(value not in allowed for value in self.graph_activations_per_block):
             raise ValueError("Only softmax and sparsemax are supported here.")
-        expected_activations = (
-            ("softmax",)
-            if int(self.num_st_blocks) == 1
-            else tuple(
-                ["softmax"]
-                * (int(self.num_st_blocks) - 1)
-                + ["sparsemax"]
-            )
-        )
-
-        if tuple(
-            self.graph_activations_per_block
-        ) != expected_activations:
-            raise ValueError(
-                "Graph activations must be ('softmax',) "
-                "for one block, or softmax in every "
-                "non-final block followed by sparsemax."
-            )
+        if self.graph_activations_per_block[-1] != "sparsemax":
+            raise ValueError("The final graph block must use sparsemax." )
+        if any(
+            value != "softmax"
+            for value in self.graph_activations_per_block[:-1]
+        ):
+            raise ValueError("Every non-final graph block must use softmax.")
 
 
 @dataclass
