@@ -29,6 +29,7 @@ AblationFamily = Literal[
     "alpha_beta_initialisation_sweep",
     "alpha_beta_delayed_decay_sweep",
     "final_sparsemax_graph_ablation",
+    "final_correlation_activation_ablation",
 ]
 
 

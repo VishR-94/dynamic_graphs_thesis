@@ -131,9 +131,14 @@ def _validate_config(config: Mapping[str, Any]) -> None:
 
     if str(model["temporal"]["type"]) != "modern_tcn":
         raise ValueError("Round 1 requires ModernTCN.")
-    if str(model["graph"]["activation"]) not in {"softmax", "sparsemax"}:
+    if str(model["graph"]["activation"]) not in {
+        "softmax",
+        "sparsemax",
+        "entmax15",
+    }:
         raise ValueError(
-            "Round 1 graph activation must be 'softmax' or 'sparsemax'."
+            "Round 1 graph activation must be 'softmax', 'sparsemax', "
+            "or 'entmax15'."
         )
     if bool(model["graph"]["add_self_loops"]):
         raise ValueError("Round 1 requires zero graph diagonal.")

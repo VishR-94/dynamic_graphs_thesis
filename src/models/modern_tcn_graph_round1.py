@@ -10,7 +10,7 @@ remain unchanged, while later diagnostics can independently choose:
 * whether that static graph is prior-initialised or randomly initialised;
 * whether the current continuous state is exposed directly to graph scoring
   and graph-weighted value propagation;
-* softmax or sparsemax graph normalisation.
+* softmax, sparsemax, or 1.5-entmax graph normalisation.
 
 All graph tensors use the project convention ``A[target, source]``.
 """
@@ -53,9 +53,14 @@ class ModernTCNGraphRound1Config:
         self.forecaster.validate()
         if self.forecaster.temporal.type != "modern_tcn":
             raise ValueError("Round 1 requires the ModernTCN temporal backbone.")
-        if self.forecaster.graph.activation not in {"softmax", "sparsemax"}:
+        if self.forecaster.graph.activation not in {
+            "softmax",
+            "sparsemax",
+            "entmax15",
+        }:
             raise ValueError(
-                "Round 1 graph activation must be 'softmax' or 'sparsemax'."
+                "Round 1 graph activation must be 'softmax', 'sparsemax', "
+                "or 'entmax15'."
             )
         if self.forecaster.graph.add_self_loops:
             raise ValueError("Round 1 excludes graph self-edges.")
@@ -215,9 +220,14 @@ class PriorMixedDynamicGraphLearner(nn.Module):
             use_static_graph = static_prior is not None
         self.use_static_graph = bool(use_static_graph)
         self.random_static_initialisation = bool(random_static_initialisation)
-        if str(graph_activation) not in {"softmax", "sparsemax"}:
+        if str(graph_activation) not in {
+            "softmax",
+            "sparsemax",
+            "entmax15",
+        }:
             raise ValueError(
-                "graph_activation must be 'softmax' or 'sparsemax'."
+                "graph_activation must be 'softmax', 'sparsemax', "
+                "or 'entmax15'."
             )
         if not self.use_static_graph and static_prior is not None:
             raise ValueError("A dynamic-only graph cannot receive static_prior.")
