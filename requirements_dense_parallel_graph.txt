@@ -1,0 +1,12 @@
+# Optional convenience requirements for the dense parallel graph experiment.
+# The Colab notebook does not bulk-install this file: it verifies imports and
+# installs only genuinely missing core packages. PyTorch comes from Colab.
+# Weights & Biases is optional and deliberately excluded so logging can never
+# block training.
+numpy
+pandas
+matplotlib
+scipy
+tqdm
+pyyaml
+einops==0.8.1
