@@ -131,8 +131,10 @@ def _validate_config(config: Mapping[str, Any]) -> None:
 
     if str(model["temporal"]["type"]) != "modern_tcn":
         raise ValueError("Round 1 requires ModernTCN.")
-    if str(model["graph"]["activation"]) != "softmax":
-        raise ValueError("Round 1 uses softmax graph activation.")
+    if str(model["graph"]["activation"]) not in {"softmax", "sparsemax"}:
+        raise ValueError(
+            "Round 1 graph activation must be 'softmax' or 'sparsemax'."
+        )
     if bool(model["graph"]["add_self_loops"]):
         raise ValueError("Round 1 requires zero graph diagonal.")
     if str(model["spatial"]["gate_type"]) not in {"learned_scalar", "none"}:
@@ -141,8 +143,10 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         )
     if str(model["variant"]) not in {
         "dynamic_only",
+        "dynamic_only_state",
         "prior_mixture",
         "prior_mixture_state",
+        "random_static_mixture_state",
     }:
         raise ValueError("Unsupported Round-1 variant.")
     if int(model["graph"]["hidden_dim"]) % int(model["graph"]["num_heads"]):
@@ -1170,7 +1174,7 @@ def main() -> None:
     prior_type = str(resolved["model"]["prior"]["type"])
     static_prior: Tensor | None
     sectors: list[str] | None = None
-    if prior_type == "none":
+    if prior_type in {"none", "random"}:
         static_prior = None
     elif prior_type == "sector":
         if args.company_profiles is None:
@@ -1267,6 +1271,9 @@ def main() -> None:
         "temporal_backbone": "modern_tcn",
         "graph_variant": str(resolved["model"]["variant"]),
         "graph_type": str(resolved["model"]["graph"]["type"]),
+        "graph_activation": str(
+            resolved["model"]["graph"]["activation"]
+        ),
         "graph_heads": int(resolved["model"]["graph"]["num_heads"]),
         "graph_hidden_dim": int(resolved["model"]["graph"]["hidden_dim"]),
         "prior_type": prior_type,
@@ -1280,9 +1287,9 @@ def main() -> None:
             resolved["model"]["spatial"]["initial_beta"]
         ),
         "graph_initial_alpha": (
-            None
-            if prior_type == "none"
-            else float(resolved["model"]["graph"]["initial_alpha"])
+            float(resolved["model"]["graph"]["initial_alpha"])
+            if model_config.uses_static_graph
+            else None
         ),
         "trainable_parameters": int(
             sum(
@@ -1304,22 +1311,39 @@ def main() -> None:
         "This run uses the test split for checkpoint selection.\n",
         encoding="utf-8",
     )
-    if static_prior is not None:
+    initial_static = model.graph_learner.static_adjacency()
+    if initial_static is not None:
+        initial_adjacency = initial_static.detach().cpu().float()[0]
         initial_prior_payload = {
             "prior_type": prior_type,
-            "adjacency": static_prior,
+            "adjacency": initial_adjacency,
+            "static_logits": (
+                None
+                if model.graph_learner.static_logits is None
+                else model.graph_learner.static_logits.detach().cpu().float()
+            ),
             "asset_cols": asset_cols,
             "sectors": sectors,
             "orientation": GRAPH_ORIENTATION,
+            "graph_activation": str(
+                resolved["model"]["graph"]["activation"]
+            ),
             "fitted_on": (
                 "company_profiles.csv"
                 if prior_type == "sector"
-                else "canonical January-August training Close returns only"
+                else (
+                    "canonical January-August training Close returns only"
+                    if prior_type == "correlation"
+                    else "random trainable static logits; no economic prior"
+                )
             ),
         }
-        atomic_torch_save(initial_prior_payload, run_dir / "initial_graph_prior.pt")
+        atomic_torch_save(
+            initial_prior_payload,
+            run_dir / "initial_graph_prior.pt",
+        )
         pd.DataFrame(
-            static_prior.numpy(),
+            initial_adjacency.mean(dim=0).numpy(),
             index=asset_cols,
             columns=asset_cols,
         ).to_csv(run_dir / "initial_graph_prior.csv")
@@ -1327,7 +1351,7 @@ def main() -> None:
             {
                 key: value
                 for key, value in initial_prior_payload.items()
-                if key != "adjacency"
+                if key not in {"adjacency", "static_logits"}
             },
             run_dir / "initial_graph_prior.json",
         )

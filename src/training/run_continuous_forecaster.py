@@ -1268,6 +1268,16 @@ def _run_validation(
             "selected": selected_graph_tensor,
             "base": base_graph_tensor,
             "dynamic": dynamic_graph_tensor,
+            # ContinuousForecaster contains exactly one graph/spatial stage.
+            # Preserve the historical top-level keys while also writing the
+            # canonical per-layer schema expected by Graph Hub.
+            "per_layer": (selected_graph_tensor,),
+            "per_layer_base": (base_graph_tensor,),
+            "per_layer_dynamic": (dynamic_graph_tensor,),
+            "num_layers": 1,
+            "selected_layer": 0,
+            "num_heads_per_layer": [int(config["model"]["graph"]["num_heads"])],
+            "layer_head_counts": [int(config["model"]["graph"]["num_heads"])],
             "spatial_beta": spatial_beta_value,
             "dynamic_alpha": dynamic_alpha_value,
             "dates": days,

@@ -11,8 +11,14 @@ from typing import Any, Literal, Mapping, Sequence
 import pandas as pd
 
 
-PriorType = Literal["none", "sector", "correlation"]
-Variant = Literal["dynamic_only", "prior_mixture", "prior_mixture_state"]
+PriorType = Literal["none", "sector", "correlation", "random"]
+Variant = Literal[
+    "dynamic_only",
+    "dynamic_only_state",
+    "prior_mixture",
+    "prior_mixture_state",
+    "random_static_mixture_state",
+]
 OptimisationProfile = Literal["round1", "dimitri", "round1_delayed_decay"]
 SpatialGateType = Literal["learned_scalar", "none"]
 AblationFamily = Literal[
@@ -22,6 +28,7 @@ AblationFamily = Literal[
     "no_beta_dimitri_optimisation",
     "alpha_beta_initialisation_sweep",
     "alpha_beta_delayed_decay_sweep",
+    "final_sparsemax_graph_ablation",
 ]
 
 

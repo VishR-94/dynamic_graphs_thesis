@@ -1177,6 +1177,9 @@ def _make_metadata(
         "temporal_backbone": "modern_tcn",
         "graph_variant": str(resolved["model"]["variant"]),
         "graph_type": str(resolved["model"]["graph"]["type"]),
+        "graph_activation": str(
+            resolved["model"]["graph"]["activation"]
+        ),
         "graph_heads": int(resolved["model"]["graph"]["num_heads"]),
         "graph_hidden_dim": int(resolved["model"]["graph"]["hidden_dim"]),
         "prior_type": str(resolved["model"]["prior"]["type"]),
@@ -1185,7 +1188,11 @@ def _make_metadata(
         "state_pathway": model_config.uses_state_pathway,
         "spatial_gate_type": str(resolved["model"]["spatial"]["gate_type"]),
         "spatial_initial_beta": float(resolved["model"]["spatial"]["initial_beta"]),
-        "graph_initial_alpha": float(resolved["model"]["graph"]["initial_alpha"]),
+        "graph_initial_alpha": (
+            float(resolved["model"]["graph"]["initial_alpha"])
+            if model_config.uses_static_graph
+            else None
+        ),
         "trainable_parameters": int(sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)),
         "backbone_trainable_parameters": int(sum(parameter.numel() for parameter in backbone_parameters)),
         "graph_trainable_parameters": int(sum(parameter.numel() for parameter in graph_parameters)),
@@ -1200,7 +1207,7 @@ def _build_static_prior(
     company_profiles: Path | None,
 ) -> tuple[Tensor | None, list[str] | None]:
     prior_type = str(resolved["model"]["prior"]["type"])
-    if prior_type == "none":
+    if prior_type in {"none", "random"}:
         return None, None
     if prior_type == "sector":
         if company_profiles is None:
@@ -1318,25 +1325,49 @@ def main() -> None:
         "This run uses the test split for checkpoint selection.\n",
         encoding="utf-8",
     )
-    if static_prior is not None:
+    initial_static = model.graph_learner.static_adjacency()
+    if initial_static is not None:
+        prior_type = str(resolved["model"]["prior"]["type"])
+        initial_adjacency = initial_static.detach().cpu().float()[0]
         initial_prior_payload = {
-            "prior_type": str(resolved["model"]["prior"]["type"]),
-            "adjacency": static_prior,
+            "prior_type": prior_type,
+            "adjacency": initial_adjacency,
+            "static_logits": (
+                None
+                if model.graph_learner.static_logits is None
+                else model.graph_learner.static_logits.detach().cpu().float()
+            ),
             "asset_cols": asset_cols,
             "sectors": sectors,
             "orientation": GRAPH_ORIENTATION,
+            "graph_activation": str(
+                resolved["model"]["graph"]["activation"]
+            ),
             "fitted_on": (
                 "company_profiles.csv"
-                if str(resolved["model"]["prior"]["type"]) == "sector"
-                else "canonical January-August training Close returns only"
+                if prior_type == "sector"
+                else (
+                    "canonical January-August training Close returns only"
+                    if prior_type == "correlation"
+                    else "random trainable static logits; no economic prior"
+                )
             ),
         }
-        atomic_torch_save(initial_prior_payload, run_dir / "initial_graph_prior.pt")
-        pd.DataFrame(static_prior.numpy(), index=asset_cols, columns=asset_cols).to_csv(
-            run_dir / "initial_graph_prior.csv"
+        atomic_torch_save(
+            initial_prior_payload,
+            run_dir / "initial_graph_prior.pt",
         )
+        pd.DataFrame(
+            initial_adjacency.mean(dim=0).numpy(),
+            index=asset_cols,
+            columns=asset_cols,
+        ).to_csv(run_dir / "initial_graph_prior.csv")
         atomic_json_save(
-            {key: value for key, value in initial_prior_payload.items() if key != "adjacency"},
+            {
+                key: value
+                for key, value in initial_prior_payload.items()
+                if key not in {"adjacency", "static_logits"}
+            },
             run_dir / "initial_graph_prior.json",
         )
 

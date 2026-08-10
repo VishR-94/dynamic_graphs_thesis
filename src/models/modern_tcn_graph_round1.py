@@ -3,12 +3,14 @@ from __future__ import annotations
 """Round-1 ModernTCN graph ablations.
 
 This module preserves the selected ModernTCN temporal/forecasting path and
-adds only three controlled graph variants:
+supports controlled one-block graph variants. Historical Round-1 variants
+remain unchanged, while later diagnostics can independently choose:
 
-1. dynamic-only graph (the current best architecture);
-2. trainable prior-initialised static graph mixed with a dynamic graph;
-3. the same mixture with the current continuous state exposed directly to
-   both graph scoring and graph-weighted value propagation.
+* whether a trainable static graph is present;
+* whether that static graph is prior-initialised or randomly initialised;
+* whether the current continuous state is exposed directly to graph scoring
+  and graph-weighted value propagation;
+* softmax or sparsemax graph normalisation.
 
 All graph tensors use the project convention ``A[target, source]``.
 """
@@ -32,8 +34,10 @@ from src.models.dynamic_graph.modules import GraphNormalizer
 
 Round1GraphVariant = Literal[
     "dynamic_only",
+    "dynamic_only_state",
     "prior_mixture",
     "prior_mixture_state",
+    "random_static_mixture_state",
 ]
 
 
@@ -49,8 +53,10 @@ class ModernTCNGraphRound1Config:
         self.forecaster.validate()
         if self.forecaster.temporal.type != "modern_tcn":
             raise ValueError("Round 1 requires the ModernTCN temporal backbone.")
-        if self.forecaster.graph.activation != "softmax":
-            raise ValueError("Round 1 uses softmax graphs only.")
+        if self.forecaster.graph.activation not in {"softmax", "sparsemax"}:
+            raise ValueError(
+                "Round 1 graph activation must be 'softmax' or 'sparsemax'."
+            )
         if self.forecaster.graph.add_self_loops:
             raise ValueError("Round 1 excludes graph self-edges.")
         if self.forecaster.spatial_gate_type not in {"learned_scalar", "none"}:
@@ -60,8 +66,10 @@ class ModernTCNGraphRound1Config:
             )
         if self.graph_variant not in {
             "dynamic_only",
+            "dynamic_only_state",
             "prior_mixture",
             "prior_mixture_state",
+            "random_static_mixture_state",
         }:
             raise ValueError(f"Unsupported graph variant {self.graph_variant!r}.")
         if not math.isfinite(float(self.prior_scale)) or self.prior_scale <= 0:
@@ -70,12 +78,28 @@ class ModernTCNGraphRound1Config:
             raise ValueError("prior_jitter must be finite and non-negative.")
 
     @property
+    def uses_static_graph(self) -> bool:
+        return self.graph_variant in {
+            "prior_mixture",
+            "prior_mixture_state",
+            "random_static_mixture_state",
+        }
+
+    @property
     def uses_static_prior(self) -> bool:
         return self.graph_variant in {"prior_mixture", "prior_mixture_state"}
 
     @property
+    def uses_random_static_graph(self) -> bool:
+        return self.graph_variant == "random_static_mixture_state"
+
+    @property
     def uses_state_pathway(self) -> bool:
-        return self.graph_variant == "prior_mixture_state"
+        return self.graph_variant in {
+            "dynamic_only_state",
+            "prior_mixture_state",
+            "random_static_mixture_state",
+        }
 
 
 @dataclass
@@ -171,6 +195,9 @@ class PriorMixedDynamicGraphLearner(nn.Module):
         prior_scale: float,
         prior_jitter: float,
         prior_seed: int,
+        graph_activation: str = "softmax",
+        use_static_graph: bool | None = None,
+        random_static_initialisation: bool = False,
     ) -> None:
         super().__init__()
         if graph_hidden_dim % num_heads != 0:
@@ -184,6 +211,32 @@ class PriorMixedDynamicGraphLearner(nn.Module):
         self.graph_hidden_dim = int(graph_hidden_dim)
         self.head_dim = self.graph_hidden_dim // self.num_heads
         self.use_state_pathway = bool(use_state_pathway)
+        if use_static_graph is None:
+            use_static_graph = static_prior is not None
+        self.use_static_graph = bool(use_static_graph)
+        self.random_static_initialisation = bool(random_static_initialisation)
+        if str(graph_activation) not in {"softmax", "sparsemax"}:
+            raise ValueError(
+                "graph_activation must be 'softmax' or 'sparsemax'."
+            )
+        if not self.use_static_graph and static_prior is not None:
+            raise ValueError("A dynamic-only graph cannot receive static_prior.")
+        if self.random_static_initialisation and not self.use_static_graph:
+            raise ValueError(
+                "random_static_initialisation requires a static graph."
+            )
+        if self.random_static_initialisation and static_prior is not None:
+            raise ValueError(
+                "A random static graph must not receive an economic prior."
+            )
+        if (
+            self.use_static_graph
+            and not self.random_static_initialisation
+            and static_prior is None
+        ):
+            raise ValueError(
+                "A prior-initialised static graph requires static_prior."
+            )
         scorer_dim = self.d_model * (2 if self.use_state_pathway else 1)
 
         self.q_proj = nn.Linear(scorer_dim, self.graph_hidden_dim)
@@ -193,26 +246,45 @@ class PriorMixedDynamicGraphLearner(nn.Module):
                 type="dynamic",
                 num_heads=self.num_heads,
                 hidden_dim=self.graph_hidden_dim,
-                activation="softmax",
+                activation=str(graph_activation),
                 add_self_loops=False,
             )
         )
 
-        if static_prior is None:
+        if not self.use_static_graph:
             self.register_parameter("static_logits", None)
             self.register_parameter("raw_alpha", None)
         else:
-            prior_values = torch.as_tensor(static_prior).detach().cpu().float()
-            if tuple(prior_values.shape) != (self.num_nodes, self.num_nodes):
-                raise ValueError("static_prior node axes differ from the configured graph.")
-            initial_logits = build_v2_prior_logits(
-                prior_values,
-                num_heads=self.num_heads,
-                scale=prior_scale,
-                jitter=prior_jitter,
-                seed=prior_seed,
-            )
-            self.static_logits = nn.Parameter(initial_logits)
+            if self.random_static_initialisation:
+                generator = torch.Generator(device="cpu").manual_seed(
+                    int(prior_seed)
+                )
+                initial_logits = torch.randn(
+                    self.num_heads,
+                    self.num_nodes,
+                    self.num_nodes,
+                    generator=generator,
+                    dtype=torch.float32,
+                ) * float(prior_jitter)
+            else:
+                prior_values = torch.as_tensor(
+                    static_prior
+                ).detach().cpu().float()
+                if tuple(prior_values.shape) != (
+                    self.num_nodes,
+                    self.num_nodes,
+                ):
+                    raise ValueError(
+                        "static_prior node axes differ from the configured graph."
+                    )
+                initial_logits = build_v2_prior_logits(
+                    prior_values,
+                    num_heads=self.num_heads,
+                    scale=prior_scale,
+                    jitter=prior_jitter,
+                    seed=prior_seed,
+                )
+            self.static_logits = nn.Parameter(initial_logits.contiguous())
             epsilon = 1.0e-6
             clipped = min(max(float(initial_alpha), epsilon), 1.0 - epsilon)
             raw = math.log(clipped / (1.0 - clipped))
@@ -414,7 +486,9 @@ class ModernTCNGraphRound1Model(nn.Module):
         if config.uses_static_prior and static_prior is None:
             raise ValueError("A prior-mixture model requires static_prior.")
         if not config.uses_static_prior and static_prior is not None:
-            raise ValueError("The dynamic-only control must not receive a prior.")
+            raise ValueError(
+                "Only a prior-initialised graph may receive static_prior."
+            )
 
         self.config = config
         forecaster = config.forecaster
@@ -431,8 +505,11 @@ class ModernTCNGraphRound1Model(nn.Module):
             num_nodes=forecaster.num_nodes,
             num_heads=forecaster.graph.num_heads,
             graph_hidden_dim=forecaster.graph.hidden_dim,
+            graph_activation=forecaster.graph.activation,
             use_state_pathway=config.uses_state_pathway,
+            use_static_graph=config.uses_static_graph,
             static_prior=(static_prior if config.uses_static_prior else None),
+            random_static_initialisation=config.uses_random_static_graph,
             initial_alpha=forecaster.graph.initial_alpha,
             prior_scale=config.prior_scale,
             prior_jitter=config.prior_jitter,
@@ -596,12 +673,17 @@ def round1_model_config_from_mapping(
             type="dynamic",
             num_heads=int(graph["num_heads"]),
             hidden_dim=int(graph["hidden_dim"]),
-            activation="softmax",
+            activation=str(graph.get("activation", "softmax")),
             add_self_loops=False,
             mtgnn_top_k=min(4, int(num_nodes) - 1),
             base_graph_type="free_static",
             gate_type=(
-                "none" if str(model["variant"]) == "dynamic_only" else "learned_scalar"
+                "none"
+                if str(model["variant"]) in {
+                    "dynamic_only",
+                    "dynamic_only_state",
+                }
+                else "learned_scalar"
             ),
             initial_alpha=float(graph["initial_alpha"]),
         ),

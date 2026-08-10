@@ -6985,6 +6985,84 @@ def _normalise_saved_graph_tensor(
     return tensor.contiguous()
 
 
+def _historical_single_layer_graph_contract(
+    *,
+    graph: Mapping[str, Any],
+    info: UnifiedRunInfo,
+) -> bool:
+    """Return whether top-level graph components unambiguously mean layer 0.
+
+    Historical ``ContinuousForecaster`` exports predate the per-layer graph
+    schema. They contain one graph/spatial stage and save only ``selected``,
+    ``base`` and ``dynamic``. New interlaced models advertise an explicit
+    layer/head schedule and must continue to provide their real per-layer
+    tensors; this fallback is therefore restricted to artefacts with no
+    evidence of more than one graph layer.
+    """
+
+    explicit_counts: list[int] = []
+    if info.num_heads_per_layer is not None:
+        explicit_counts.append(len(info.num_heads_per_layer))
+
+    artifact_layers = graph.get("num_layers")
+    if artifact_layers is not None:
+        explicit_counts.append(int(artifact_layers))
+
+    model = info.resolved_config.get("model", {})
+    if isinstance(model, Mapping):
+        temporal_stack = model.get("temporal_stack")
+        if isinstance(temporal_stack, Mapping):
+            value = temporal_stack.get("num_st_blocks")
+            if value is not None:
+                explicit_counts.append(int(value))
+        for key in ("num_st_blocks", "st_blocks"):
+            value = model.get(key)
+            if value is not None and not isinstance(value, Mapping):
+                explicit_counts.append(int(value))
+
+    metadata = info.run_metadata
+    for key in ("num_st_blocks", "st_blocks", "graph_layers"):
+        value = metadata.get(key)
+        if value is not None:
+            explicit_counts.append(int(value))
+
+    basedygraph = info.resolved_config.get("basedygraph_financial")
+    if isinstance(basedygraph, Mapping):
+        value = basedygraph.get("num_st_blocks")
+        if value is not None:
+            explicit_counts.append(int(value))
+
+    if any(count > 1 for count in explicit_counts):
+        return False
+    if explicit_counts and any(count != 1 for count in explicit_counts):
+        return False
+    return graph.get("selected") is not None
+
+
+def _synthesise_historical_single_layer_components(
+    graph: dict[str, Any],
+    *,
+    info: UnifiedRunInfo,
+) -> None:
+    """Add per-layer aliases for an old one-graph continuous artefact."""
+
+    if any(
+        graph.get(key) is not None
+        for key in ("per_layer", "per_layer_base", "per_layer_dynamic")
+    ):
+        return
+    if not _historical_single_layer_graph_contract(graph=graph, info=info):
+        return
+
+    graph["num_layers"] = 1
+    graph["selected_layer"] = 0
+    graph["num_heads_per_layer"] = [int(info.num_heads)]
+    graph["layer_head_counts"] = [int(info.num_heads)]
+    graph["per_layer"] = (graph.get("selected"),)
+    graph["per_layer_base"] = (graph.get("base"),)
+    graph["per_layer_dynamic"] = (graph.get("dynamic"),)
+
+
 def _normalise_graph_payload(
     graph_artifacts: Mapping[str, Any],
     *,
@@ -7014,6 +7092,11 @@ def _normalise_graph_payload(
                 expected_heads=info.num_heads,
                 name=key,
             )
+
+    _synthesise_historical_single_layer_components(
+        graph,
+        info=info,
+    )
 
     for key in ("per_layer", "per_layer_base", "per_layer_dynamic"):
         per_layer = graph.get(key)
