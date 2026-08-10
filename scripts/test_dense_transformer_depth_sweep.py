@@ -54,12 +54,8 @@ def _tiny_model_config(depth: int = 3) -> DenseTransformerDepthConfig:
         position_embedding=False,
         graph_heads_per_block=tuple([2] * (depth - 1) + [1]),
         graph_hidden_dims_per_block=tuple([12] * depth),
-        graph_activations_per_block=tuple(
-            ["softmax"] * (depth - 1) + ["sparsemax"]
-        ),
+        graph_activations_per_block=(("softmax",) if depth == 1 else tuple(["softmax"] * (depth - 1) + ["sparsemax"])),
         graph_initial_alpha=0.5,
-        random_static_jitter=0.02,
-        graph_seed=42,
         spatial_initial_beta=0.5,
         spatial_feedforward_multiplier=2,
         spatial_dropout=0.0,
@@ -89,7 +85,7 @@ def _tiny_mapping(depth: int = 2) -> dict:
         "model": {
             "num_nodes": 5,
             "num_st_blocks": depth,
-            "variant": "random_static_dynamic_state",
+            "variant": "uniform_static_dynamic_state",
             "temporal": {
                 "type": "transformer",
                 "d_model": 12,
@@ -111,7 +107,7 @@ def _tiny_mapping(depth: int = 2) -> dict:
                 "activations_per_block": list(
                     model_config.graph_activations_per_block
                 ),
-                "activation": "sparsemax",
+                "activation": (model_config.graph_activations_per_block[-1]),
                 "add_self_loops": False,
                 "initial_alpha": 0.5,
             },
@@ -122,7 +118,12 @@ def _tiny_mapping(depth: int = 2) -> dict:
                 "gate_type": "learned_scalar",
                 "initial_beta": 0.5,
             },
-            "prior": {"type": "random", "jitter": 0.02, "seed": 42},
+            "prior": {
+                "type": "uniform",
+                "static_logits": "zeros",
+                "dynamic_logits": "zeros_at_initialisation",
+                "diagonal": "excluded",
+            },
             "graph_regularisation": {
                 "graph_reg_layer": -1,
                 "graph_reg_warmup_epochs": 0,
@@ -208,7 +209,11 @@ def _test_grid() -> None:
     for spec in specs:
         depth = spec.depth
         activations = tuple(spec.config["model"]["graph"]["activations_per_block"])
-        assert activations == tuple(["softmax"] * (depth - 1) + ["sparsemax"])
+        expected_activations = (("softmax",) if depth == 1 else tuple(["softmax"] * (depth - 1) + ["sparsemax"]))
+        assert activations == expected_activations
+        assert spec.config["model"]["variant"] == "uniform_static_dynamic_state"
+        assert spec.config["model"]["prior"]["type"] == "uniform"
+        assert "uniformstatic" in spec.run_name
         _validate_config(spec.config)
 
 
@@ -220,6 +225,29 @@ def _test_forward_causality_and_gradients() -> None:
     output = model.forward_dense(x)
     assert tuple(output.predictions.shape) == (2, 6, 2, 5, 1)
     assert len(output.block_outputs) == 3
+
+    # All graph branches and therefore the selected graph must begin from the
+    # exact same neutral off-diagonal uniform adjacency, regardless of whether
+    # the block uses softmax or sparsemax.
+    expected_uniform = torch.full((5, 5), 1.0 / 4.0)
+    expected_uniform.fill_diagonal_(0.0)
+    for block_output in output.block_outputs:
+        heads = int(block_output.graph.selected.shape[2])
+        expected_base = expected_uniform.view(1, 1, 5, 5).expand(
+            1, heads, 5, 5
+        )
+        expected_dynamic = expected_uniform.view(1, 1, 1, 5, 5).expand(
+            2, 6, heads, 5, 5
+        )
+        torch.testing.assert_close(
+            block_output.graph.base, expected_base, atol=1.0e-7, rtol=0.0
+        )
+        torch.testing.assert_close(
+            block_output.graph.dynamic, expected_dynamic, atol=1.0e-7, rtol=0.0
+        )
+        torch.testing.assert_close(
+            block_output.graph.selected, expected_dynamic, atol=1.0e-7, rtol=0.0
+        )
 
     for index, block in enumerate(output.block_outputs):
         heads = config.graph_heads_per_block[index]
@@ -264,7 +292,9 @@ def _test_forward_causality_and_gradients() -> None:
     for block in model.blocks:
         assert block.graph_learner.q_proj.weight.grad is not None
         assert block.graph_learner.k_proj.weight.grad is not None
+        assert float(block.graph_learner.k_proj.weight.grad.norm().item()) > 0.0
         assert block.graph_learner.static_logits.grad is not None
+        assert float(block.graph_learner.static_logits.grad.norm().item()) > 0.0
         assert block.graph_learner.raw_alpha.grad is not None
         assert block.spatial_gate.raw_beta is not None
         assert block.spatial_gate.raw_beta.grad is not None

@@ -20,6 +20,7 @@ DEFAULT_METRIC_DISPLAY_NAMES = {
     "mase": "MASE",
     "relative_mae_vs_persistence": "Rel. MAE",
     "persistence_win_rate": "Win Rate",
+    "cumulative_log_change_directional_accuracy": "Sign Acc.",
     "cumulative_log_change_pearson_correlation": "Pearson",
     "cumulative_log_change_cross_sectional_pearson_ic": "IC",
     "cumulative_log_change_cross_sectional_spearman_rank_ic": (
@@ -49,6 +50,7 @@ DEFAULT_SUMMARY_METRICS = (
     "cumulative_log_change_p95_absolute_error",
     "relative_mae_vs_persistence",
     "persistence_win_rate",
+    "cumulative_log_change_directional_accuracy",
     "cumulative_log_change_pearson_correlation",
     "cumulative_log_change_cross_sectional_pearson_ic",
     "cumulative_log_change_cross_sectional_spearman_rank_ic",

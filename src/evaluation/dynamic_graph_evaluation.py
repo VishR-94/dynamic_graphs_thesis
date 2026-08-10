@@ -1325,6 +1325,7 @@ def _augment_best_metrics_from_saved_predictions(
     backfillable_metrics = {
         "cumulative_log_change_median_absolute_error",
         "cumulative_log_change_p95_absolute_error",
+        "cumulative_log_change_directional_accuracy",
     }
 
     recomputable = [
@@ -1551,10 +1552,19 @@ def style_metrics_table(
         else "Last"
     )
 
+    formatters = {
+        column: (
+            "{:.2%}"
+            if column == "Sign Acc."
+            else "{:.6g}"
+        )
+        for column in table.columns
+    }
+
     return (
         table.style
         .format(
-            "{:.6g}",
+            formatters,
             na_rep="—",
         )
         .set_caption(
@@ -7079,6 +7089,73 @@ def _unwrap_token_artifacts(payload: Any) -> dict[str, Any]:
     return dict(nested if isinstance(nested, Mapping) else payload)
 
 
+def _augment_common_metrics_from_saved_predictions(
+    metric_table: pd.DataFrame,
+    prediction_result: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Backfill evaluation-only metrics added after a run was saved.
+
+    Graph Hub treats the exact saved prediction path as authoritative.
+    Metrics in this allow-list require no training-derived state, so they
+    can be reconstructed without rerunning inference or changing model
+    selection.  The saved CSV is not modified; augmentation is in memory.
+    """
+    observed = set(
+        metric_table["metric"]
+        .astype(str)
+        .tolist()
+    )
+
+    backfillable_metrics = (
+        "cumulative_log_change_directional_accuracy",
+    )
+
+    missing = [
+        metric_name
+        for metric_name in backfillable_metrics
+        if metric_name not in observed
+    ]
+
+    if not missing:
+        return metric_table
+
+    if prediction_result.get("output_space", "raw") != "raw":
+        return metric_table
+
+    evaluator = ForecastEvaluator(
+        prediction_result=dict(prediction_result),
+    )
+
+    recomputable = [
+        metric_name
+        for metric_name in missing
+        if metric_name in evaluator.available_metrics
+    ]
+
+    if not recomputable:
+        return metric_table
+
+    results = evaluator.evaluate(
+        metrics=recomputable,
+        reduce_dims=(0, 2),
+        bootstrap=False,
+    )
+
+    additional = make_evaluation_table(
+        metric_results=results,
+        horizons=evaluator.horizons,
+        channels=evaluator.channels,
+    )
+
+    return pd.concat(
+        [metric_table, additional],
+        ignore_index=True,
+    ).drop_duplicates(
+        subset=["metric", "horizon", "channel"],
+        keep="first",
+    )
+
+
 def load_evaluation_artifacts(
     run_dir: str | Path,
     *,
@@ -7156,6 +7233,10 @@ def load_evaluation_artifacts(
             raise ValueError(
                 f"Saved metric table is missing columns {sorted(missing)}."
             )
+        metric_table = _augment_common_metrics_from_saved_predictions(
+            metric_table,
+            prediction_result,
+        )
 
     sampled = (
         _unwrap_sampled_price_paths(_torch_load(paths.sampled_paths))
@@ -7360,6 +7441,8 @@ def style_model_metric_comparison(
             formatters[column] = "{:.8f}"
         elif column == "MASE":
             formatters[column] = "{:.5f}"
+        elif column == "Sign Acc.":
+            formatters[column] = "{:.2%}"
         else:
             formatters[column] = "{:.6f}"
     return table.style.format(formatters, na_rep="—").set_caption(caption)

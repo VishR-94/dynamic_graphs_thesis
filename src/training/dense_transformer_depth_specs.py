@@ -154,7 +154,6 @@ def make_dense_transformer_depth_specs(
     reference_mae: Sequence[float] = DEFAULT_REFERENCE_MAE,
     alpha_initial: float = 0.5,
     beta_initial: float = 0.5,
-    random_static_jitter: float = 0.02,
     position_embedding: bool = False,
     transformer_dropout: float = 0.0,
     spatial_feedforward_multiplier: int = 2,
@@ -196,9 +195,7 @@ def make_dense_transformer_depth_specs(
             depth = int(depth)
             graph_heads = profile.graph_heads(depth)
             graph_hidden_dims = profile.graph_hidden_dims(depth)
-            activations = tuple(
-                ["softmax"] * (depth - 1) + ["sparsemax"]
-            )
+            activations = (("softmax",) if depth == 1 else tuple(["softmax"] * (depth - 1) + ["sparsemax"]))
             for index, (heads, hidden) in enumerate(
                 zip(graph_heads, graph_hidden_dims, strict=True)
             ):
@@ -232,7 +229,7 @@ def make_dense_transformer_depth_specs(
                 "model": {
                     "num_nodes": 93,
                     "num_st_blocks": depth,
-                    "variant": "random_static_dynamic_state",
+                    "variant": "uniform_static_dynamic_state",
                     "temporal": {
                         "type": "transformer",
                         "d_model": int(profile.d_model),
@@ -266,9 +263,10 @@ def make_dense_transformer_depth_specs(
                         "initial_beta": float(beta_initial),
                     },
                     "prior": {
-                        "type": "random",
-                        "jitter": float(random_static_jitter),
-                        "seed": int(seed),
+                        "type": "uniform",
+                        "static_logits": "zeros",
+                        "dynamic_logits": "zeros_at_initialisation",
+                        "diagonal": "excluded",
                     },
                     "graph_regularisation": {
                         "graph_reg_layer": -1,
@@ -328,7 +326,7 @@ def make_dense_transformer_depth_specs(
             run_name = (
                 f"dense_tr_{profile.profile_id}_st{depth}_"
                 f"a{_float_tag(alpha_initial)}_b{_float_tag(beta_initial)}_"
-                f"randstatic_{signature}"
+                f"uniformstatic_{signature}"
             )
             label = f"{profile.label}; {depth} ST block(s)"
             specs.append(

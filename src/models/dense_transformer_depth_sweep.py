@@ -7,7 +7,7 @@ This module is the final depth/capacity diagnostic built after the one-block
 same causal interlaced contract:
 
     per-node causal Transformer
-    -> state-aware dynamic graph + trainable random static graph
+    -> state-aware dynamic graph + trainable neutral uniform static graph
     -> convex alpha graph mixture
     -> state-aware spatial message passing
     -> learned beta temporal/spatial mixture
@@ -56,10 +56,8 @@ class DenseTransformerDepthConfig:
 
     graph_heads_per_block: tuple[int, ...] = (1,)
     graph_hidden_dims_per_block: tuple[int, ...] = (64,)
-    graph_activations_per_block: tuple[str, ...] = ("sparsemax",)
+    graph_activations_per_block: tuple[str, ...] = ("softmax",)
     graph_initial_alpha: float = 0.5
-    random_static_jitter: float = 0.02
-    graph_seed: int = 42
 
     spatial_initial_beta: float = 0.5
     spatial_feedforward_multiplier: int = 2
@@ -100,11 +98,6 @@ class DenseTransformerDepthConfig:
             raise ValueError("graph_initial_alpha must lie strictly in (0,1).")
         if not 0.0 < float(self.spatial_initial_beta) < 1.0:
             raise ValueError("spatial_initial_beta must lie strictly in (0,1).")
-        if not math.isfinite(float(self.random_static_jitter)) or float(
-            self.random_static_jitter
-        ) < 0.0:
-            raise ValueError("random_static_jitter must be finite and non-negative.")
-
         schedules: dict[str, Sequence[object]] = {
             "graph_heads_per_block": self.graph_heads_per_block,
             "graph_hidden_dims_per_block": self.graph_hidden_dims_per_block,
@@ -133,12 +126,24 @@ class DenseTransformerDepthConfig:
         allowed = {"softmax", "sparsemax"}
         if any(value not in allowed for value in self.graph_activations_per_block):
             raise ValueError("Only softmax and sparsemax are supported here.")
-        if self.graph_activations_per_block[-1] != "sparsemax":
-            raise ValueError("The final graph block must use sparsemax.")
-        if any(
-            value != "softmax" for value in self.graph_activations_per_block[:-1]
-        ):
-            raise ValueError("Every non-final graph block must use softmax.")
+        expected_activations = (
+            ("softmax",)
+            if int(self.num_st_blocks) == 1
+            else tuple(
+                ["softmax"]
+                * (int(self.num_st_blocks) - 1)
+                + ["sparsemax"]
+            )
+        )
+
+        if tuple(
+            self.graph_activations_per_block
+        ) != expected_activations:
+            raise ValueError(
+                "Graph activations must be ('softmax',) "
+                "for one block, or softmax in every "
+                "non-final block followed by sparsemax."
+            )
 
 
 @dataclass
@@ -169,8 +174,16 @@ class DenseTransformerDepthSequenceOutput:
         return self.predictions[:, -1].contiguous()
 
 
-class DenseRandomStaticDynamicGraphLearner(nn.Module):
-    """Per-minute state-aware graph with trainable random static logits."""
+class DenseUniformStaticDynamicGraphLearner(nn.Module):
+    """State-aware graph whose static and dynamic branches start uniformly.
+
+    Every static-logit tensor starts at exactly zero.  The query projection is
+    randomly initialised while the key projection starts at zero, making the
+    initial QK logits exactly zero without killing graph learning: the first
+    backward pass updates K, and later passes update both Q and K.  With the
+    diagonal masked by ``GraphNormalizer``, softmax and sparsemax both map the
+    zero logits to the same neutral off-diagonal uniform adjacency.
+    """
 
     def __init__(
         self,
@@ -181,8 +194,6 @@ class DenseRandomStaticDynamicGraphLearner(nn.Module):
         graph_hidden_dim: int,
         activation: str,
         initial_alpha: float,
-        random_static_jitter: float,
-        seed: int,
     ) -> None:
         super().__init__()
         if int(graph_hidden_dim) % int(num_heads):
@@ -197,6 +208,15 @@ class DenseRandomStaticDynamicGraphLearner(nn.Module):
         scorer_dim = 2 * self.d_model
         self.q_proj = nn.Linear(scorer_dim, self.graph_hidden_dim)
         self.k_proj = nn.Linear(scorer_dim, self.graph_hidden_dim)
+
+        # Neutral dynamic-graph start with a live gradient path.  If both Q and
+        # K were zero, the bilinear scorer would be dead.  Keeping Q random and
+        # K zero makes QK^T exactly zero initially, while the first loss sends
+        # a non-zero gradient into K.
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.zeros_(self.q_proj.bias)
+        nn.init.zeros_(self.k_proj.weight)
+        nn.init.zeros_(self.k_proj.bias)
         self.normalizer = GraphNormalizer(
             GraphConfig(
                 type="dynamic",
@@ -207,15 +227,17 @@ class DenseRandomStaticDynamicGraphLearner(nn.Module):
             )
         )
 
-        generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        initial_logits = torch.randn(
-            self.num_heads,
-            self.num_nodes,
-            self.num_nodes,
-            generator=generator,
-            dtype=torch.float32,
-        ) * float(random_static_jitter)
-        self.static_logits = nn.Parameter(initial_logits.contiguous())
+        # One independent trainable parameter tensor per block/head, but the
+        # same neutral starting adjacency in every case.  No random sector-like
+        # structure is imposed before training.
+        self.static_logits = nn.Parameter(
+            torch.zeros(
+                self.num_heads,
+                self.num_nodes,
+                self.num_nodes,
+                dtype=torch.float32,
+            )
+        )
         alpha = float(initial_alpha)
         self.raw_alpha = nn.Parameter(
             torch.tensor(math.log(alpha / (1.0 - alpha)), dtype=torch.float32)
@@ -366,7 +388,7 @@ class DenseTransformerSTBlock(nn.Module):
                 dropout=float(config.transformer_dropout),
             ),
         )
-        self.graph_learner = DenseRandomStaticDynamicGraphLearner(
+        self.graph_learner = DenseUniformStaticDynamicGraphLearner(
             d_model=int(config.d_model),
             num_nodes=int(config.num_nodes),
             num_heads=int(config.graph_heads_per_block[self.block_index]),
@@ -377,8 +399,6 @@ class DenseTransformerSTBlock(nn.Module):
                 config.graph_activations_per_block[self.block_index]
             ),
             initial_alpha=float(config.graph_initial_alpha),
-            random_static_jitter=float(config.random_static_jitter),
-            seed=int(config.graph_seed) + self.block_index * 1009,
         )
         self.spatial_module = DenseStateAwareSpatialMessagePassing(
             d_model=int(config.d_model),
@@ -541,6 +561,8 @@ def dense_transformer_depth_config_from_mapping(
     graph = dict(model["graph"])  # type: ignore[arg-type]
     spatial = dict(model["spatial"])  # type: ignore[arg-type]
     prior = dict(model["prior"])  # type: ignore[arg-type]
+    if str(prior.get("type")) != "uniform":
+        raise ValueError("Dense Transformer depth sweep requires uniform graph initialisation.")
     config = DenseTransformerDepthConfig(
         num_nodes=int(model["num_nodes"]),
         context_length=int(data["context_length"]),
@@ -566,8 +588,6 @@ def dense_transformer_depth_config_from_mapping(
             str(value) for value in graph["activations_per_block"]  # type: ignore[arg-type]
         ),
         graph_initial_alpha=float(graph["initial_alpha"]),
-        random_static_jitter=float(prior["jitter"]),
-        graph_seed=int(prior["seed"]),
         spatial_initial_beta=float(spatial["initial_beta"]),
         spatial_feedforward_multiplier=int(spatial["feedforward_multiplier"]),
         spatial_dropout=float(spatial["dropout"]),

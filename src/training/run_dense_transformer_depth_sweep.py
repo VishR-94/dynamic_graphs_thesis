@@ -123,10 +123,10 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     if str(data.get("input_representation", "raw")) != "raw":
         raise ValueError("This sweep uses context-normalised raw OHLCV.")
 
-    if str(model["variant"]) != "random_static_dynamic_state":
-        raise ValueError("This sweep fixes random static + dynamic + state.")
-    if str(model["prior"]["type"]) != "random":
-        raise ValueError("The static graph must use random initialisation.")
+    if str(model["variant"]) != "uniform_static_dynamic_state":
+        raise ValueError("This sweep fixes uniform static + dynamic + state.")
+    if str(model["prior"]["type"]) != "uniform":
+        raise ValueError("Every graph branch must start from a neutral uniform adjacency.")
     if str(model["graph"]["type"]) != "static_dynamic_mixture":
         raise ValueError("Every run must contain static and dynamic graphs.")
     if bool(model["graph"].get("add_self_loops", False)):
@@ -139,10 +139,21 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     activations = tuple(str(value) for value in model["graph"]["activations_per_block"])
     if not (len(heads) == len(widths) == len(activations) == blocks):
         raise ValueError("Per-block graph schedules must match num_st_blocks.")
-    if activations[-1] != "sparsemax" or any(
-        value != "softmax" for value in activations[:-1]
-    ):
-        raise ValueError("Graph activations must be softmax ... sparsemax.")
+    expected_activations = (
+        ("softmax",)
+        if blocks == 1
+        else tuple(
+            ["softmax"] * (blocks - 1)
+            + ["sparsemax"]
+        )
+    )
+
+    if activations != expected_activations:
+        raise ValueError(
+            "Graph activations must be ('softmax',) "
+            "for one block, or softmax in every "
+            "non-final block followed by sparsemax."
+        )
     for index, (head_count, width) in enumerate(zip(heads, widths, strict=True)):
         if head_count <= 0 or width <= 0 or width % head_count:
             raise ValueError(
@@ -781,7 +792,7 @@ def _export_selected_checkpoint(
         "assets": int(prediction_result["y_pred"].shape[2]),
         "temporal_family": "transformer",
         "training_style": "dense_prefix",
-        "graph_family": "random_static_dynamic_state",
+        "graph_family": "uniform_static_dynamic_state",
         "blocks": blocks,
         "graph_orientation": GRAPH_ORIENTATION,
     }
@@ -831,21 +842,21 @@ def _save_initial_graphs(
 ) -> None:
     per_layer = model.initial_base_graphs()
     payload = {
-        "prior_type": "random",
+        "prior_type": "uniform",
         "source_prior": None,
         "initial_base_graphs_per_layer": per_layer,
         "asset_cols": list(asset_cols),
         "orientation": GRAPH_ORIENTATION,
-        "fitted_on": "random trainable logits",
+        "fitted_on": "neutral zero logits",
     }
     atomic_torch_save(payload, run_dir / "initial_graph_prior.pt")
     atomic_json_save(
         {
-            "prior_type": "random",
+            "prior_type": "uniform",
             "asset_cols": list(asset_cols),
             "orientation": GRAPH_ORIENTATION,
             "num_layers": len(per_layer),
-            "fitted_on": "random trainable logits",
+            "fitted_on": "neutral zero logits",
         },
         run_dir / "initial_graph_prior.json",
     )
@@ -1094,7 +1105,9 @@ def main() -> None:
             model_config.graph_activations_per_block
         ),
         "graph_type": "static_dynamic_mixture",
-        "prior_type": "random",
+        "prior_type": "uniform",
+        "initial_static_graph": "uniform_off_diagonal",
+        "initial_dynamic_graph": "uniform_off_diagonal",
         "state_pathway": True,
         "graph_initial_alpha": float(model_config.graph_initial_alpha),
         "spatial_initial_beta": float(model_config.spatial_initial_beta),

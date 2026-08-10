@@ -248,6 +248,35 @@ def persistence_win_score_values(
         )
     )
 
+
+def directional_accuracy_values(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+) -> torch.Tensor:
+    """Return pointwise cumulative-change sign correctness scores.
+
+    Each element is:
+
+        1.0 when prediction and target have the same sign;
+        0.0 otherwise.
+
+    ``torch.sign`` maps negative, zero and positive values to -1, 0 and
+    +1 respectively.  Therefore an unchanged prediction is counted as
+    correct only when the realised change is also exactly unchanged.
+
+    Input/output shape:
+        [B, H, N, C]
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    return (
+        torch.sign(y_pred)
+        == torch.sign(y_true)
+    ).to(dtype=y_pred.dtype)
+
 def _normalise_reduction_dims(
     *,
     ndim: int,
@@ -617,6 +646,31 @@ def persistence_win_rate(
 
     return reduce_metric(
         pointwise_scores,
+        reduce_dims=reduce_dims,
+    )
+
+
+def directional_accuracy(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    reduce_dims: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """Return the proportion of predictions with the correct sign.
+
+    The caller is responsible for supplying predictions and targets in
+    the intended change space.  ``ForecastEvaluator`` registers this
+    metric in cumulative-log-change space.
+
+    Values lie in [0, 1].  Multiply by 100, or use percentage display
+    formatting, to report the result as a percentage.
+    """
+    values = directional_accuracy_values(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    return reduce_metric(
+        values,
         reduce_dims=reduce_dims,
     )
 
@@ -1811,6 +1865,24 @@ class ForecastEvaluator:
             values=y_pred,
             reference_values=y_true,
         )
+
+    def _build_cumulative_log_change_directional_accuracy_bootstrap_components(
+        self,
+    ) -> BootstrapMetricComponents:
+        """Return pointwise cumulative-log-change sign scores."""
+        y_pred, y_true = self.get_predictions(
+            output_space="cumulative_log_change",
+        )
+
+        values = directional_accuracy_values(
+            y_pred=y_pred,
+            y_true=y_true,
+        )
+
+        return BootstrapMetricComponents(
+            kind="mean",
+            values=values,
+        )
     
     def _build_cumulative_log_change_movement_magnitude_ratio_bootstrap_components(
         self,
@@ -2032,6 +2104,20 @@ class ForecastEvaluator:
                     bootstrap_components=(
                         self
                         ._build_cumulative_log_change_pearson_bootstrap_components
+                    ),
+                )
+            ),
+
+            "cumulative_log_change_directional_accuracy": (
+                MetricDefinition(
+                    compute=partial(
+                        self.compute_pairwise_metric,
+                        metric_fn=directional_accuracy,
+                        output_space="cumulative_log_change",
+                    ),
+                    bootstrap_components=(
+                        self
+                        ._build_cumulative_log_change_directional_accuracy_bootstrap_components
                     ),
                 )
             ),
