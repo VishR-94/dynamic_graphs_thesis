@@ -116,8 +116,11 @@ class ModernTCNGraphRound2TokenConfig:
             "transformer_only",
         }:
             raise ValueError(f"Unsupported temporal_family {self.temporal_family!r}.")
-        if int(self.num_transformer_blocks) <= 0:
-            raise ValueError("num_transformer_blocks must be positive.")
+        if self.temporal_family == "modern_tcn_transformer":
+            if int(self.num_transformer_blocks) < 0:
+                raise ValueError("num_transformer_blocks cannot be negative.")
+        elif int(self.num_transformer_blocks) <= 0:
+            raise ValueError("transformer_only requires at least one block.")
         if self.temporal_family == "modern_tcn_transformer":
             if self.context_length % self.modern_tcn_patch_stride:
                 raise ValueError(
@@ -150,12 +153,14 @@ class ModernTCNGraphRound2TokenConfig:
         )
         if any(len(values) != block_count for values in schedules):
             raise ValueError("Every graph schedule must match num_st_blocks.")
-        if self.graph_activations_per_block[-1] != "sparsemax":
-            raise ValueError("The final graph block must use sparsemax.")
+        allowed_activations = {"softmax", "sparsemax", "entmax15"}
         if any(
-            value != "softmax" for value in self.graph_activations_per_block[:-1]
+            value not in allowed_activations
+            for value in self.graph_activations_per_block
         ):
-            raise ValueError("Every non-final graph block must use softmax.")
+            raise ValueError(
+                "Graph activations must be softmax, sparsemax, or entmax15."
+            )
         for index, (heads, hidden) in enumerate(
             zip(
                 self.graph_heads_per_block,
@@ -592,10 +597,16 @@ class ModernTCNGraphRound2TokenModel(nn.Module):
                 )
             )
             self.transformer_input: CoarseTokenTransformerInputBlock | None = None
-            self.modern_to_transformer: nn.Module | None = nn.Sequential(
-                nn.Linear(config.modern_tcn_d_model, config.transformer_d_model),
-                nn.LayerNorm(config.transformer_d_model),
-            )
+            if int(config.modern_tcn_d_model) == int(config.transformer_d_model):
+                self.modern_to_transformer = nn.Identity()
+            else:
+                self.modern_to_transformer = nn.Sequential(
+                    nn.Linear(
+                        config.modern_tcn_d_model,
+                        config.transformer_d_model,
+                    ),
+                    nn.LayerNorm(config.transformer_d_model),
+                )
         else:
             self.modern_tcn_backbone = None
             self.transformer_input = CoarseTokenTransformerInputBlock(config)

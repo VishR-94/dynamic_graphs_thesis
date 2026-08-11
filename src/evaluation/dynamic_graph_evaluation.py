@@ -10707,7 +10707,10 @@ def analyse_coarse_token_predictive_distribution(
         base = _analyse_saved_token_predictive_distribution(
             run_dir,
             split=resolved_split,
-            policy=policy,
+            # Probability/top-k summaries belong to the selected checkpoint,
+            # not to a sampling policy.  The sampled-frequency branch below
+            # independently loads the requested temperature bundle.
+            policy="best",
             asset=selected_asset,
             horizon=int(horizon),
             window_indices=window_indices,
@@ -11293,7 +11296,9 @@ def analyse_coarse_token_topk(
         saved = _analyse_saved_coarse_token_topk(
             run_dir,
             split=resolved_split,
-            policy=policy,
+            # Exact top-k IDs/probabilities are exported once from the best
+            # checkpoint.  Temperature policies contain sampled IDs instead.
+            policy="best",
             asset=resolved_asset,
             window_indices=window_indices,
             max_windows=max_windows,
