@@ -43,10 +43,12 @@ from src.models.modern_tcn_graph_round2_token import (
 from src.training.final_token_v2_specs import make_final_token_v2_specs
 from src.training.run_final_token_v2_experiment import (
     _decode_token_split,
-    _dense_token_targets,
+    _hybrid_dense_token_targets,
+    _train_token_epoch,
     _export_continuous_split,
     _export_token_split,
     _metadata,
+    _new_grad_scaler,
     _save_continuous_export,
     _save_token_export,
 )
@@ -211,6 +213,9 @@ def _small_dense_config(config: dict) -> dict:
     values["training"]["export_batch_size"] = 1
     values["training"]["num_workers"] = 0
     values["training"]["mixed_precision"] = False
+    if values["training"]["loss"].get("dense_origins", False):
+        values["training"]["loss"]["dense_auxiliary_horizons"] = [1, 2, 4]
+        values["training"]["loss"]["final_origin_future_steps"] = 4
     return values
 
 
@@ -286,10 +291,19 @@ def _test_specs() -> None:
         "softmax", "softmax", "sparsemax"
     ]:
         raise AssertionError("Dense Transformer activation schedule changed.")
-    if not dense["training"]["loss"]["dense_origins"]:
+    dense_loss = dense["training"]["loss"]
+    if not dense_loss["dense_origins"]:
         raise AssertionError("Dense token supervision is disabled.")
-    if dense["training"]["loss"]["future_steps_per_origin"] != 60:
-        raise AssertionError("Every dense origin must predict all 60 future steps.")
+    if dense_loss["dense_objective"] != (
+        "internal_five_horizons_plus_final_full_path"
+    ):
+        raise AssertionError("Dense token objective is not the hybrid contract.")
+    if dense_loss["dense_auxiliary_horizons"] != [1, 5, 15, 30, 60]:
+        raise AssertionError("Dense auxiliary horizons changed.")
+    if dense_loss["dense_auxiliary_weight"] != 1.0:
+        raise AssertionError("Dense auxiliary loss weight changed.")
+    if dense_loss["final_origin_future_steps"] != 60:
+        raise AssertionError("Final origin must predict all 60 future steps.")
 
     for kind in ("dimitri_v2_token", "dimitri_v2_continuous"):
         values = by_kind[kind].config
@@ -310,20 +324,40 @@ def _test_specs() -> None:
         "mean_top1_accuracy_over_all_60_future_steps"
     ):
         raise AssertionError("V2 token selection metric changed.")
+    v2_token_loss = by_kind["dimitri_v2_token"].config["training"]["loss"]
+    if v2_token_loss["dense_objective"] != (
+        "internal_five_horizons_plus_final_full_path"
+    ):
+        raise AssertionError("V2 token dense objective changed.")
+    if v2_token_loss["dense_auxiliary_horizons"] != [1, 5, 15, 30, 60]:
+        raise AssertionError("V2 token auxiliary horizons changed.")
+    if v2_token_loss["final_origin_future_steps"] != 60:
+        raise AssertionError("V2 token final path length changed.")
     if by_kind["dimitri_v2_continuous"].config["training"]["loss"][
         "horizon_weighting"
     ] != "inverse_reference_mae":
         raise AssertionError("V2 continuous weighted loss changed.")
 
 
-def _test_dense_targets() -> None:
+def _test_hybrid_dense_targets() -> None:
     context = torch.tensor([[[0], [1], [2], [3]]])
     future = torch.tensor([[[4], [5], [6], [7]]])
-    target = _dense_token_targets(context, future)
-    expected = torch.tensor(
-        [[[[1], [2], [3], [4]], [[2], [3], [4], [5]], [[3], [4], [5], [6]], [[4], [5], [6], [7]]]]
+    auxiliary, final_path = _hybrid_dense_token_targets(
+        context,
+        future,
+        auxiliary_horizons=(1, 2, 4),
     )
-    torch.testing.assert_close(target, expected)
+    expected_auxiliary = torch.tensor(
+        [
+            [
+                [[1], [2], [4]],
+                [[2], [3], [5]],
+                [[3], [4], [6]],
+            ]
+        ]
+    )
+    torch.testing.assert_close(auxiliary, expected_auxiliary)
+    torch.testing.assert_close(final_path, future)
 
 
 def _assert_row_stochastic(graph: Tensor) -> None:
@@ -355,6 +389,13 @@ def _test_dense_transformer() -> None:
     first_logits = model.future_predictor.forward_origin(initial.hidden, 1)
     second_logits = model.future_predictor.forward_origin(other.hidden, 1)
     torch.testing.assert_close(first_logits, second_logits, atol=2.0e-6, rtol=0.0)
+    auxiliary_logits = model.future_predictor.forward_origin(
+        initial.hidden,
+        1,
+        future_position_indices=(0, 1, 3),
+    )
+    if tuple(auxiliary_logits.shape) != (1, 3, 3, 1024):
+        raise AssertionError("Selected-position token head has the wrong shape.")
 
     target = torch.randint(0, 1024, (1, 4, 3))
     loss = torch.nn.functional.cross_entropy(first_logits.reshape(-1, 1024), target.reshape(-1))
@@ -369,6 +410,42 @@ def _test_dense_transformer() -> None:
             raise AssertionError("Dynamic graph key projection received no gradient.")
         if learner.raw_alpha.grad is None or block.spatial_gate.raw_beta.grad is None:
             raise AssertionError("Alpha or beta gate received no gradient.")
+
+
+def _test_hybrid_dense_training_step() -> None:
+    specs = {spec.model_kind: spec for spec in make_final_token_v2_specs()}
+    config = _small_dense_config(specs["dense_transformer_token"].config)
+    dataset = CachedTokenGraphDataset(_token_cache(), validate=False)
+    model = DenseTransformerTokenForecaster(
+        num_nodes=3,
+        context_length=4,
+        prediction_length=4,
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-4)
+    values = _train_token_epoch(
+        model=model,
+        kind="dense_transformer_token",
+        dataset=dataset,
+        config=config,
+        optimizer=optimizer,
+        scaler=_new_grad_scaler(False),
+        device=torch.device("cpu"),
+        epoch=1,
+    )
+    required = {
+        "training_objective",
+        "training_final_path_cross_entropy",
+        "training_final_path_top1_accuracy",
+        "training_dense_auxiliary_cross_entropy",
+        "training_dense_auxiliary_top1_accuracy",
+    }
+    if not required.issubset(values):
+        raise AssertionError(
+            "Hybrid dense training diagnostics are incomplete: "
+            f"{sorted(set(required).difference(values))}"
+        )
+    if not all(torch.isfinite(torch.tensor(float(values[key]))) for key in required):
+        raise AssertionError("Hybrid dense training produced a non-finite metric.")
 
 
 def _test_v2() -> None:
@@ -652,8 +729,9 @@ def _test_exports_and_graph_hub() -> None:
 
 def main() -> None:
     _test_specs()
-    _test_dense_targets()
+    _test_hybrid_dense_targets()
     _test_dense_transformer()
+    _test_hybrid_dense_training_step()
     _test_v2()
     _test_exports_and_graph_hub()
     print("Final token and BaseDyGraph-V2 comparison contracts passed.")

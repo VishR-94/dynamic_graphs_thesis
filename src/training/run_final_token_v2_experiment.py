@@ -11,12 +11,12 @@ Four model kinds are supported by one resumable runner:
 
 ``dense_transformer_token``
     Token counterpart of the winning D64/three-ST-block dense Transformer.
-    Every one of the 60 causal context origins predicts all 60 future coarse
-    tokens during training.  Public evaluation uses the final origin only.
+    Internal causal origins predict the five dissertation horizons, while the
+    final observed origin predicts the complete 60-step coarse-token path.
 
 ``dimitri_v2_token``
-    Dimitri's default four-block V2 backbone at context 60, with the same
-    dense 60-origin x 60-future-step coarse-token objective.
+    Dimitri's default four-block V2 backbone at context 60, using the same
+    hybrid dense-five plus final-sixty coarse-token objective.
 
 ``dimitri_v2_continuous``
     The same V2 backbone with a direct five-horizon price head applied at all
@@ -283,21 +283,58 @@ def _token_batch(batch: Mapping[str, Any], *, device: torch.device) -> tuple[Ten
     return context, target
 
 
-def _dense_token_targets(context: Tensor, future: Tensor) -> Tensor:
-    """Return [B,60 origins,60 future steps,N] causal targets."""
+def _hybrid_dense_token_targets(
+    context: Tensor,
+    future: Tensor,
+    *,
+    auxiliary_horizons: Sequence[int],
+) -> tuple[Tensor, Tensor]:
+    """Build hybrid dense-token targets without materialising a 60x60 cube.
+
+    Returns
+    -------
+    auxiliary_targets:
+        ``[B, T-1, H_aux, N]``.  Each internal causal origin predicts only
+        the configured dissertation horizons.
+    final_path_targets:
+        ``[B, P, N]``.  The final observed origin predicts the complete
+        ordered future path required by the frozen Kronos decoder.
+    """
     if context.ndim != 3 or future.ndim != 3:
         raise ValueError("context/future must have shape [B,T,N].")
-    if context.shape != future.shape:
-        raise ValueError("This final experiment requires 60 context and 60 future steps.")
+    if int(context.shape[0]) != int(future.shape[0]) or int(context.shape[2]) != int(future.shape[2]):
+        raise ValueError("Context and future batches/assets do not align.")
+
+    horizons = tuple(int(value) for value in auxiliary_horizons)
+    if not horizons or horizons != tuple(sorted(set(horizons))):
+        raise ValueError("Auxiliary horizons must be unique and increasing.")
+    if horizons[0] <= 0:
+        raise ValueError("Auxiliary horizons must be positive.")
+
+    context_steps = int(context.shape[1])
+    future_steps = int(future.shape[1])
+    internal_origins = context_steps - 1
+    if internal_origins <= 0:
+        raise ValueError("Dense auxiliary supervision requires at least two context steps.")
+    if horizons[-1] > future_steps:
+        raise ValueError("Auxiliary horizon exceeds the saved future path.")
+
     combined = torch.cat([context, future], dim=1)
-    steps = int(context.shape[1])
+    offsets = torch.as_tensor(horizons, device=context.device, dtype=torch.long)
     indices = (
-        torch.arange(steps, device=context.device)[:, None]
-        + torch.arange(1, steps + 1, device=context.device)[None]
+        torch.arange(internal_origins, device=context.device, dtype=torch.long)[:, None]
+        + offsets[None]
     )
-    return combined.index_select(1, indices.reshape(-1)).reshape(
-        int(context.shape[0]), steps, steps, int(context.shape[2])
+    if int(indices.max().item()) >= int(combined.shape[1]):
+        raise ValueError("Dense auxiliary target index exceeds context+future data.")
+
+    auxiliary = combined.index_select(1, indices.reshape(-1)).reshape(
+        int(context.shape[0]),
+        internal_origins,
+        len(horizons),
+        int(context.shape[2]),
     )
+    return auxiliary, future
 
 
 def _token_sums(logits: Tensor, target: Tensor, top_k_values: Sequence[int]) -> dict[str, Tensor]:
@@ -523,52 +560,169 @@ def _train_token_epoch(
         pin_memory=device.type == "cuda",
     )
     use_amp = bool(training["mixed_precision"]) and device.type == "cuda"
-    dense = bool(training["loss"].get("dense_origins", False))
+    loss_config = training["loss"]
+    dense = bool(loss_config.get("dense_origins", False))
     model.train()
-    ce_sum = correct_sum = count = 0.0
+
+    final_ce_sum = final_correct_sum = final_count = 0.0
+    auxiliary_ce_sum = auxiliary_correct_sum = auxiliary_count = 0.0
+    objective_sum = objective_weight = 0.0
+
     for batch in tqdm(loader, desc=f"train token epoch {epoch}", leave=False, dynamic_ncols=True):
         context, future = _token_batch(batch, device=device)
         optimizer.zero_grad(set_to_none=True)
+
         if not dense:
             with _autocast_context(device, use_amp):
-                logits, _ = _forward_token_final(model, kind, context, include_components=False)
-                loss = F.cross_entropy(logits.reshape(-1, 1024).float(), future.reshape(-1))
+                logits, _ = _forward_token_final(
+                    model, kind, context, include_components=False
+                )
+                loss = F.cross_entropy(
+                    logits.reshape(-1, 1024).float(), future.reshape(-1)
+                )
             scaler.scale(loss).backward()
             batch_count = int(future.numel())
-            ce_sum += float(loss.detach().item()) * batch_count
-            correct_sum += float(logits.argmax(dim=-1).eq(future).sum().item())
-            count += batch_count
+            final_ce_sum += float(loss.detach().item()) * batch_count
+            final_correct_sum += float(logits.argmax(dim=-1).eq(future).sum().item())
+            final_count += batch_count
+            objective_sum += float(loss.detach().item()) * int(context.shape[0])
+            objective_weight += int(context.shape[0])
         else:
+            objective_name = str(loss_config.get("dense_objective", ""))
+            if objective_name != "internal_five_horizons_plus_final_full_path":
+                raise ValueError(
+                    "Unsupported dense token objective: " + repr(objective_name)
+                )
+            auxiliary_horizons = tuple(
+                int(value) for value in loss_config["dense_auxiliary_horizons"]
+            )
+            auxiliary_weight = float(loss_config["dense_auxiliary_weight"])
+            if auxiliary_weight < 0.0:
+                raise ValueError("dense_auxiliary_weight must be non-negative.")
+            expected_final_steps = int(loss_config["final_origin_future_steps"])
+            if expected_final_steps != int(future.shape[1]):
+                raise ValueError(
+                    "Final-origin path length differs from the configured loss."
+                )
+
             with _autocast_context(device, use_amp):
-                backbone = model.forward_backbone(context, include_components=False) if kind == "dimitri_v2_token" else model.forward_backbone(context)
-            dense_target = _dense_token_targets(context, future)
-            origins = int(context.shape[1])
-            for origin in range(origins):
+                backbone = (
+                    model.forward_backbone(context, include_components=False)
+                    if kind == "dimitri_v2_token"
+                    else model.forward_backbone(context)
+                )
+                final_logits = model.future_predictor.forward_origin(
+                    backbone.hidden,
+                    int(context.shape[1]) - 1,
+                )
+                final_loss = F.cross_entropy(
+                    final_logits.reshape(-1, 1024).float(), future.reshape(-1)
+                )
+
+            auxiliary_target, final_target = _hybrid_dense_token_targets(
+                context,
+                future,
+                auxiliary_horizons=auxiliary_horizons,
+            )
+            # ``final_target`` is returned explicitly so the target contract is
+            # audited in one place rather than inferred independently here.
+            if not torch.equal(final_target, future):
+                raise AssertionError("Final-origin target path was altered.")
+
+            internal_origins = int(auxiliary_target.shape[1])
+            query_indices = torch.as_tensor(
+                [value - 1 for value in auxiliary_horizons],
+                device=context.device,
+                dtype=torch.long,
+            )
+
+            final_loss_value = float(final_loss.detach().item())
+            batch_final_count = int(final_target.numel())
+            final_ce_sum += final_loss_value * batch_final_count
+            final_correct_sum += float(
+                final_logits.argmax(dim=-1).eq(final_target).sum().item()
+            )
+            final_count += batch_final_count
+            del final_logits
+
+            auxiliary_losses: list[Tensor] = []
+            batch_auxiliary_loss_sum = 0.0
+            for origin in range(internal_origins):
                 with _autocast_context(device, use_amp):
-                    logits = model.future_predictor.forward_origin(backbone.hidden, origin)
-                    target = dense_target[:, origin]
-                    origin_loss = F.cross_entropy(
-                        logits.reshape(-1, 1024).float(), target.reshape(-1)
-                    ) / origins
-                scaler.scale(origin_loss).backward(retain_graph=origin < origins - 1)
-                raw_loss = float(origin_loss.detach().item()) * origins
+                    auxiliary_logits = model.future_predictor.forward_origin(
+                        backbone.hidden,
+                        origin,
+                        future_position_indices=query_indices,
+                    )
+                    target = auxiliary_target[:, origin]
+                    raw_auxiliary_loss = F.cross_entropy(
+                        auxiliary_logits.reshape(-1, 1024).float(),
+                        target.reshape(-1),
+                    )
+                auxiliary_losses.append(raw_auxiliary_loss)
+                raw_value = float(raw_auxiliary_loss.detach().item())
+                batch_auxiliary_loss_sum += raw_value
                 batch_count = int(target.numel())
-                ce_sum += raw_loss * batch_count
-                correct_sum += float(logits.argmax(dim=-1).eq(target).sum().item())
-                count += batch_count
-                del logits, target, origin_loss
+                auxiliary_ce_sum += raw_value * batch_count
+                auxiliary_correct_sum += float(
+                    auxiliary_logits.argmax(dim=-1).eq(target).sum().item()
+                )
+                auxiliary_count += batch_count
+                del auxiliary_logits, target
+
+            auxiliary_mean_loss = torch.stack(auxiliary_losses).mean()
+            objective_loss = final_loss + auxiliary_weight * auxiliary_mean_loss
+            batch_auxiliary_mean = batch_auxiliary_loss_sum / internal_origins
+            batch_objective = final_loss_value + (
+                auxiliary_weight * batch_auxiliary_mean
+            )
+            scaler.scale(objective_loss).backward()
+            objective_sum += batch_objective * int(context.shape[0])
+            objective_weight += int(context.shape[0])
+            del (
+                auxiliary_losses,
+                auxiliary_mean_loss,
+                objective_loss,
+                final_loss,
+                auxiliary_target,
+                final_target,
+                backbone,
+            )
+
         scaler.unscale_(optimizer)
         clip = training.get("gradient_clip_norm")
         if clip is not None and float(clip) > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(clip))
         scaler.step(optimizer)
         scaler.update()
-    if count <= 0:
-        raise RuntimeError("Token training produced no targets.")
-    return {
-        "training_mean_cross_entropy": ce_sum / count,
-        "training_mean_top1_accuracy": correct_sum / count,
+
+    if final_count <= 0 or objective_weight <= 0:
+        raise RuntimeError("Token training produced no final-path targets.")
+
+    result = {
+        "training_objective": objective_sum / objective_weight,
+        "training_mean_cross_entropy": final_ce_sum / final_count,
+        "training_mean_top1_accuracy": final_correct_sum / final_count,
+        "training_final_path_cross_entropy": final_ce_sum / final_count,
+        "training_final_path_top1_accuracy": final_correct_sum / final_count,
     }
+    if dense:
+        if auxiliary_count <= 0:
+            raise RuntimeError("Dense token training produced no auxiliary targets.")
+        result.update(
+            {
+                "training_dense_auxiliary_cross_entropy": (
+                    auxiliary_ce_sum / auxiliary_count
+                ),
+                "training_dense_auxiliary_top1_accuracy": (
+                    auxiliary_correct_sum / auxiliary_count
+                ),
+                "training_dense_auxiliary_weight": float(
+                    loss_config["dense_auxiliary_weight"]
+                ),
+            }
+        )
+    return result
 
 
 def _evaluate_token(
@@ -1516,6 +1670,18 @@ def _metadata(
         "epochs_completed": int(epochs_completed),
         "selection_split": "test",
         "selection_metric": str(config["training"]["selection_metric"]),
+        "dense_token_objective": config["training"].get("loss", {}).get(
+            "dense_objective"
+        ),
+        "dense_auxiliary_horizons": config["training"].get("loss", {}).get(
+            "dense_auxiliary_horizons"
+        ),
+        "dense_auxiliary_weight": config["training"].get("loss", {}).get(
+            "dense_auxiliary_weight"
+        ),
+        "final_origin_future_steps": config["training"].get("loss", {}).get(
+            "final_origin_future_steps"
+        ),
         "test_set_contaminated": True,
         "do_not_report": True,
         "trainable_parameters": parameter_count,

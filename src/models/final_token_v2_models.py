@@ -11,9 +11,10 @@ architectures:
   from :mod:`src.models.dense_transformer_depth_sweep`;
 * Dimitri's vendored BaseDyGraph-V2 backbone is executed unchanged through an
   architecture-only importer, avoiding the optional Lightning dependency;
-* token heads predict a complete 60-step coarse-s1 path from every causal
-  origin; the continuous V2 head predicts the five dissertation horizons from
-  every causal origin.
+* dense token heads use a hybrid objective: the five dissertation horizons
+  at internal causal origins and the complete 60-step coarse-s1 path at the
+  final forecast origin; the continuous V2 head predicts the five dissertation
+  horizons from every causal origin.
 
 Graph orientation is always ``A[target, source]``.
 """
@@ -266,25 +267,65 @@ class DenseOriginStructuredTokenPredictor(nn.Module):
             .reshape(batch * nodes, length, hidden)
         )
 
-    def forward_origin(self, hidden: Tensor, origin_index: int) -> Tensor:
+    def forward_origin(
+        self,
+        hidden: Tensor,
+        origin_index: int,
+        *,
+        future_position_indices: Sequence[int] | Tensor | None = None,
+    ) -> Tensor:
+        """Predict selected future positions from one causal origin.
+
+        ``future_position_indices`` uses zero-based indices into the shared
+        future-query bank.  ``None`` evaluates the complete ordered future
+        path.  Dense auxiliary supervision passes only the five dissertation
+        positions, while final-origin forecasting passes ``None`` and therefore
+        retains the complete 60-position path required by the frozen decoder.
+        """
         if hidden.ndim != 4:
             raise ValueError("hidden must have shape [B,T,N,D].")
         batch, steps, nodes, width = map(int, hidden.shape)
         origin = int(origin_index)
         if width != self.d_model or not 0 <= origin < steps:
             raise ValueError("Origin or hidden width is invalid.")
+
+        if future_position_indices is None:
+            position_indices = torch.arange(
+                self.prediction_length,
+                device=hidden.device,
+                dtype=torch.long,
+            )
+        else:
+            position_indices = torch.as_tensor(
+                future_position_indices,
+                device=hidden.device,
+                dtype=torch.long,
+            ).reshape(-1)
+            if int(position_indices.numel()) == 0:
+                raise ValueError("At least one future position is required.")
+            if (
+                int(position_indices.min().item()) < 0
+                or int(position_indices.max().item()) >= self.prediction_length
+            ):
+                raise ValueError("Future position index is out of range.")
+            if not bool(
+                torch.all(position_indices[1:] > position_indices[:-1]).item()
+            ):
+                raise ValueError(
+                    "Future position indices must be unique and increasing."
+                )
+
         memory_btnd = hidden[:, : origin + 1]
         memory = self._flatten_nodes(memory_btnd)
         summary = hidden[:, origin].reshape(batch * nodes, self.d_model)
-        positions = self.future_position_embedding(
-            torch.arange(self.prediction_length, device=hidden.device)
-        )
+        positions = self.future_position_embedding(position_indices)
         future = self.input_norm(summary[:, None] + positions[None])
         for layer in self.layers:
             future = layer(future, memory, self_attention_mask=None)
         logits = self.classifier(future)
+        selected_steps = int(position_indices.numel())
         return (
-            logits.reshape(batch, nodes, self.prediction_length, self.vocabulary_size)
+            logits.reshape(batch, nodes, selected_steps, self.vocabulary_size)
             .permute(0, 2, 1, 3)
             .contiguous()
         )

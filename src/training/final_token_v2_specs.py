@@ -299,8 +299,12 @@ def make_final_token_v2_specs(
                 "type": "coarse_s1_cross_entropy",
                 "horizon_weighting": "uniform",
                 "dense_origins": True,
-                "future_steps_per_origin": int(prediction_length),
-                "origin_chunk_size": 1,
+                "dense_objective": (
+                    "internal_five_horizons_plus_final_full_path"
+                ),
+                "dense_auxiliary_horizons": list(horizons),
+                "dense_auxiliary_weight": 1.0,
+                "final_origin_future_steps": int(prediction_length),
             },
         }
     )
@@ -341,7 +345,7 @@ def make_final_token_v2_specs(
                 "initial_beta": 0.5,
             },
             "future_predictor": {
-                "type": "structured_parallel_per_causal_origin",
+                "type": "hybrid_dense5_final60_structured_parallel",
                 "prediction_length": int(prediction_length),
                 "num_layers": 1,
                 "num_heads": 4,
@@ -394,8 +398,12 @@ def make_final_token_v2_specs(
             "type": "coarse_s1_cross_entropy",
             "horizon_weighting": "uniform",
             "dense_origins": True,
-            "future_steps_per_origin": int(prediction_length),
-            "origin_chunk_size": 1,
+            "dense_objective": (
+                "internal_five_horizons_plus_final_full_path"
+            ),
+            "dense_auxiliary_horizons": list(horizons),
+            "dense_auxiliary_weight": 1.0,
+            "final_origin_future_steps": int(prediction_length),
         },
     }
     v2_token_config: dict[str, Any] = {
@@ -430,7 +438,7 @@ def make_final_token_v2_specs(
                 "learnable": bool(v2_defaults["graph_prior_learnable"]),
             },
             "forecast_head": {
-                "type": "structured_parallel_per_causal_origin",
+                "type": "hybrid_dense5_final60_structured_parallel",
                 "prediction_length": int(prediction_length),
                 "vocabulary_size": int(vocabulary_size),
                 "num_layers": 1,
@@ -535,14 +543,20 @@ def make_final_token_v2_specs(
         ),
         _spec(
             model_kind="dense_transformer_token",
-            label="Winning D64 three-block dense Transformer in coarse-s1 space",
-            prefix="final_tok_dense_tr_d64_t4_g1_st3_uniform",
+            label=(
+                "Winning D64 three-block dense Transformer in coarse-s1 "
+                "space — dense five-horizon auxiliary plus final 60-step path"
+            ),
+            prefix="final_tok_dense5_final60_tr_d64_t4_g1_st3_uniform",
             config=dense_transformer_config,
         ),
         _spec(
             model_kind="dimitri_v2_token",
-            label="Dimitri BaseDyGraph-V2 defaults, dense coarse-s1 forecasting",
-            prefix="final_tok_dimitri_v2_c60_s15_dense60x60",
+            label=(
+                "Dimitri BaseDyGraph-V2 defaults — dense five-horizon "
+                "auxiliary plus final 60-step coarse-s1 path"
+            ),
+            prefix="final_tok_dimitri_v2_c60_s15_dense5_final60",
             config=v2_token_config,
         ),
         _spec(
