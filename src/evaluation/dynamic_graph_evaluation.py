@@ -87,6 +87,11 @@ from src.utils.metric_tables import (
     DEFAULT_SUMMARY_METRICS,
     make_evaluation_table,
 )
+from src.utils.company_profiles import (
+    make_asset_sector_mapping,
+    make_sector_group_order,
+    resolve_company_profiles_path,
+)
 from src.visualization.candle_plots import (
     compute_return_correlation_matrix,
     reorder_correlation_matrix,
@@ -9239,19 +9244,15 @@ def plot_selected_graph(
     labels = np.asarray(graph.adjacency.index, dtype=object)
     ordered_sectors: np.ndarray | None = None
     if cluster:
-        mapping = _asset_sector_mapping(
+        order, ordered_mapping = make_sector_group_order(
             tuple(str(value) for value in labels),
             company_profiles_path=company_profiles_path,
-        ).copy()
-        mapping["Original position"] = np.arange(len(mapping), dtype=np.int64)
-        mapping = mapping.sort_values(
-            ["Sector", "Ticker"],
-            kind="stable",
-        ).reset_index(drop=True)
-        order = mapping["Original position"].to_numpy(dtype=np.int64)
+        )
         matrix = matrix[np.ix_(order, order)]
         labels = labels[order]
-        ordered_sectors = mapping["Sector"].astype(str).to_numpy()
+        ordered_sectors = (
+            ordered_mapping["Sector"].astype(str).to_numpy()
+        )
     plotted_values = matrix.copy()
     if not graph.add_self_loops:
         np.fill_diagonal(plotted_values, np.nan)
@@ -9563,60 +9564,6 @@ def analyse_graph_entropy(
     )
 
 
-def resolve_company_profiles_path(path: str | Path | None = None) -> Path:
-    """Resolve ``company_profiles.csv`` on the author's Mac or in Colab."""
-
-    if path is not None:
-        resolved = Path(path).expanduser().resolve()
-        if not resolved.is_file():
-            raise FileNotFoundError(resolved)
-        return resolved
-    candidates = (
-        Path(
-            "/Users/vishalruparelia/Library/CloudStorage/"
-            "GoogleDrive-vishal@autonomous-fox.ai/My Drive/"
-            "dissertation/company_profiles.csv"
-        ),
-        Path("/content/drive/MyDrive/dissertation/company_profiles.csv"),
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    raise FileNotFoundError(
-        "Could not locate dissertation/company_profiles.csv. Checked:\n"
-        + "\n".join(f"  - {candidate}" for candidate in candidates)
-    )
-
-
-def _asset_sector_mapping(
-    assets: Sequence[str],
-    *,
-    company_profiles_path: str | Path | None,
-) -> pd.DataFrame:
-    path = resolve_company_profiles_path(company_profiles_path)
-    profiles = pd.read_csv(path)
-    if profiles.shape[1] < 6:
-        raise ValueError("company_profiles.csv must contain at least six columns.")
-    ticker_column = profiles.columns[0]
-    sector_column = profiles.columns[5]
-    selected = profiles[[ticker_column, sector_column]].copy()
-    selected.columns = ["Ticker", "Sector"]
-    selected["Ticker"] = selected["Ticker"].astype(str).str.upper().str.strip()
-    selected["Sector"] = selected["Sector"].astype(str).str.strip()
-    selected = selected.loc[selected["Ticker"].isin([str(value).upper() for value in assets])]
-    duplicated = selected.loc[selected["Ticker"].duplicated(keep=False), "Ticker"].unique()
-    if len(duplicated):
-        raise ValueError(f"Company profile contains duplicate project tickers: {list(duplicated)}")
-    mapping = selected.set_index("Ticker")["Sector"].to_dict()
-    missing = [str(asset) for asset in assets if str(asset).upper() not in mapping]
-    if missing:
-        raise ValueError(f"No sector was found for project assets: {missing}")
-    return pd.DataFrame(
-        {
-            "Ticker": [str(asset) for asset in assets],
-            "Sector": [mapping[str(asset).upper()] for asset in assets],
-        }
-    )
 
 
 def analyse_sector_graph(
@@ -9649,7 +9596,7 @@ def analyse_sector_graph(
         random_seed=random_seed,
         models_root=models_root,
     )
-    mapping = _asset_sector_mapping(
+    mapping = make_asset_sector_mapping(
         tuple(str(value) for value in graph.adjacency.index),
         company_profiles_path=company_profiles_path,
     )

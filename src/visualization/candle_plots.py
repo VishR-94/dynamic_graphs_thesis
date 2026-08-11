@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any,Sequence
 from datetime import datetime, time, timedelta
 import matplotlib.pyplot as plt
@@ -9,6 +10,7 @@ from matplotlib.figure import Figure
 from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.spatial.distance import squareform
 from src.data.load_candle_data import compute_log_returns, get_channel
+from src.utils.company_profiles import make_sector_group_order
 
 SplitDict = dict[str,Any]
 
@@ -236,17 +238,20 @@ def plot_return_correlation_heatmap(
         channel: str='close',
         sample_indices:int|Sequence[int]|slice|None=None,
         assets:str|int|Sequence[str|int]|None=None,
-        reorder:bool=False,
-        cluster_by_abs:bool=False,
+        cluster:bool=False,
+        company_profiles_path:str|Path|None=None,
         show_tickers:bool=True,
         max_tick_labels:int=93,
         figsize:tuple[float,float]|None=None,
         ax:Axes|None=None,
 )->tuple[Figure,Axes,np.ndarray,list[str]]:
-    """
-    Plot a cross-asset return correlation heatmap.
+    """Plot a cross-asset return-correlation heatmap.
 
-    If sample_indices=None, this computes correlation over all days in the split.
+    If ``sample_indices=None``, correlations are computed over every day in
+    the split. If ``cluster=True``, assets are displayed in exactly the same
+    fixed order as Graph Hub: sectors are sorted alphabetically and tickers
+    are sorted alphabetically within each sector using ``company_profiles``.
+    Clustering changes only the display order, not the correlation values.
     """
 
     corr,labels = compute_return_correlation_matrix(
@@ -255,14 +260,19 @@ def plot_return_correlation_heatmap(
         sample_indices=sample_indices,
         assets=assets
     )
-    
-    if reorder:
-        corr,labels,order = reorder_correlation_matrix(
-            corr,
-            labels=labels,
-            cluster_by_abs=cluster_by_abs
+
+    ordered_sectors:np.ndarray|None = None
+    if cluster:
+        order, ordered_mapping = make_sector_group_order(
+            labels,
+            company_profiles_path=company_profiles_path,
         )
-    
+        corr = corr[np.ix_(order, order)]
+        labels = [labels[index] for index in order]
+        ordered_sectors = (
+            ordered_mapping["Sector"].astype(str).to_numpy()
+        )
+
     num_assets = len(labels)
 
     if figsize is None:
@@ -277,19 +287,42 @@ def plot_return_correlation_heatmap(
         fig,ax = plt.subplots(figsize=figsize)
     else:
         fig = ax.figure
-    
+
     #imshow displays a 2D matrix as an image
-    image = ax.imshow(corr,vmin=-1.0,vmax=1.0,cmap="coolwarm",aspect="auto")
+    # Use a separate display matrix so the returned correlation matrix
+    # retains its true diagonal values of 1.0.
+    display_corr = corr.copy()
+
+    np.fill_diagonal(
+        display_corr,
+        np.nan,
+    )
+
+    correlation_cmap = plt.get_cmap(
+        "coolwarm"
+    ).copy()
+
+    correlation_cmap.set_bad(
+        color="white"
+    )
+
+    image = ax.imshow(
+        display_corr,
+        vmin=-1.0,
+        vmax=1.0,
+        cmap=correlation_cmap,
+        aspect="auto",
+    )
     fig.colorbar(image,ax=ax,fraction=0.046,pad=0.04)
-    title="Return Correlation Heatmap"
+    title="Return Correlation Heatmap "
 
     if sample_indices is None:
         title += "across all days"
     else:
         title += "for selected day(s)"
-    
-    if reorder:
-        title += "- reordered"
+
+    if cluster:
+        title += " — sector-grouped"
 
     if show_tickers and num_assets<=max_tick_labels:
         ax.set_xticks(np.arange(num_assets))
@@ -299,7 +332,16 @@ def plot_return_correlation_heatmap(
     else:
         ax.set_xticks([])
         ax.set_yticks([])
-    
+
+    if ordered_sectors is not None and len(ordered_sectors):
+        boundaries = (
+            np.flatnonzero(ordered_sectors[1:] != ordered_sectors[:-1]) + 1
+        )
+        for boundary in boundaries:
+            coordinate = float(boundary) - 0.5
+            ax.axhline(coordinate,color="black",linewidth=0.8,alpha=0.65)
+            ax.axvline(coordinate,color="black",linewidth=0.8,alpha=0.65)
+
     fig.tight_layout()
 
     return fig,ax,corr,labels
