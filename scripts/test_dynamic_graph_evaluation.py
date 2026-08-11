@@ -29,6 +29,7 @@ from src.evaluation.dynamic_graph_evaluation import (
     make_model_metric_comparison,
     make_predictive_coverage_report,
     make_evaluation_window_table,
+    plot_realised_volatility,
     plot_point_forecast_comparison,
     plot_point_forecast_example,
     plot_training_diagnostics,
@@ -120,6 +121,51 @@ def _graph_values(dynamic: bool = True) -> torch.Tensor:
         ],
         dim=0,
     ).unsqueeze(1)
+
+
+def _volatility_split() -> dict:
+    """Small cleaned candle split for realised-volatility plotting tests."""
+
+    assets = ["AAA", "BBB"]
+    channels = ["open", "high", "low", "close", "volume", "amount"]
+    samples = []
+
+    for day_index, day in enumerate(("2024-09-03", "2024-09-04")):
+        steps = 8
+        close = torch.empty(steps, len(assets), dtype=torch.float32)
+        close[0] = torch.tensor([100.0, 50.0])
+
+        returns = torch.tensor(
+            [
+                [0.0010, -0.0010],
+                [0.0020, 0.0015],
+                [-0.0010, 0.0005],
+                [0.0030, -0.0020],
+                [-0.0020, 0.0010],
+                [0.0015, 0.0020],
+                [0.0005, -0.0015],
+            ],
+            dtype=torch.float32,
+        )
+        returns = returns + day_index * 0.0001
+
+        for index in range(1, steps):
+            close[index] = close[index - 1] * torch.exp(returns[index - 1])
+
+        x = torch.zeros(steps, len(assets), len(channels), dtype=torch.float32)
+        for channel_index in range(4):
+            x[:, :, channel_index] = close
+        x[:, :, 4] = 1_000.0
+        x[:, :, 5] = 0.0
+        samples.append((x, None, day))
+
+    return {
+        "samples": samples,
+        "asset_cols": assets,
+        "channels": channels,
+        "market_open": "09:30",
+        "market_close": "16:00",
+    }
 
 
 def _graphs(graph_type: str, orientation: str = "A[target, source]") -> dict:
@@ -1145,11 +1191,76 @@ def main() -> None:
         random_graph.adjacency_figure.clf()
         random_graph.frequency_figure.clf()
 
-        entropy_report = analyse_graph_entropy(dynamic, split="train")
+        entropy_report = analyse_graph_entropy(
+            dynamic,
+            split="train",
+            aggregation="mean_window_entropy",
+        )
+        assert entropy_report.aggregation == "mean_window_entropy"
+        assert entropy_report.plot_granularity == "day"
         assert len(entropy_report.day_values) == 2
         assert len(entropy_report.asset_summary) == len(ASSETS)
         assert entropy_report.day_summary["Highest-entropy day"].notna().all()
+
+        entropy_of_daily_mean = analyse_graph_entropy(
+            dynamic,
+            split="train",
+            aggregation="entropy_of_mean_adjacency",
+        )
+        assert entropy_of_daily_mean.aggregation == "entropy_of_mean_adjacency"
+        assert entropy_of_daily_mean.plot_granularity == "day"
+        np.testing.assert_array_less(
+            entropy_report.day_values["Daily mean row entropy"].to_numpy()
+            - 1.0e-12,
+            entropy_of_daily_mean.day_values[
+                "Daily mean row entropy"
+            ].to_numpy(),
+        )
+
+        intraday_entropy = analyse_graph_entropy(
+            dynamic,
+            split="train",
+            aggregation="mean_window_entropy",
+            average_over_all_days=True,
+        )
+        assert intraday_entropy.plot_granularity == "intraday_average"
+        assert intraday_entropy.average_over_all_days
+        assert intraday_entropy.selected_day is None
+        assert len(intraday_entropy.day_values) == 2
+        assert intraday_entropy.day_values["Days"].tolist() == [2, 2]
+        assert intraday_entropy.day_values["Window within date"].tolist() == [1, 2]
+
+        intraday_entropy_of_mean = analyse_graph_entropy(
+            dynamic,
+            split="train",
+            aggregation="entropy_of_mean_adjacency",
+            average_over_all_days=True,
+        )
+        assert intraday_entropy_of_mean.plot_granularity == "intraday_average"
+        np.testing.assert_array_less(
+            intraday_entropy.day_values["Mean row entropy"].to_numpy()
+            - 1.0e-12,
+            intraday_entropy_of_mean.day_values["Mean row entropy"].to_numpy(),
+        )
+
+        one_day_entropy = analyse_graph_entropy(
+            dynamic,
+            split="validation",
+            day="2024-09-03",
+            aggregation="entropy_of_mean_adjacency",
+            average_over_all_days=True,
+        )
+        assert one_day_entropy.plot_granularity == "window"
+        assert not one_day_entropy.average_over_all_days
+        assert one_day_entropy.selected_day == "2024-09-03"
+        assert len(one_day_entropy.day_values) == 2
+        assert "Mean row entropy" in one_day_entropy.day_values
+
         entropy_report.figure.clf()
+        entropy_of_daily_mean.figure.clf()
+        intraday_entropy.figure.clf()
+        intraday_entropy_of_mean.figure.clf()
+        one_day_entropy.figure.clf()
 
         sector_report = analyse_sector_graph(
             dynamic,
@@ -1163,8 +1274,66 @@ def main() -> None:
         np.testing.assert_allclose(
             sector_report.sector_adjacency.sum(axis=1).to_numpy(), 1.0
         )
+        assert len(sector_report.asset_sector_axes.get_yticks()) == 0
+        assert any(
+            text.get_text() == "Target asset"
+            for text in sector_report.asset_sector_figure.texts
+        )
         sector_report.sector_figure.clf()
         sector_report.asset_sector_figure.clf()
+
+        volatility_split = _volatility_split()
+        volatility_figure, _, volatility_values = plot_realised_volatility(
+            volatility_split,
+            asset="AAA",
+            day="2024-09-03",
+            average_over_all_days=True,
+            window_minutes=3,
+        )
+        assert len(volatility_values) == 5
+        assert volatility_values["Date"].nunique() == 1
+        assert volatility_values["Asset"].unique().tolist() == ["AAA"]
+        assert not volatility_values["Average over all days"].any()
+        assert volatility_values.iloc[0]["Timestamp"].strftime("%H:%M") == "09:34"
+        volatility_figure.clf()
+
+        mean_volatility_figure, _, mean_volatility_values = (
+            plot_realised_volatility(
+                volatility_split,
+                asset=None,
+                day=("2024-09-03", "2024-09-04"),
+                window_minutes=3,
+            )
+        )
+        assert len(mean_volatility_values) == 10
+        assert mean_volatility_values["Date"].nunique() == 2
+        assert mean_volatility_values["Asset"].unique().tolist() == [
+            "Cross-asset mean"
+        ]
+        mean_volatility_figure.clf()
+
+        averaged_volatility_figure, _, averaged_volatility_values = (
+            plot_realised_volatility(
+                volatility_split,
+                asset=None,
+                day=None,
+                average_over_all_days=True,
+                window_minutes=3,
+            )
+        )
+        assert len(averaged_volatility_values) == 5
+        assert averaged_volatility_values["Date"].unique().tolist() == [
+            "Average across all days"
+        ]
+        assert averaged_volatility_values["Sessions averaged"].tolist() == [
+            2, 2, 2, 2, 2
+        ]
+        assert averaged_volatility_values["Average over all days"].all()
+        assert (
+            averaged_volatility_values.iloc[0]["Timestamp"].strftime("%H:%M")
+            == "09:34"
+        )
+        averaged_volatility_figure.clf()
 
         forecast_report = plot_point_forecast_comparison(
             models,

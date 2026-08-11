@@ -41,7 +41,7 @@ Current public API
 
 from __future__ import annotations
 
-EVALUATION_MODULE_VERSION = "2026-08-05-v11-final-graph-hub"
+EVALUATION_MODULE_VERSION = "2026-08-11-v13-intraday-averages"
 
 import json
 import re
@@ -94,6 +94,7 @@ from src.utils.company_profiles import (
 )
 from src.visualization.candle_plots import (
     compute_return_correlation_matrix,
+    plot_realised_volatility,
     reorder_correlation_matrix,
 )
 
@@ -117,6 +118,10 @@ NeighbourDirection = Literal[
     "impacts",
 ]
 HeadSelection = int | Literal["mean"]
+GraphEntropyAggregation = Literal[
+    "mean_window_entropy",
+    "entropy_of_mean_adjacency",
+]
 
 
 @dataclass(frozen=True)
@@ -8704,8 +8709,12 @@ class GraphAnalysisReport:
 
 @dataclass(frozen=True)
 class GraphEntropyReport:
-    """Dynamic-graph row entropy across dates and target assets."""
+    """Dynamic-graph row entropy across dates/windows and target assets."""
 
+    aggregation: GraphEntropyAggregation
+    plot_granularity: Literal["day", "window", "intraday_average"]
+    selected_day: str | None
+    average_over_all_days: bool
     day_values: pd.DataFrame
     day_summary: pd.DataFrame
     asset_summary: pd.DataFrame
@@ -9314,8 +9323,8 @@ def plot_selected_graph(
         f"{graph.run_name} — {graph.split} / {graph.policy}\n"
         f"{graph.selection_description}{time_text}"
         f"{' — sector-grouped' if cluster else ''}\n"
-        f"entropy of displayed adjacency={graph.displayed_mean_row_entropy:.4f}; "
-        f"mean window entropy={graph.mean_window_row_entropy:.4f}"
+        f"H(mean adjacency)={graph.displayed_mean_row_entropy:.4f}; "
+        f"mean H(window adjacency)={graph.mean_window_row_entropy:.4f}"
         f"{cap_text}"
     )
     colourbar = figure.colorbar(image, ax=axes, fraction=0.046, pad=0.03)
@@ -9432,13 +9441,41 @@ def analyse_graph(
     )
 
 
+def _graph_row_entropy(adjacency: Tensor) -> Tensor:
+    """Return row entropy for ``[..., target, source]`` adjacency tensors."""
+
+    probabilities = adjacency.to(torch.float64)
+
+    if torch.any(probabilities < 0.0):
+        raise ValueError("Graph adjacency contains negative weights.")
+
+    row_mass = probabilities.sum(dim=-1)
+
+    if not torch.allclose(
+        row_mass,
+        torch.ones_like(row_mass),
+        atol=2.0e-5,
+        rtol=0.0,
+    ):
+        raise ValueError("Graph adjacency rows must sum to one before entropy analysis.")
+
+    terms = torch.where(
+        probabilities > 0.0,
+        probabilities * probabilities.clamp_min(1.0e-12).log(),
+        torch.zeros_like(probabilities),
+    )
+
+    return -terms.sum(dim=-1)
+
+
 def analyse_graph_entropy(
     model: str | Path,
     *,
     split: EvaluationSplitInput | str = "validation",
     policy: str | None = None,
     day: str | None = None,
-    window: int | str | None = None,
+    aggregation: GraphEntropyAggregation = "mean_window_entropy",
+    average_over_all_days: bool = False,
     component: GraphComponent = "selected",
     layer: int = -1,
     head: HeadSelection = "mean",
@@ -9446,96 +9483,510 @@ def analyse_graph_entropy(
     models_root: str | Path | None = None,
     figsize: tuple[float, float] = (14.0, 5.5),
 ) -> GraphEntropyReport:
-    """Summarise row-entropy variation across dates and target assets."""
+    """Plot graph row entropy by day, within one day, or by intraday slot.
+
+    With ``day=None`` and ``average_over_all_days=False``, the plot contains
+    one entropy value per day. ``aggregation`` controls the order of the
+    window average and the nonlinear entropy calculation:
+
+    ``"mean_window_entropy"``
+        Calculate row entropy for every saved graph/window first, then average
+        entropy across windows and target assets within each day:
+        ``mean_w mean_i H(A[d,w,i,:])``.
+
+    ``"entropy_of_mean_adjacency"``
+        Average all saved adjacency matrices within each day first, calculate
+        row entropy of that daily mean adjacency, then average across targets:
+        ``mean_i H(mean_w A[d,w,i,:])``.
+
+    With ``day=None`` and ``average_over_all_days=True``, the plot instead
+    contains one value for each within-day graph-window position, averaged
+    across all selected days. The same ``aggregation`` choice is respected,
+    but the averaging axis is now days at a fixed intraday window:
+
+    ``"mean_window_entropy"``
+        ``mean_d mean_i H(A[d,w,i,:])``.
+
+    ``"entropy_of_mean_adjacency"``
+        ``mean_i H(mean_d A[d,w,i,:])``.
+
+    This produces an average intraday entropy profile aligned by the saved
+    one-based ``Window within date`` index and forecast-origin bar-close time.
+
+    With an exact ``day`` (or ``day="random"``), neither daily aggregation nor
+    across-day averaging is applied. The plot shows one entropy value for each
+    saved graph/window on that day, ordered by forecast origin. In that case,
+    ``aggregation`` and ``average_over_all_days`` do not alter the calculation.
+
+    If ``head="mean"``, graph heads are averaged within every window before
+    all entropy calculations, matching the Graph Hub adjacency convention.
+    """
+
+    if aggregation not in {
+        "mean_window_entropy",
+        "entropy_of_mean_adjacency",
+    }:
+        raise ValueError(
+            "aggregation must be 'mean_window_entropy' or "
+            "'entropy_of_mean_adjacency'."
+        )
 
     graph = select_graph(
         model,
         split=split,
         policy=policy,
         day=day,
-        window=window,
+        window=None,
         component=component,
         layer=layer,
         head=head,
         random_seed=random_seed,
         models_root=models_root,
     )
-    entropy = -(
-        graph.per_window_adjacency.clamp_min(1.0e-12)
-        * graph.per_window_adjacency.clamp_min(1.0e-12).log()
-    ).sum(dim=-1)
-    records: list[dict[str, Any]] = []
+
+    selected_windows = graph.selected_windows.reset_index(drop=True).copy()
+
+    if selected_windows["Date"].isna().any():
+        raise ValueError(
+            "Graph entropy analysis requires saved date metadata for every "
+            "selected window."
+        )
+
+    per_window_adjacency = graph.per_window_adjacency.detach().cpu()
+    per_window_entropy = _graph_row_entropy(per_window_adjacency)
     assets = tuple(str(value) for value in graph.adjacency.index)
-    for local_index, row in graph.selected_windows.reset_index(drop=True).iterrows():
+
+    if tuple(per_window_entropy.shape) != (
+        len(selected_windows),
+        len(assets),
+    ):
+        raise AssertionError(
+            "Unexpected graph-entropy tensor shape. "
+            f"Observed {tuple(per_window_entropy.shape)}."
+        )
+
+    detailed_records: list[dict[str, Any]] = []
+
+    for local_index, row in selected_windows.iterrows():
         for asset_index, asset in enumerate(assets):
-            records.append(
+            detailed_records.append(
                 {
-                    "Date": row["Date"],
+                    "Date": str(row["Date"]),
                     "Window within date": int(row["Window within date"]),
                     "Global window index": int(row["Global window index"]),
+                    "Forecast origin time": row["Forecast origin time"],
+                    "Time window": row["Time window"],
                     "Asset": asset,
-                    "Row entropy": float(entropy[local_index, asset_index].item()),
+                    "Row entropy": float(
+                        per_window_entropy[local_index, asset_index].item()
+                    ),
                 }
             )
-    detailed = pd.DataFrame(records)
-    if detailed["Date"].isna().any():
-        raise ValueError(
-            "Daily entropy analysis requires saved date metadata for every selected window."
+
+    detailed = pd.DataFrame(detailed_records)
+
+    def _asset_summary(values: pd.DataFrame) -> pd.DataFrame:
+        return (
+            values.groupby("Asset", as_index=False)["Row entropy"]
+            .agg(
+                **{
+                    "Mean row entropy": "mean",
+                    "Lower quartile row entropy": lambda series: series.quantile(
+                        0.25
+                    ),
+                    "Upper quartile row entropy": lambda series: series.quantile(
+                        0.75
+                    ),
+                }
+            )
+            .sort_values("Mean row entropy")
+            .reset_index(drop=True)
         )
-    day_values = (
-        detailed.groupby("Date", as_index=False)
-        .agg(
-            **{
-                "Windows": ("Global window index", "nunique"),
-                "Daily mean row entropy": ("Row entropy", "mean"),
+
+    def _origin_label(row: pd.Series) -> str:
+        origin = row.get("Forecast origin time")
+        if pd.notna(origin):
+            return str(origin)
+        return f"window {int(row['Window within date'])}"
+
+    # Exact-day mode: one point for every saved graph/window on that day.
+    if graph.resolved_day is not None:
+        window_values = selected_windows[
+            [
+                "Date",
+                "Window within date",
+                "Global window index",
+                "Forecast origin time",
+                "Time window",
+            ]
+        ].copy()
+        window_values["Mean row entropy"] = per_window_entropy.mean(
+            dim=-1
+        ).numpy()
+        window_values["Aggregation"] = (
+            "Per-window entropy (exact day; no cross-window aggregation)"
+        )
+
+        entropy_series = window_values["Mean row entropy"]
+        minimum_row = window_values.loc[entropy_series.idxmin()]
+        maximum_row = window_values.loc[entropy_series.idxmax()]
+
+        day_summary = pd.DataFrame(
+            [
+                {
+                    "Selected split": graph.split,
+                    "Selection": graph.selection_description,
+                    "Requested daily aggregation": aggregation,
+                    "Requested average over all days": bool(
+                        average_over_all_days
+                    ),
+                    "Plot granularity": "window",
+                    "Selected day": graph.resolved_day,
+                    "Windows": len(window_values),
+                    "Mean window row entropy": float(entropy_series.mean()),
+                    "Lower quartile window row entropy": float(
+                        entropy_series.quantile(0.25)
+                    ),
+                    "Upper quartile window row entropy": float(
+                        entropy_series.quantile(0.75)
+                    ),
+                    "Lowest-entropy window": _origin_label(minimum_row),
+                    "Lowest window row entropy": float(
+                        minimum_row["Mean row entropy"]
+                    ),
+                    "Highest-entropy window": _origin_label(maximum_row),
+                    "Highest window row entropy": float(
+                        maximum_row["Mean row entropy"]
+                    ),
+                }
+            ]
+        )
+
+        figure, axes = plt.subplots(figsize=figsize)
+        positions = np.arange(len(window_values))
+        axes.plot(
+            positions,
+            window_values["Mean row entropy"],
+            linewidth=1.7,
+            marker="o",
+            markersize=4.0,
+        )
+        origin_labels = [
+            _origin_label(row)
+            for _, row in window_values.iterrows()
+        ]
+        tick_stride = max(1, int(np.ceil(len(origin_labels) / 20)))
+        tick_positions = positions[::tick_stride]
+        axes.set_xticks(tick_positions)
+        axes.set_xticklabels(
+            [origin_labels[index] for index in tick_positions],
+            rotation=45,
+            ha="right",
+        )
+        axes.set_xlabel("Forecast-origin bar-close time")
+        axes.set_ylabel("Mean row entropy of each window graph (nats)")
+        axes.set_title(
+            f"{graph.run_name} — graph entropy within {graph.resolved_day} — "
+            f"{graph.split} / {graph.policy}\n"
+            f"{graph.selection_description}"
+        )
+        axes.grid(True, alpha=0.25)
+        figure.tight_layout()
+
+        return GraphEntropyReport(
+            aggregation=aggregation,
+            plot_granularity="window",
+            selected_day=graph.resolved_day,
+            average_over_all_days=False,
+            day_values=window_values,
+            day_summary=day_summary,
+            asset_summary=_asset_summary(detailed),
+            window_asset_entropy=detailed,
+            figure=figure,
+            axes=axes,
+        )
+
+    aggregation_label = (
+        "Mean window-specific entropy"
+        if aggregation == "mean_window_entropy"
+        else "Entropy of mean adjacency"
+    )
+
+    # Across-day intraday profile: one point per within-session graph window.
+    if average_over_all_days:
+        slot_records: list[dict[str, Any]] = []
+        slot_asset_records: list[dict[str, Any]] = []
+
+        for window_number, slot_rows in selected_windows.groupby(
+            "Window within date",
+            sort=True,
+        ):
+            local_indices = torch.as_tensor(
+                slot_rows.index.to_numpy(dtype=np.int64),
+                dtype=torch.long,
+            )
+
+            if aggregation == "mean_window_entropy":
+                row_entropy = per_window_entropy.index_select(
+                    0,
+                    local_indices,
+                ).mean(dim=0)
+                applied_label = "Mean window entropy across days"
+            else:
+                mean_adjacency = per_window_adjacency.index_select(
+                    0,
+                    local_indices,
+                ).mean(dim=0)
+                row_entropy = _graph_row_entropy(mean_adjacency)
+                applied_label = "Entropy of mean adjacency across days"
+
+            origin_values = tuple(
+                str(value)
+                for value in slot_rows["Forecast origin time"]
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            time_window_values = tuple(
+                str(value)
+                for value in slot_rows["Time window"]
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            origin_value = (
+                origin_values[0]
+                if len(origin_values) == 1
+                else None
+            )
+            time_window_value = (
+                time_window_values[0]
+                if len(time_window_values) == 1
+                else None
+            )
+
+            slot_records.append(
+                {
+                    "Window within date": int(window_number),
+                    "Forecast origin time": origin_value,
+                    "Time window": time_window_value,
+                    "Days": int(slot_rows["Date"].nunique()),
+                    "Windows": len(slot_rows),
+                    "Mean row entropy": float(row_entropy.mean().item()),
+                    "Aggregation": applied_label,
+                }
+            )
+
+            for asset_index, asset in enumerate(assets):
+                slot_asset_records.append(
+                    {
+                        "Window within date": int(window_number),
+                        "Forecast origin time": origin_value,
+                        "Asset": asset,
+                        "Row entropy": float(row_entropy[asset_index].item()),
+                        "Aggregation": applied_label,
+                    }
+                )
+
+        intraday_values = (
+            pd.DataFrame(slot_records)
+            .sort_values("Window within date")
+            .reset_index(drop=True)
+        )
+        intraday_asset_values = pd.DataFrame(slot_asset_records)
+        entropy_series = intraday_values["Mean row entropy"]
+        minimum_row = intraday_values.loc[entropy_series.idxmin()]
+        maximum_row = intraday_values.loc[entropy_series.idxmax()]
+
+        day_summary = pd.DataFrame(
+            [
+                {
+                    "Selected split": graph.split,
+                    "Selection": graph.selection_description,
+                    "Aggregation": intraday_values.loc[0, "Aggregation"],
+                    "Plot granularity": "intraday_average",
+                    "Days": int(selected_windows["Date"].nunique()),
+                    "Intraday window positions": len(intraday_values),
+                    "Selected windows": len(selected_windows),
+                    "Mean intraday-profile row entropy": float(
+                        entropy_series.mean()
+                    ),
+                    "Lower quartile intraday-profile row entropy": float(
+                        entropy_series.quantile(0.25)
+                    ),
+                    "Upper quartile intraday-profile row entropy": float(
+                        entropy_series.quantile(0.75)
+                    ),
+                    "Lowest-entropy intraday window": _origin_label(
+                        minimum_row
+                    ),
+                    "Lowest intraday row entropy": float(
+                        minimum_row["Mean row entropy"]
+                    ),
+                    "Highest-entropy intraday window": _origin_label(
+                        maximum_row
+                    ),
+                    "Highest intraday row entropy": float(
+                        maximum_row["Mean row entropy"]
+                    ),
+                }
+            ]
+        )
+
+        figure, axes = plt.subplots(figsize=figsize)
+        positions = np.arange(len(intraday_values))
+        axes.plot(
+            positions,
+            intraday_values["Mean row entropy"],
+            linewidth=1.7,
+            marker="o",
+            markersize=4.0,
+        )
+        origin_labels = [
+            _origin_label(row)
+            for _, row in intraday_values.iterrows()
+        ]
+        tick_stride = max(1, int(np.ceil(len(origin_labels) / 20)))
+        tick_positions = positions[::tick_stride]
+        axes.set_xticks(tick_positions)
+        axes.set_xticklabels(
+            [origin_labels[index] for index in tick_positions],
+            rotation=45,
+            ha="right",
+        )
+        axes.set_xlabel(
+            "Forecast-origin bar-close time (aligned across days)"
+        )
+        axes.set_ylabel("Across-day mean row entropy (nats)")
+        axes.set_title(
+            f"{graph.run_name} — average intraday graph entropy — "
+            f"{graph.split} / {graph.policy}\n"
+            f"{aggregation_label.lower()} across days; "
+            f"{graph.selection_description}"
+        )
+        axes.grid(True, alpha=0.25)
+        figure.tight_layout()
+
+        return GraphEntropyReport(
+            aggregation=aggregation,
+            plot_granularity="intraday_average",
+            selected_day=None,
+            average_over_all_days=True,
+            day_values=intraday_values,
+            day_summary=day_summary,
+            asset_summary=_asset_summary(intraday_asset_values),
+            window_asset_entropy=detailed,
+            figure=figure,
+            axes=axes,
+        )
+
+    # Daily time series: one value per day using the requested aggregation.
+    daily_records: list[dict[str, Any]] = []
+    daily_asset_records: list[dict[str, Any]] = []
+
+    for date_value, date_rows in selected_windows.groupby(
+        "Date",
+        sort=True,
+    ):
+        local_indices = torch.as_tensor(
+            date_rows.index.to_numpy(dtype=np.int64),
+            dtype=torch.long,
+        )
+
+        if aggregation == "mean_window_entropy":
+            row_entropy = per_window_entropy.index_select(
+                0,
+                local_indices,
+            ).mean(dim=0)
+            applied_label = "Mean window-specific entropy"
+        else:
+            daily_mean_adjacency = per_window_adjacency.index_select(
+                0,
+                local_indices,
+            ).mean(dim=0)
+            row_entropy = _graph_row_entropy(daily_mean_adjacency)
+            applied_label = "Entropy of daily mean adjacency"
+
+        daily_records.append(
+            {
+                "Date": str(date_value),
+                "Windows": len(date_rows),
+                "Daily mean row entropy": float(row_entropy.mean().item()),
+                "Aggregation": applied_label,
             }
         )
+
+        for asset_index, asset in enumerate(assets):
+            daily_asset_records.append(
+                {
+                    "Date": str(date_value),
+                    "Asset": asset,
+                    "Row entropy": float(row_entropy[asset_index].item()),
+                    "Aggregation": applied_label,
+                }
+            )
+
+    day_values = (
+        pd.DataFrame(daily_records)
         .sort_values("Date")
         .reset_index(drop=True)
     )
+    daily_asset_values = pd.DataFrame(daily_asset_records)
     daily_series = day_values["Daily mean row entropy"]
     minimum_row = day_values.loc[daily_series.idxmin()]
     maximum_row = day_values.loc[daily_series.idxmax()]
+
     day_summary = pd.DataFrame(
         [
             {
                 "Selected split": graph.split,
                 "Selection": graph.selection_description,
+                "Aggregation": day_values.loc[0, "Aggregation"],
+                "Plot granularity": "day",
                 "Days": len(day_values),
+                "Selected windows": len(selected_windows),
                 "Mean of daily average row entropy": float(daily_series.mean()),
-                "Lower quartile of daily average row entropy": float(daily_series.quantile(0.25)),
-                "Upper quartile of daily average row entropy": float(daily_series.quantile(0.75)),
+                "Lower quartile of daily average row entropy": float(
+                    daily_series.quantile(0.25)
+                ),
+                "Upper quartile of daily average row entropy": float(
+                    daily_series.quantile(0.75)
+                ),
                 "Lowest-entropy day": str(minimum_row["Date"]),
-                "Lowest daily average row entropy": float(minimum_row["Daily mean row entropy"]),
+                "Lowest daily average row entropy": float(
+                    minimum_row["Daily mean row entropy"]
+                ),
                 "Highest-entropy day": str(maximum_row["Date"]),
-                "Highest daily average row entropy": float(maximum_row["Daily mean row entropy"]),
+                "Highest daily average row entropy": float(
+                    maximum_row["Daily mean row entropy"]
+                ),
             }
         ]
-    )
-    asset_summary = (
-        detailed.groupby("Asset", as_index=False)["Row entropy"]
-        .agg(
-            **{
-                "Mean row entropy": "mean",
-                "Lower quartile row entropy": lambda values: values.quantile(0.25),
-                "Upper quartile row entropy": lambda values: values.quantile(0.75),
-            }
-        )
-        .sort_values("Mean row entropy")
-        .reset_index(drop=True)
     )
 
     figure, axes = plt.subplots(figsize=figsize)
     dates = pd.to_datetime(day_values["Date"])
     positions = np.arange(len(day_values))
-    axes.plot(positions, day_values["Daily mean row entropy"], linewidth=1.7)
+    axes.plot(
+        positions,
+        day_values["Daily mean row entropy"],
+        linewidth=1.7,
+    )
     month_keys = dates.dt.to_period("M")
     tick_positions: list[int] = []
     tick_labels: list[str] = []
     seen: set[str] = set()
     unique_month_periods = pd.Series(month_keys.drop_duplicates().tolist())
-    repeated_month_names = unique_month_periods.astype(str).str[5:7].duplicated(keep=False).any()
-    for position, (date_value, month_key) in enumerate(zip(dates, month_keys, strict=True)):
+    repeated_month_names = (
+        unique_month_periods.astype(str)
+        .str[5:7]
+        .duplicated(keep=False)
+        .any()
+    )
+
+    for position, (date_value, month_key) in enumerate(
+        zip(dates, month_keys, strict=True)
+    ):
         key = str(month_key)
         if key in seen:
             continue
@@ -9544,27 +9995,31 @@ def analyse_graph_entropy(
         tick_labels.append(
             date_value.strftime("%b %Y" if repeated_month_names else "%b")
         )
+
     axes.set_xticks(tick_positions)
     axes.set_xticklabels(tick_labels)
     axes.set_xlabel("Date (label shown at first saved day of each month)")
-    axes.set_ylabel("Daily average row entropy (nats)")
+    axes.set_ylabel("Daily mean row entropy (nats)")
     axes.set_title(
-        f"{graph.run_name} — daily graph entropy — {graph.split} / {graph.policy}\n"
+        f"{graph.run_name} — daily graph entropy — {graph.split} / "
+        f"{graph.policy}\n{aggregation_label.lower()}; "
         f"{graph.selection_description}"
     )
     axes.grid(True, alpha=0.25)
     figure.tight_layout()
+
     return GraphEntropyReport(
+        aggregation=aggregation,
+        plot_granularity="day",
+        selected_day=None,
+        average_over_all_days=False,
         day_values=day_values,
         day_summary=day_summary,
-        asset_summary=asset_summary,
+        asset_summary=_asset_summary(daily_asset_values),
         window_asset_entropy=detailed,
         figure=figure,
         axes=axes,
     )
-
-
-
 
 def analyse_sector_graph(
     model: str | Path,
@@ -9656,9 +10111,20 @@ def analyse_sector_graph(
     sector_figure.tight_layout()
 
     asset_sector_figure = plt.figure(figsize=asset_figsize)
-    grid = GridSpec(1, 2, width_ratios=[2.8, 10.0], wspace=0.02, figure=asset_sector_figure)
+    # Keep sector names, ticker labels and the heatmap on separate axes.
+    # The previous two-axis layout placed the 93 ticker labels on top of the
+    # coloured sector strip and also left the y-axis title competing for the
+    # same horizontal space.
+    grid = GridSpec(
+        1,
+        3,
+        width_ratios=[2.8, 1.25, 10.0],
+        wspace=0.02,
+        figure=asset_sector_figure,
+    )
     sector_label_axes = asset_sector_figure.add_subplot(grid[0, 0])
-    asset_sector_axes = asset_sector_figure.add_subplot(grid[0, 1])
+    ticker_label_axes = asset_sector_figure.add_subplot(grid[0, 1])
+    asset_sector_axes = asset_sector_figure.add_subplot(grid[0, 2])
     asset_image = asset_sector_axes.imshow(
         ordered_values,
         cmap="Reds",
@@ -9668,13 +10134,24 @@ def analyse_sector_graph(
     )
     asset_sector_axes.set_xticks(np.arange(len(sectors)))
     asset_sector_axes.set_xticklabels(sectors, rotation=90)
-    asset_sector_axes.set_yticks(np.arange(len(ordered_mapping)))
-    asset_sector_axes.set_yticklabels(ordered_mapping["Ticker"], fontsize=7)
+    asset_sector_axes.set_yticks([])
     asset_sector_axes.set_xlabel("Source sector")
-    asset_sector_axes.set_ylabel("Target asset")
     asset_sector_axes.set_title(
         f"Asset-to-sector influence — {graph.run_name}\n{graph.selection_description}"
     )
+
+    ticker_label_axes.set_xlim(0.0, 1.0)
+    ticker_label_axes.set_ylim(len(ordered_mapping) - 0.5, -0.5)
+    for asset_index, ticker in enumerate(ordered_mapping["Ticker"]):
+        ticker_label_axes.text(
+            0.98,
+            asset_index,
+            str(ticker),
+            ha="right",
+            va="center",
+            fontsize=7,
+        )
+    ticker_label_axes.axis("off")
 
     colour_map = plt.get_cmap("tab20")
     sector_colours = {
@@ -9705,6 +10182,7 @@ def analyse_sector_graph(
         )
         if start > 0:
             asset_sector_axes.axhline(start - 0.5, color="black", linewidth=0.7)
+            ticker_label_axes.axhline(start - 0.5, color="black", linewidth=0.7)
         start += length
     sector_label_axes.set_xlim(0.0, 1.0)
     sector_label_axes.set_ylim(len(ordered_mapping) - 0.5, -0.5)
@@ -9715,7 +10193,20 @@ def analyse_sector_graph(
         fraction=0.026,
         pad=0.02,
     ).set_label("Influence weight assigned to source sector")
-    asset_sector_figure.subplots_adjust(left=0.08, right=0.93, bottom=0.16, top=0.93)
+    asset_sector_figure.text(
+        0.012,
+        0.53,
+        "Target asset",
+        rotation=90,
+        ha="center",
+        va="center",
+    )
+    asset_sector_figure.subplots_adjust(
+        left=0.045,
+        right=0.93,
+        bottom=0.16,
+        top=0.93,
+    )
 
     return SectorGraphReport(
         graph=graph,

@@ -1,9 +1,10 @@
 from pathlib import Path
-from typing import Any,Sequence
-from datetime import datetime, time, timedelta
+from typing import Any, Sequence
+from datetime import date, datetime, time, timedelta
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
+import pandas as pd
 import torch
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
@@ -13,6 +14,8 @@ from src.data.load_candle_data import compute_log_returns, get_channel
 from src.utils.company_profiles import make_sector_group_order
 
 SplitDict = dict[str,Any]
+DateLike = str | date | datetime
+VolatilityDaySelector = DateLike | tuple[DateLike, DateLike] | None
 
 #converts torch tensor or numpy object to numpy object
 def to_numpy(x: torch.Tensor|np.ndarray) -> np.ndarray:
@@ -401,6 +404,392 @@ def format_day_label(day: Any) -> str:
     Format a day/session identifier for axis labels.
     """
     return parse_day(day).strftime("%Y-%m-%d")
+
+
+def _resolve_volatility_sample_indices(
+    split: SplitDict,
+    day: VolatilityDaySelector,
+) -> list[int]:
+    """Resolve an exact day, inclusive date range, or the complete split.
+
+    ``day=None`` selects every session in ``split``. An exact date-like value
+    selects one session. A two-item tuple ``(start, end)`` selects every
+    session in the inclusive calendar range. The helper never joins returns
+    across session boundaries.
+    """
+
+    sample_dates = [
+        parse_day(sample[2]).date()
+        for sample in split["samples"]
+    ]
+
+    if day is None:
+        indices = list(range(len(sample_dates)))
+
+    elif isinstance(day, tuple):
+        if len(day) != 2:
+            raise ValueError(
+                "A volatility date range must be a two-item tuple "
+                "(start_date, end_date)."
+            )
+
+        start_date = parse_day(day[0]).date()
+        end_date = parse_day(day[1]).date()
+
+        if start_date > end_date:
+            raise ValueError(
+                "The realised-volatility start date must not be later "
+                "than the end date."
+            )
+
+        indices = [
+            index
+            for index, sample_date in enumerate(sample_dates)
+            if start_date <= sample_date <= end_date
+        ]
+
+    else:
+        selected_date = parse_day(day).date()
+        indices = [
+            index
+            for index, sample_date in enumerate(sample_dates)
+            if sample_date == selected_date
+        ]
+
+    if not indices:
+        if day is None:
+            description = "the supplied split"
+        elif isinstance(day, tuple):
+            description = f"the inclusive range {day[0]} to {day[1]}"
+        else:
+            description = f"the exact day {day}"
+
+        available = [
+            value.isoformat()
+            for value in sample_dates
+        ]
+
+        raise ValueError(
+            f"No sessions were found for {description}. "
+            f"Available dates include {available[:10]}."
+        )
+
+    return indices
+
+
+def plot_realised_volatility(
+    split: SplitDict,
+    *,
+    asset: str | int | None = None,
+    day: VolatilityDaySelector = None,
+    average_over_all_days: bool = False,
+    window_minutes: int = 60,
+    channel: str = "close",
+    eps: float = 1.0e-8,
+    figsize: tuple[float, float] = (14.0, 5.5),
+    ax: Axes | None = None,
+) -> tuple[Figure, Axes, pd.DataFrame]:
+    """Plot rolling realised volatility from within-session log returns.
+
+    Realised volatility is the population standard deviation (``ddof=0``)
+    of the previous ``window_minutes`` one-minute log returns. Rolling
+    windows reset at every session boundary, so the statistic never mixes an
+    overnight gap with intraday returns.
+
+    Parameters
+    ----------
+    split:
+        A cleaned candle-data split.
+    asset:
+        A ticker or zero-based asset index. ``None`` first calculates the
+        rolling volatility independently for every asset and then takes the
+        cross-asset mean at each timestamp. It does *not* calculate the
+        volatility of a cross-sectional average return series.
+    day:
+        ``None`` selects every session in the split. A single date-like value
+        selects that exact session. A two-item tuple ``(start_date, end_date)``
+        selects the inclusive date range.
+    average_over_all_days:
+        Applied only when ``day=None``. When ``False``, the selected sessions
+        are plotted on their actual calendar timestamps. When ``True``, daily
+        volatility curves are aligned by intraday bar-close time and averaged
+        across all sessions in the supplied split, producing one average
+        intraday volatility profile. If an exact day or date range is passed,
+        this flag has no effect.
+    window_minutes:
+        Number of one-minute returns in each rolling standard deviation.
+
+    Returns
+    -------
+    figure, axes, values:
+        In ordinary mode, ``values`` contains one row per selected session and
+        timestamp. In across-day-average mode, it contains one row per
+        intraday bar-close time with the mean realised volatility and number
+        of sessions averaged.
+    """
+
+    if window_minutes < 2:
+        raise ValueError(
+            "window_minutes must be at least 2 for a meaningful "
+            "standard deviation."
+        )
+
+    if eps <= 0.0:
+        raise ValueError("eps must be positive.")
+
+    if channel not in split["channels"]:
+        raise ValueError(
+            f"Channel {channel!r} is unavailable. "
+            f"Available channels are {split['channels']}."
+        )
+
+    sample_indices = _resolve_volatility_sample_indices(
+        split,
+        day,
+    )
+
+    if asset is None:
+        asset_indices = list(range(len(split["asset_cols"])))
+        asset_label = "Cross-asset mean"
+    else:
+        asset_indices, asset_labels = resolve_asset_indices(
+            split,
+            asset,
+        )
+
+        if len(asset_indices) != 1:
+            raise ValueError(
+                "plot_realised_volatility accepts one asset or asset=None."
+            )
+
+        asset_label = asset_labels[0]
+
+    records: list[dict[str, Any]] = []
+
+    for sample_index in sample_indices:
+        x, _, sample_day = split["samples"][sample_index]
+
+        log_returns = compute_log_returns(
+            x=x,
+            split=split,
+            channels=[channel],
+            eps=eps,
+        )[:, asset_indices]
+
+        returns_frame = pd.DataFrame(
+            to_numpy(log_returns),
+        )
+
+        rolling_volatility = (
+            returns_frame
+            .rolling(
+                window=int(window_minutes),
+                min_periods=int(window_minutes),
+            )
+            .std(ddof=0)
+        )
+
+        if asset is None:
+            volatility_values = rolling_volatility.mean(
+                axis=1,
+                skipna=True,
+            ).to_numpy(dtype=np.float64)
+        else:
+            volatility_values = rolling_volatility.iloc[:, 0].to_numpy(
+                dtype=np.float64
+            )
+
+        # Cleaned close index 0 is the 09:31 bar endpoint. Return index 0
+        # therefore ends at cleaned close index 1 (09:32). The first finite
+        # 60-return volatility value is consequently aligned to 10:31.
+        close_timestamps = build_intraday_datetimes(
+            split=split,
+            day=sample_day,
+            num_points=int(x.shape[0]),
+            offset_minutes=1,
+        )
+        return_timestamps = close_timestamps[1:]
+
+        finite = np.isfinite(volatility_values)
+
+        for timestamp, value in zip(
+            return_timestamps[finite],
+            volatility_values[finite],
+            strict=True,
+        ):
+            timestamp_value = pd.Timestamp(timestamp)
+            intraday_minute = int(
+                timestamp_value.hour * 60
+                + timestamp_value.minute
+            )
+            records.append(
+                {
+                    "Date": format_day_label(sample_day),
+                    "Timestamp": timestamp_value,
+                    "Bar-close time": timestamp_value.strftime("%H:%M"),
+                    "Intraday minute": intraday_minute,
+                    "Asset": asset_label,
+                    "Window minutes": int(window_minutes),
+                    "Realised volatility": float(value),
+                }
+            )
+
+    values = pd.DataFrame(records)
+
+    if values.empty:
+        raise ValueError(
+            "The realised-volatility selection produced no finite values. "
+            "The rolling window may be longer than the selected sessions."
+        )
+
+    values = values.sort_values(
+        ["Timestamp"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    average_applied = bool(
+        average_over_all_days
+        and day is None
+    )
+
+    if average_applied:
+        plot_values = (
+            values.groupby(
+                [
+                    "Intraday minute",
+                    "Bar-close time",
+                    "Asset",
+                    "Window minutes",
+                ],
+                as_index=False,
+                sort=True,
+            )
+            .agg(
+                **{
+                    "Realised volatility": (
+                        "Realised volatility",
+                        "mean",
+                    ),
+                    "Sessions averaged": (
+                        "Date",
+                        "nunique",
+                    ),
+                }
+            )
+            .sort_values("Intraday minute")
+            .reset_index(drop=True)
+        )
+        plot_values["Date"] = "Average across all days"
+        plot_values["Timestamp"] = (
+            pd.Timestamp("2000-01-01")
+            + pd.to_timedelta(
+                plot_values["Intraday minute"],
+                unit="m",
+            )
+        )
+        plot_values["Average over all days"] = True
+        plot_values = plot_values[
+            [
+                "Date",
+                "Timestamp",
+                "Bar-close time",
+                "Intraday minute",
+                "Asset",
+                "Window minutes",
+                "Sessions averaged",
+                "Average over all days",
+                "Realised volatility",
+            ]
+        ]
+    else:
+        plot_values = values.copy()
+        plot_values["Sessions averaged"] = 1
+        plot_values["Average over all days"] = False
+
+    if ax is None:
+        figure, axes = plt.subplots(figsize=figsize)
+    else:
+        axes = ax
+        figure = axes.figure
+
+    if average_applied:
+        axes.plot(
+            plot_values["Timestamp"],
+            plot_values["Realised volatility"],
+            color="tab:blue",
+            linewidth=1.7,
+            label=asset_label,
+        )
+        locator = mdates.AutoDateLocator(
+            minticks=4,
+            maxticks=12,
+        )
+        axes.xaxis.set_major_locator(locator)
+        axes.xaxis.set_major_formatter(
+            mdates.DateFormatter("%H:%M")
+        )
+        session_count = int(
+            values["Date"].nunique()
+        )
+        date_description = (
+            f"average intraday profile across {session_count} sessions"
+        )
+        axes.set_xlabel("Bar-close time")
+    else:
+        for group_index, (_, group) in enumerate(
+            plot_values.groupby("Date", sort=True)
+        ):
+            axes.plot(
+                group["Timestamp"],
+                group["Realised volatility"],
+                color="tab:blue",
+                linewidth=1.35,
+                alpha=0.9,
+                label=(asset_label if group_index == 0 else None),
+            )
+
+        unique_dates = tuple(
+            plot_values["Date"].drop_duplicates()
+        )
+
+        if len(unique_dates) == 1:
+            locator = mdates.AutoDateLocator(
+                minticks=4,
+                maxticks=10,
+            )
+            axes.xaxis.set_major_locator(locator)
+            axes.xaxis.set_major_formatter(
+                mdates.DateFormatter("%H:%M")
+            )
+            date_description = unique_dates[0]
+            axes.set_xlabel("Bar-close time")
+        else:
+            locator = mdates.AutoDateLocator(
+                minticks=4,
+                maxticks=12,
+            )
+            axes.xaxis.set_major_locator(locator)
+            axes.xaxis.set_major_formatter(
+                mdates.ConciseDateFormatter(locator)
+            )
+            date_description = (
+                f"{unique_dates[0]} to {unique_dates[-1]} "
+                f"({len(unique_dates)} sessions)"
+            )
+            axes.set_xlabel("Date and bar-close time")
+
+    axes.set_ylabel(
+        "Rolling std. dev. of 1-minute log returns"
+    )
+    axes.set_title(
+        f"{window_minutes}-minute realised volatility — {asset_label}\n"
+        f"{date_description}"
+    )
+    axes.grid(True, alpha=0.25)
+    axes.legend(loc="best")
+    figure.tight_layout()
+
+    return figure, axes, plot_values
 
 #function to plot intraday channel for selected assets and selected days
 #by default, it will plot the first max_sample (10) days for the first max_assets (5)
