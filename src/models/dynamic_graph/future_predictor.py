@@ -466,6 +466,7 @@ class FutureTransformerLayer(nn.Module):
         context_memory: Tensor,
         *,
         self_attention_mask: Tensor | None,
+        context_key_padding_mask: Tensor | None = None,
     ) -> Tensor:
         """Process flattened node sequences ``[B*N, T, D]``."""
         if future_hidden.ndim != 3:
@@ -511,10 +512,24 @@ class FutureTransformerLayer(nn.Module):
             future_hidden
         )
 
+        if context_key_padding_mask is not None:
+            if context_key_padding_mask.ndim != 2:
+                raise ValueError(
+                    "context_key_padding_mask must have shape [B*N, C]."
+                )
+            if tuple(context_key_padding_mask.shape) != (
+                int(context_memory.shape[0]),
+                int(context_memory.shape[1]),
+            ):
+                raise ValueError(
+                    "Context padding mask does not align with context_memory."
+                )
+
         cross_message, _ = self.cross_attention(
             query=cross_query,
             key=context_memory,
             value=context_memory,
+            key_padding_mask=context_key_padding_mask,
             need_weights=False,
         )
 

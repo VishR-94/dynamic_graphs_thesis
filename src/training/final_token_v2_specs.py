@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Specifications for the final token and BaseDyGraph-V2 comparison notebook."""
 
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -571,6 +572,130 @@ def make_final_token_v2_specs(
     if len(set(signatures)) != len(signatures):
         raise AssertionError("Different final-comparison labels resolved to identical configs.")
     return specs
+
+
+
+def make_full_dense_transformer_token_spec(
+    *,
+    context_length: int = 60,
+    prediction_length: int = 60,
+    evaluation_horizons: Sequence[int] = (1, 5, 15, 30, 60),
+    vocabulary_size: int = 1024,
+    num_nodes: int = 93,
+    seed: int = 42,
+    batch_size: int = 4,
+    origin_chunk_size: int = 4,
+    selection_batch_size: int = 4,
+    export_batch_size: int = 2,
+) -> FinalComparisonSpec:
+    """Return the final all-origins/all-positions dense token run.
+
+    The architecture is copied from the completed D64, three-ST-block token
+    counterpart.  The only scientific change is the training objective:
+    every one of the 60 causal context origins predicts every one of the 60
+    future coarse-s1 positions.  Final-origin checkpoint selection, export and
+    frozen decoding remain unchanged.
+
+    ``origin_chunk_size`` controls only execution batching.  It does not alter
+    the loss: chunk losses are weighted by their origin count so the gradient
+    is exactly the mean CE over ``B x 60 x 60 x N`` targets.
+    """
+    if int(num_nodes) <= 1:
+        raise ValueError("num_nodes must be greater than one.")
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive.")
+    if int(origin_chunk_size) <= 0:
+        raise ValueError("origin_chunk_size must be positive.")
+    if int(selection_batch_size) <= 0 or int(export_batch_size) <= 0:
+        raise ValueError("selection/export batch sizes must be positive.")
+
+    base_specs = make_final_token_v2_specs(
+        context_length=context_length,
+        prediction_length=prediction_length,
+        evaluation_horizons=evaluation_horizons,
+        vocabulary_size=vocabulary_size,
+        seed=seed,
+    )
+    source = next(
+        spec
+        for spec in base_specs
+        if spec.model_kind == "dense_transformer_token"
+    )
+    config = deepcopy(source.config)
+    config["model_family"] = (
+        "final_dense_transformer_token_all_origins_full_path"
+    )
+    config["model"]["num_nodes"] = int(num_nodes)
+    config["models"]["dynamic_graph"]["num_nodes"] = int(num_nodes)
+    config["experiment_family"] = (
+        "full_dense_all_origins_all_future_positions"
+    )
+    config["model"]["future_predictor"]["type"] = (
+        "all_origins_full60_structured_parallel"
+    )
+    config["models"]["dynamic_graph"]["future_predictor"]["type"] = (
+        "all_origins_full60_structured_parallel"
+    )
+    config["training"]["batch_size"] = int(batch_size)
+    config["training"]["selection_batch_size"] = int(selection_batch_size)
+    config["training"]["export_batch_size"] = int(export_batch_size)
+    config["training"]["loss"] = {
+        "type": "coarse_s1_cross_entropy",
+        "horizon_weighting": "uniform",
+        "dense_origins": True,
+        "dense_objective": "all_60_future_positions_per_origin",
+        "future_steps_per_origin": int(prediction_length),
+        "origin_chunk_size": int(origin_chunk_size),
+    }
+
+    # Architecture guard: this run must remain the exact completed D64/ST3
+    # token architecture apart from the dense objective and execution batches.
+    if config["model"]["num_st_blocks"] != 3:
+        raise AssertionError("Expected exactly three ST blocks.")
+    if config["model"]["temporal"] != {
+        "type": "transformer",
+        "d_model": 64,
+        "num_layers": 1,
+        "num_heads": 4,
+        "feedforward_multiplier": 2,
+        "dropout": 0.0,
+        "position_embedding": False,
+    }:
+        raise AssertionError("Dense Transformer temporal contract changed.")
+    if config["model"]["graph"] != {
+        "type": "static_dynamic_mixture",
+        "num_heads_per_block": [1, 1, 1],
+        "hidden_dims_per_block": [64, 64, 64],
+        "activations_per_block": ["softmax", "softmax", "sparsemax"],
+        "add_self_loops": False,
+        "initial_alpha": 0.5,
+    }:
+        raise AssertionError("Dense Transformer graph contract changed.")
+    if config["model"]["prior"] != {
+        "type": "uniform",
+        "static_logits": "zeros",
+        "dynamic_logits": "zeros_at_initialisation",
+    }:
+        raise AssertionError("Dense Transformer neutral prior changed.")
+    if config["model"]["spatial"] != {
+        "feedforward_multiplier": 2,
+        "dropout": 0.0,
+        "initial_beta": 0.5,
+    }:
+        raise AssertionError("Dense Transformer spatial contract changed.")
+
+    return _spec(
+        model_kind="dense_transformer_token",
+        label=(
+            "D64 three-block dense Transformer in coarse-s1 space — every "
+            "causal context origin predicts the complete 60-token path"
+        ),
+        prefix=(
+            "final_tok_full_dense60_allorigins_"
+            "tr_d64_t4_g1_st3_uniform"
+        ),
+        config=config,
+    )
 
 
 def save_specs(path: str | Path, specs: Sequence[FinalComparisonSpec]) -> None:

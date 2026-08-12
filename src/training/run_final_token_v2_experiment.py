@@ -11,8 +11,8 @@ Four model kinds are supported by one resumable runner:
 
 ``dense_transformer_token``
     Token counterpart of the winning D64/three-ST-block dense Transformer.
-    Internal causal origins predict the five dissertation horizons, while the
-    final observed origin predicts the complete 60-step coarse-token path.
+    It supports both the hybrid dense-five/final-60 objective and the full
+    60-origin x 60-future-position objective used by the final experiment.
 
 ``dimitri_v2_token``
     Dimitri's default four-block V2 backbone at context 60, using the same
@@ -27,6 +27,7 @@ Graph orientation is ``A[target, source]``.
 """
 
 import argparse
+import gc
 from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
@@ -35,6 +36,7 @@ import math
 from pathlib import Path
 import random
 import shutil
+from time import perf_counter
 import subprocess
 from typing import Any, Mapping, Sequence
 
@@ -295,6 +297,56 @@ def _token_batch(batch: Mapping[str, Any], *, device: torch.device) -> tuple[Ten
     return context, target
 
 
+def _all_origins_full_path_token_targets(
+    context: Tensor,
+    future: Tensor,
+) -> Tensor:
+    """Return every causal origin's complete future-token path.
+
+    Given an observed context ``[x_0, ..., x_{T-1}]`` and saved continuation
+    ``[x_T, ..., x_{T+P-1}]``, origin ``t`` is supervised against
+    ``[x_{t+1}, ..., x_{t+P}]``.  With ``T=P=60`` the result has shape
+    ``[B,60,60,N]`` and the final origin exactly equals the ordinary saved
+    future path.
+    """
+    if context.ndim != 3 or future.ndim != 3:
+        raise ValueError("context/future must have shape [B,T,N].")
+    if (
+        int(context.shape[0]) != int(future.shape[0])
+        or int(context.shape[2]) != int(future.shape[2])
+    ):
+        raise ValueError("Context and future batches/assets do not align.")
+    context_steps = int(context.shape[1])
+    future_steps = int(future.shape[1])
+    if context_steps <= 0 or future_steps <= 0:
+        raise ValueError("Context and future paths must be non-empty.")
+
+    combined = torch.cat([context, future], dim=1)
+    origins = torch.arange(
+        context_steps,
+        device=context.device,
+        dtype=torch.long,
+    )[:, None]
+    offsets = torch.arange(
+        1,
+        future_steps + 1,
+        device=context.device,
+        dtype=torch.long,
+    )[None, :]
+    indices = origins + offsets
+    if int(indices.max().item()) >= int(combined.shape[1]):
+        raise ValueError("Dense target index exceeds context+future data.")
+    targets = combined.index_select(1, indices.reshape(-1)).reshape(
+        int(context.shape[0]),
+        context_steps,
+        future_steps,
+        int(context.shape[2]),
+    )
+    if not torch.equal(targets[:, -1], future):
+        raise AssertionError("Final-origin dense target differs from future path.")
+    return targets
+
+
 def _hybrid_dense_token_targets(
     context: Tensor,
     future: Tensor,
@@ -551,6 +603,283 @@ def _forward_token_final(model: nn.Module, kind: str, context: Tensor, *, includ
     return logits, _generic_graph_batch(backbone, final_origin_only=True)
 
 
+def _all_origins_full_path_backward(
+    *,
+    model: nn.Module,
+    kind: str,
+    context: Tensor,
+    future: Tensor,
+    loss_config: Mapping[str, Any],
+    scaler: Any,
+    device: torch.device,
+    use_amp: bool,
+) -> dict[str, float]:
+    """Backpropagate exact CE over all origins and all future positions.
+
+    Origins are processed in configurable vectorised chunks.  Each chunk loss
+    is multiplied by ``chunk_origins / total_origins`` before backward, so the
+    accumulated gradient is exactly the mean over the complete target tensor
+    ``[B,T,P,N]``.  Chunking changes only execution/memory, never the objective.
+    """
+    if kind not in {"dense_transformer_token", "dimitri_v2_token"}:
+        raise ValueError(
+            "Full dense all-origin token training requires a causal "
+            "sequence-output token backbone."
+        )
+    expected_steps = int(loss_config["future_steps_per_origin"])
+    if expected_steps != int(future.shape[1]):
+        raise ValueError(
+            "future_steps_per_origin differs from the saved future path."
+        )
+    total_origins = int(context.shape[1])
+    chunk_size = int(loss_config.get("origin_chunk_size", 1))
+    if chunk_size <= 0:
+        raise ValueError("origin_chunk_size must be positive.")
+    chunk_size = min(chunk_size, total_origins)
+
+    with _autocast_context(device, use_amp):
+        backbone = (
+            model.forward_backbone(context, include_components=False)
+            if kind == "dimitri_v2_token"
+            else model.forward_backbone(context)
+        )
+    targets = _all_origins_full_path_token_targets(context, future)
+
+    all_ce_sum = 0.0
+    all_correct_sum = 0.0
+    all_count = 0
+    objective_value = 0.0
+    final_ce_sum = 0.0
+    final_correct_sum = 0.0
+    final_count = 0
+
+    for start in range(0, total_origins, chunk_size):
+        stop = min(start + chunk_size, total_origins)
+        origin_indices = torch.arange(
+            start,
+            stop,
+            device=context.device,
+            dtype=torch.long,
+        )
+        with _autocast_context(device, use_amp):
+            logits = model.future_predictor.forward_origins(
+                backbone.hidden,
+                origin_indices,
+            )
+            target = targets[:, start:stop]
+            raw_chunk_loss = F.cross_entropy(
+                logits.reshape(-1, int(logits.shape[-1])).float(),
+                target.reshape(-1),
+            )
+            chunk_weight = float(stop - start) / float(total_origins)
+            weighted_chunk_loss = raw_chunk_loss * chunk_weight
+
+        scaler.scale(weighted_chunk_loss).backward(
+            retain_graph=stop < total_origins
+        )
+
+        raw_value = float(raw_chunk_loss.detach().item())
+        chunk_count = int(target.numel())
+        all_ce_sum += raw_value * chunk_count
+        all_correct_sum += float(
+            logits.argmax(dim=-1).eq(target).sum().item()
+        )
+        all_count += chunk_count
+        objective_value += raw_value * chunk_weight
+
+        if start <= total_origins - 1 < stop:
+            local_index = total_origins - 1 - start
+            final_logits = logits[:, local_index]
+            final_target = target[:, local_index]
+            final_loss = F.cross_entropy(
+                final_logits.reshape(-1, int(final_logits.shape[-1])).float(),
+                final_target.reshape(-1),
+            )
+            final_count = int(final_target.numel())
+            final_ce_sum = float(final_loss.detach().item()) * final_count
+            final_correct_sum = float(
+                final_logits.argmax(dim=-1).eq(final_target).sum().item()
+            )
+            del final_logits, final_target, final_loss
+
+        del (
+            logits,
+            target,
+            raw_chunk_loss,
+            weighted_chunk_loss,
+            origin_indices,
+        )
+
+    if all_count <= 0 or final_count <= 0:
+        raise RuntimeError("Full dense token batch produced no targets.")
+    del targets, backbone
+    return {
+        "objective": objective_value,
+        "all_origins_ce_sum": all_ce_sum,
+        "all_origins_correct_sum": all_correct_sum,
+        "all_origins_count": float(all_count),
+        "final_ce_sum": final_ce_sum,
+        "final_correct_sum": final_correct_sum,
+        "final_count": float(final_count),
+        "origin_chunk_size": float(chunk_size),
+    }
+
+
+def probe_full_dense_transformer_batch_candidates(
+    *,
+    candidates: Sequence[Sequence[int]],
+    device: torch.device | str = "cuda",
+    num_nodes: int = 93,
+    context_length: int = 60,
+    prediction_length: int = 60,
+    mixed_precision: bool = True,
+    memory_safety_fraction: float = 0.92,
+    seed: int = 42,
+    stop_after_first_safe: bool = True,
+) -> list[dict[str, Any]]:
+    """Probe physical batch/origin-chunk pairs using the real training path.
+
+    The candidates are evaluated in the supplied order.  A candidate is marked
+    safe only when a complete forward/backward/Adam step succeeds and peak CUDA
+    allocation stays below ``memory_safety_fraction`` of device VRAM.  The
+    function never changes the scientific objective or model architecture.
+    """
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("The full dense batch probe requires CUDA.")
+    if not 0.0 < float(memory_safety_fraction) <= 1.0:
+        raise ValueError("memory_safety_fraction must lie in (0,1].")
+    parsed: list[tuple[int, int]] = []
+    for value in candidates:
+        if len(value) != 2:
+            raise ValueError("Each candidate must be (batch_size, chunk_size).")
+        batch_size, chunk_size = (int(value[0]), int(value[1]))
+        if batch_size <= 0 or chunk_size <= 0:
+            raise ValueError("Candidate sizes must be positive.")
+        parsed.append((batch_size, chunk_size))
+    if not parsed:
+        raise ValueError("At least one batch candidate is required.")
+
+    total_gib = float(
+        torch.cuda.get_device_properties(device).total_memory / (1024**3)
+    )
+    records: list[dict[str, Any]] = []
+    for batch_size, chunk_size in parsed:
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        model: nn.Module | None = None
+        optimizer: torch.optim.Optimizer | None = None
+        context: Tensor | None = None
+        future: Tensor | None = None
+        values: dict[str, float] | None = None
+        scaler: Any | None = None
+        try:
+            _set_seed(int(seed))
+            model = DenseTransformerTokenForecaster(
+                num_nodes=int(num_nodes),
+                context_length=int(context_length),
+                prediction_length=int(prediction_length),
+            ).to(device)
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=2.5e-4,
+                weight_decay=0.0,
+            )
+            scaler = _new_grad_scaler(
+                bool(mixed_precision) and device.type == "cuda"
+            )
+            context = torch.randint(
+                0,
+                1024,
+                (batch_size, context_length, num_nodes),
+                device=device,
+                dtype=torch.long,
+            )
+            future = torch.randint(
+                0,
+                1024,
+                (batch_size, prediction_length, num_nodes),
+                device=device,
+                dtype=torch.long,
+            )
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.synchronize(device)
+            started = perf_counter()
+            values = _all_origins_full_path_backward(
+                model=model,
+                kind="dense_transformer_token",
+                context=context,
+                future=future,
+                loss_config={
+                    "future_steps_per_origin": int(prediction_length),
+                    "origin_chunk_size": int(chunk_size),
+                },
+                scaler=scaler,
+                device=device,
+                use_amp=bool(mixed_precision),
+            )
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            torch.cuda.synchronize(device)
+            elapsed = perf_counter() - started
+            peak_gib = float(
+                torch.cuda.max_memory_allocated(device) / (1024**3)
+            )
+            safe = peak_gib <= float(memory_safety_fraction) * total_gib
+            records.append(
+                {
+                    "batch_size": batch_size,
+                    "origin_chunk_size": chunk_size,
+                    "status": "safe" if safe else "fits_but_above_margin",
+                    "seconds_per_step": elapsed,
+                    "examples_per_second": batch_size / max(elapsed, 1.0e-9),
+                    "peak_cuda_gib": peak_gib,
+                    "total_cuda_gib": total_gib,
+                    "peak_fraction": peak_gib / total_gib,
+                    "objective": float(values["objective"]),
+                }
+            )
+            if safe and stop_after_first_safe:
+                break
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            message = str(exc).lower()
+            if not isinstance(exc, torch.cuda.OutOfMemoryError) and (
+                "out of memory" not in message
+                and "cuda error: out of memory" not in message
+            ):
+                raise
+            records.append(
+                {
+                    "batch_size": batch_size,
+                    "origin_chunk_size": chunk_size,
+                    "status": "cuda_oom",
+                    "seconds_per_step": None,
+                    "examples_per_second": None,
+                    "peak_cuda_gib": float(
+                        torch.cuda.max_memory_allocated(device) / (1024**3)
+                    ),
+                    "total_cuda_gib": total_gib,
+                    "peak_fraction": None,
+                    "objective": None,
+                }
+            )
+        finally:
+            del model, optimizer, context, future, values, scaler
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    if not any(value["status"] == "safe" for value in records):
+        raise RuntimeError(
+            "No full-dense batch candidate satisfied the CUDA memory margin. "
+            "Include a smaller pair such as (1,1)."
+        )
+    return records
+
+
 def _train_token_epoch(
     *,
     model: nn.Module,
@@ -574,6 +903,9 @@ def _train_token_epoch(
     use_amp = bool(training["mixed_precision"]) and device.type == "cuda"
     loss_config = training["loss"]
     dense = bool(loss_config.get("dense_origins", False))
+    dense_objective_name = (
+        str(loss_config.get("dense_objective", "")) if dense else ""
+    )
     model.train()
 
     final_ce_sum = final_correct_sum = final_count = 0.0
@@ -601,105 +933,129 @@ def _train_token_epoch(
             objective_weight += int(context.shape[0])
         else:
             objective_name = str(loss_config.get("dense_objective", ""))
-            if objective_name != "internal_five_horizons_plus_final_full_path":
+            if objective_name == "all_60_future_positions_per_origin":
+                batch_values = _all_origins_full_path_backward(
+                    model=model,
+                    kind=kind,
+                    context=context,
+                    future=future,
+                    loss_config=loss_config,
+                    scaler=scaler,
+                    device=device,
+                    use_amp=use_amp,
+                )
+                final_ce_sum += batch_values["final_ce_sum"]
+                final_correct_sum += batch_values["final_correct_sum"]
+                final_count += batch_values["final_count"]
+                auxiliary_ce_sum += batch_values["all_origins_ce_sum"]
+                auxiliary_correct_sum += batch_values[
+                    "all_origins_correct_sum"
+                ]
+                auxiliary_count += batch_values["all_origins_count"]
+                objective_sum += batch_values["objective"] * int(
+                    context.shape[0]
+                )
+                objective_weight += int(context.shape[0])
+            elif objective_name == "internal_five_horizons_plus_final_full_path":
+                auxiliary_horizons = tuple(
+                    int(value) for value in loss_config["dense_auxiliary_horizons"]
+                )
+                auxiliary_weight = float(loss_config["dense_auxiliary_weight"])
+                if auxiliary_weight < 0.0:
+                    raise ValueError("dense_auxiliary_weight must be non-negative.")
+                expected_final_steps = int(loss_config["final_origin_future_steps"])
+                if expected_final_steps != int(future.shape[1]):
+                    raise ValueError(
+                        "Final-origin path length differs from the configured loss."
+                    )
+
+                with _autocast_context(device, use_amp):
+                    backbone = (
+                        model.forward_backbone(context, include_components=False)
+                        if kind == "dimitri_v2_token"
+                        else model.forward_backbone(context)
+                    )
+                    final_logits = model.future_predictor.forward_origin(
+                        backbone.hidden,
+                        int(context.shape[1]) - 1,
+                    )
+                    final_loss = F.cross_entropy(
+                        final_logits.reshape(-1, 1024).float(), future.reshape(-1)
+                    )
+
+                auxiliary_target, final_target = _hybrid_dense_token_targets(
+                    context,
+                    future,
+                    auxiliary_horizons=auxiliary_horizons,
+                )
+                # ``final_target`` is returned explicitly so the target contract is
+                # audited in one place rather than inferred independently here.
+                if not torch.equal(final_target, future):
+                    raise AssertionError("Final-origin target path was altered.")
+
+                internal_origins = int(auxiliary_target.shape[1])
+                query_indices = torch.as_tensor(
+                    [value - 1 for value in auxiliary_horizons],
+                    device=context.device,
+                    dtype=torch.long,
+                )
+
+                final_loss_value = float(final_loss.detach().item())
+                batch_final_count = int(final_target.numel())
+                final_ce_sum += final_loss_value * batch_final_count
+                final_correct_sum += float(
+                    final_logits.argmax(dim=-1).eq(final_target).sum().item()
+                )
+                final_count += batch_final_count
+                del final_logits
+
+                auxiliary_losses: list[Tensor] = []
+                batch_auxiliary_loss_sum = 0.0
+                for origin in range(internal_origins):
+                    with _autocast_context(device, use_amp):
+                        auxiliary_logits = model.future_predictor.forward_origin(
+                            backbone.hidden,
+                            origin,
+                            future_position_indices=query_indices,
+                        )
+                        target = auxiliary_target[:, origin]
+                        raw_auxiliary_loss = F.cross_entropy(
+                            auxiliary_logits.reshape(-1, 1024).float(),
+                            target.reshape(-1),
+                        )
+                    auxiliary_losses.append(raw_auxiliary_loss)
+                    raw_value = float(raw_auxiliary_loss.detach().item())
+                    batch_auxiliary_loss_sum += raw_value
+                    batch_count = int(target.numel())
+                    auxiliary_ce_sum += raw_value * batch_count
+                    auxiliary_correct_sum += float(
+                        auxiliary_logits.argmax(dim=-1).eq(target).sum().item()
+                    )
+                    auxiliary_count += batch_count
+                    del auxiliary_logits, target
+
+                auxiliary_mean_loss = torch.stack(auxiliary_losses).mean()
+                objective_loss = final_loss + auxiliary_weight * auxiliary_mean_loss
+                batch_auxiliary_mean = batch_auxiliary_loss_sum / internal_origins
+                batch_objective = final_loss_value + (
+                    auxiliary_weight * batch_auxiliary_mean
+                )
+                scaler.scale(objective_loss).backward()
+                objective_sum += batch_objective * int(context.shape[0])
+                objective_weight += int(context.shape[0])
+                del (
+                    auxiliary_losses,
+                    auxiliary_mean_loss,
+                    objective_loss,
+                    final_loss,
+                    auxiliary_target,
+                    final_target,
+                    backbone,
+                )
+            else:
                 raise ValueError(
                     "Unsupported dense token objective: " + repr(objective_name)
                 )
-            auxiliary_horizons = tuple(
-                int(value) for value in loss_config["dense_auxiliary_horizons"]
-            )
-            auxiliary_weight = float(loss_config["dense_auxiliary_weight"])
-            if auxiliary_weight < 0.0:
-                raise ValueError("dense_auxiliary_weight must be non-negative.")
-            expected_final_steps = int(loss_config["final_origin_future_steps"])
-            if expected_final_steps != int(future.shape[1]):
-                raise ValueError(
-                    "Final-origin path length differs from the configured loss."
-                )
-
-            with _autocast_context(device, use_amp):
-                backbone = (
-                    model.forward_backbone(context, include_components=False)
-                    if kind == "dimitri_v2_token"
-                    else model.forward_backbone(context)
-                )
-                final_logits = model.future_predictor.forward_origin(
-                    backbone.hidden,
-                    int(context.shape[1]) - 1,
-                )
-                final_loss = F.cross_entropy(
-                    final_logits.reshape(-1, 1024).float(), future.reshape(-1)
-                )
-
-            auxiliary_target, final_target = _hybrid_dense_token_targets(
-                context,
-                future,
-                auxiliary_horizons=auxiliary_horizons,
-            )
-            # ``final_target`` is returned explicitly so the target contract is
-            # audited in one place rather than inferred independently here.
-            if not torch.equal(final_target, future):
-                raise AssertionError("Final-origin target path was altered.")
-
-            internal_origins = int(auxiliary_target.shape[1])
-            query_indices = torch.as_tensor(
-                [value - 1 for value in auxiliary_horizons],
-                device=context.device,
-                dtype=torch.long,
-            )
-
-            final_loss_value = float(final_loss.detach().item())
-            batch_final_count = int(final_target.numel())
-            final_ce_sum += final_loss_value * batch_final_count
-            final_correct_sum += float(
-                final_logits.argmax(dim=-1).eq(final_target).sum().item()
-            )
-            final_count += batch_final_count
-            del final_logits
-
-            auxiliary_losses: list[Tensor] = []
-            batch_auxiliary_loss_sum = 0.0
-            for origin in range(internal_origins):
-                with _autocast_context(device, use_amp):
-                    auxiliary_logits = model.future_predictor.forward_origin(
-                        backbone.hidden,
-                        origin,
-                        future_position_indices=query_indices,
-                    )
-                    target = auxiliary_target[:, origin]
-                    raw_auxiliary_loss = F.cross_entropy(
-                        auxiliary_logits.reshape(-1, 1024).float(),
-                        target.reshape(-1),
-                    )
-                auxiliary_losses.append(raw_auxiliary_loss)
-                raw_value = float(raw_auxiliary_loss.detach().item())
-                batch_auxiliary_loss_sum += raw_value
-                batch_count = int(target.numel())
-                auxiliary_ce_sum += raw_value * batch_count
-                auxiliary_correct_sum += float(
-                    auxiliary_logits.argmax(dim=-1).eq(target).sum().item()
-                )
-                auxiliary_count += batch_count
-                del auxiliary_logits, target
-
-            auxiliary_mean_loss = torch.stack(auxiliary_losses).mean()
-            objective_loss = final_loss + auxiliary_weight * auxiliary_mean_loss
-            batch_auxiliary_mean = batch_auxiliary_loss_sum / internal_origins
-            batch_objective = final_loss_value + (
-                auxiliary_weight * batch_auxiliary_mean
-            )
-            scaler.scale(objective_loss).backward()
-            objective_sum += batch_objective * int(context.shape[0])
-            objective_weight += int(context.shape[0])
-            del (
-                auxiliary_losses,
-                auxiliary_mean_loss,
-                objective_loss,
-                final_loss,
-                auxiliary_target,
-                final_target,
-                backbone,
-            )
 
         scaler.unscale_(optimizer)
         clip = training.get("gradient_clip_norm")
@@ -720,20 +1076,41 @@ def _train_token_epoch(
     }
     if dense:
         if auxiliary_count <= 0:
-            raise RuntimeError("Dense token training produced no auxiliary targets.")
-        result.update(
-            {
-                "training_dense_auxiliary_cross_entropy": (
-                    auxiliary_ce_sum / auxiliary_count
-                ),
-                "training_dense_auxiliary_top1_accuracy": (
-                    auxiliary_correct_sum / auxiliary_count
-                ),
-                "training_dense_auxiliary_weight": float(
-                    loss_config["dense_auxiliary_weight"]
-                ),
-            }
-        )
+            raise RuntimeError("Dense token training produced no dense targets.")
+        if dense_objective_name == "all_60_future_positions_per_origin":
+            result.update(
+                {
+                    "training_dense_all_origins_cross_entropy": (
+                        auxiliary_ce_sum / auxiliary_count
+                    ),
+                    "training_dense_all_origins_top1_accuracy": (
+                        auxiliary_correct_sum / auxiliary_count
+                    ),
+                    "training_dense_origin_count": float(
+                        config["data"]["context_length"]
+                    ),
+                    "training_dense_future_steps_per_origin": float(
+                        loss_config["future_steps_per_origin"]
+                    ),
+                    "training_dense_origin_chunk_size": float(
+                        loss_config.get("origin_chunk_size", 1)
+                    ),
+                }
+            )
+        else:
+            result.update(
+                {
+                    "training_dense_auxiliary_cross_entropy": (
+                        auxiliary_ce_sum / auxiliary_count
+                    ),
+                    "training_dense_auxiliary_top1_accuracy": (
+                        auxiliary_correct_sum / auxiliary_count
+                    ),
+                    "training_dense_auxiliary_weight": float(
+                        loss_config["dense_auxiliary_weight"]
+                    ),
+                }
+            )
     return result
 
 
@@ -2108,6 +2485,17 @@ def _metadata(
         "final_origin_future_steps": config["training"].get("loss", {}).get(
             "final_origin_future_steps"
         ),
+        "dense_future_steps_per_origin": config["training"].get(
+            "loss", {}
+        ).get("future_steps_per_origin"),
+        "dense_origin_chunk_size": config["training"].get(
+            "loss", {}
+        ).get("origin_chunk_size"),
+        "training_batch_size": int(config["training"]["batch_size"]),
+        "selection_batch_size": int(
+            config["training"]["selection_batch_size"]
+        ),
+        "export_batch_size": int(config["training"]["export_batch_size"]),
         "test_set_contaminated": True,
         "do_not_report": True,
         "trainable_parameters": parameter_count,
@@ -2204,6 +2592,19 @@ def _train(
         history_path = run_dir / "history.csv"
         if history_path.is_file():
             history = pd.read_csv(history_path).to_dict("records")
+
+    # A previous process can finish optimisation and then fail during the much
+    # larger selected-checkpoint export/decoder phase.  Resuming such a run
+    # must not reopen an already exhausted early-stopping budget.
+    if bad_epochs >= int(training["patience"]):
+        print(
+            "The resumed checkpoint had already satisfied early stopping: "
+            f"bad_epochs={bad_epochs}, patience={int(training['patience'])}. "
+            "Skipping further optimisation and proceeding to best-checkpoint "
+            "export."
+        )
+        start_epoch = int(training["max_epochs"]) + 1
+
     for epoch in range(start_epoch, int(training["max_epochs"]) + 1):
         if str(training["scheduler"]) == "modern_tcn_type3_delayed":
             _set_delayed_schedule(optimizer, config, epoch)

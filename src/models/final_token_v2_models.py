@@ -11,10 +11,9 @@ architectures:
   from :mod:`src.models.dense_transformer_depth_sweep`;
 * Dimitri's vendored BaseDyGraph-V2 backbone is executed unchanged through an
   architecture-only importer, avoiding the optional Lightning dependency;
-* dense token heads use a hybrid objective: the five dissertation horizons
-  at internal causal origins and the complete 60-step coarse-s1 path at the
-  final forecast origin; the continuous V2 head predicts the five dissertation
-  horizons from every causal origin.
+* dense token heads support both the hybrid five-internal/final-60 objective
+  and the full all-origins/all-60 objective; the continuous V2 head predicts
+  the five dissertation horizons from every causal origin.
 
 Graph orientation is always ``A[target, source]``.
 """
@@ -327,6 +326,132 @@ class DenseOriginStructuredTokenPredictor(nn.Module):
         return (
             logits.reshape(batch, nodes, selected_steps, self.vocabulary_size)
             .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+
+    def forward_origins(
+        self,
+        hidden: Tensor,
+        origin_indices: Sequence[int] | Tensor,
+        *,
+        future_position_indices: Sequence[int] | Tensor | None = None,
+    ) -> Tensor:
+        """Vectorise structured-parallel prediction over several origins.
+
+        Parameters
+        ----------
+        hidden:
+            Causal backbone states with shape ``[B,T,N,D]``.
+        origin_indices:
+            Unique, increasing zero-based causal origins.  Every origin sees
+            only ``hidden[:, :origin+1]`` through an explicit cross-attention
+            padding mask.
+        future_position_indices:
+            Optional selected future-query positions.  ``None`` evaluates all
+            ``prediction_length`` positions.
+
+        Returns
+        -------
+        Tensor
+            Logits with shape ``[B,K,P,N,V]`` where ``K`` is the number of
+            origins and ``P`` is the number of requested future positions.
+
+        This method is mathematically equivalent to calling
+        :meth:`forward_origin` independently for each origin, but it batches
+        those calls to reduce Python and CUDA-kernel overhead.  It is used by
+        the full 60-origin x 60-position dense-token experiment.
+        """
+        if hidden.ndim != 4:
+            raise ValueError("hidden must have shape [B,T,N,D].")
+        batch, steps, nodes, width = map(int, hidden.shape)
+        if width != self.d_model:
+            raise ValueError("Hidden width differs from predictor d_model.")
+
+        origins = torch.as_tensor(
+            origin_indices,
+            device=hidden.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if int(origins.numel()) == 0:
+            raise ValueError("At least one origin is required.")
+        if int(origins.min().item()) < 0 or int(origins.max().item()) >= steps:
+            raise ValueError("Origin index is out of range.")
+        if int(origins.numel()) > 1 and not bool(
+            torch.all(origins[1:] > origins[:-1]).item()
+        ):
+            raise ValueError("Origin indices must be unique and increasing.")
+
+        if future_position_indices is None:
+            positions_index = torch.arange(
+                self.prediction_length,
+                device=hidden.device,
+                dtype=torch.long,
+            )
+        else:
+            positions_index = torch.as_tensor(
+                future_position_indices,
+                device=hidden.device,
+                dtype=torch.long,
+            ).reshape(-1)
+            if int(positions_index.numel()) == 0:
+                raise ValueError("At least one future position is required.")
+            if (
+                int(positions_index.min().item()) < 0
+                or int(positions_index.max().item()) >= self.prediction_length
+            ):
+                raise ValueError("Future position index is out of range.")
+            if int(positions_index.numel()) > 1 and not bool(
+                torch.all(positions_index[1:] > positions_index[:-1]).item()
+            ):
+                raise ValueError(
+                    "Future position indices must be unique and increasing."
+                )
+
+        origin_count = int(origins.numel())
+        selected_steps = int(positions_index.numel())
+
+        # Repeat the complete causal-state sequence for each requested origin,
+        # then mask keys after that origin.  Since the backbone states are
+        # themselves causal, this exactly reproduces the prefix memory used by
+        # ``forward_origin`` without zero-padding or future leakage.
+        memory = (
+            hidden[:, None]
+            .expand(batch, origin_count, steps, nodes, width)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+            .reshape(batch * origin_count * nodes, steps, width)
+        )
+        time_index = torch.arange(steps, device=hidden.device)
+        padding_by_origin = time_index[None, :] > origins[:, None]
+        context_padding_mask = (
+            padding_by_origin[None, :, None, :]
+            .expand(batch, origin_count, nodes, steps)
+            .reshape(batch * origin_count * nodes, steps)
+        )
+
+        summary = (
+            hidden.index_select(1, origins)
+            .reshape(batch * origin_count * nodes, width)
+        )
+        positions = self.future_position_embedding(positions_index)
+        future = self.input_norm(summary[:, None] + positions[None])
+        for layer in self.layers:
+            future = layer(
+                future,
+                memory,
+                self_attention_mask=None,
+                context_key_padding_mask=context_padding_mask,
+            )
+        logits = self.classifier(future)
+        return (
+            logits.reshape(
+                batch,
+                origin_count,
+                nodes,
+                selected_steps,
+                self.vocabulary_size,
+            )
+            .permute(0, 1, 3, 2, 4)
             .contiguous()
         )
 
