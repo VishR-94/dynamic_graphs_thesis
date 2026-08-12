@@ -234,6 +234,105 @@ def _causal_mask(
     )
 
 
+def token_selection_probabilities(
+    logits: Tensor,
+    *,
+    temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+) -> Tensor:
+    """Return the exact categorical distribution used for token sampling.
+
+    The returned tensor has the same leading dimensions as ``logits`` and a
+    final vocabulary dimension.  Temperature scaling, top-k filtering and
+    nucleus filtering are applied in exactly the same order as sampling.
+    This helper is also used for probability logging so the saved expected
+    sampling distribution cannot drift away from the distribution used by
+    :func:`select_token_ids`.
+    """
+    if logits.ndim < 2:
+        raise ValueError(
+            "logits must end with a vocabulary dimension."
+        )
+
+    if not torch.isfinite(logits).all():
+        raise ValueError(
+            "logits contains non-finite values."
+        )
+
+    if temperature <= 0:
+        raise ValueError(
+            "temperature must be positive."
+        )
+
+    vocabulary_size = int(logits.shape[-1])
+
+    if top_k < 0:
+        raise ValueError(
+            "top_k cannot be negative."
+        )
+
+    if top_k > vocabulary_size:
+        raise ValueError(
+            "top_k cannot exceed the vocabulary size."
+        )
+
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError(
+            "top_p must lie in (0, 1]."
+        )
+
+    filtered = logits / float(temperature)
+
+    if top_k > 0:
+        threshold = torch.topk(
+            filtered,
+            k=top_k,
+            dim=-1,
+        ).values[..., -1, None]
+        filtered = filtered.masked_fill(
+            filtered < threshold,
+            float("-inf"),
+        )
+
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(
+            filtered,
+            dim=-1,
+            descending=True,
+        )
+        sorted_probabilities = torch.softmax(
+            sorted_logits,
+            dim=-1,
+        )
+        cumulative = sorted_probabilities.cumsum(dim=-1)
+        remove = cumulative > top_p
+
+        # Retain the first token whose inclusion crosses top_p.
+        shifted_remove = remove.clone()
+        shifted_remove[..., 1:] = remove[..., :-1]
+        shifted_remove[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(
+            shifted_remove,
+            float("-inf"),
+        )
+        filtered = torch.full_like(
+            filtered,
+            float("-inf"),
+        ).scatter(
+            dim=-1,
+            index=sorted_indices,
+            src=sorted_logits,
+        )
+
+    probabilities = torch.softmax(filtered, dim=-1)
+    if not torch.isfinite(probabilities).all():
+        raise RuntimeError(
+            "Token filtering produced invalid probabilities."
+        )
+    return probabilities
+
+
 def select_token_ids(
     logits: Tensor,
     *,
@@ -258,134 +357,26 @@ def select_token_ids(
         )
 
     if mode == "argmax":
-        return logits.argmax(
-            dim=-1
-        )
+        return logits.argmax(dim=-1)
 
     if mode != "sample":
         raise ValueError(
             "mode must be 'argmax' or 'sample'."
         )
 
-    if temperature <= 0:
-        raise ValueError(
-            "temperature must be positive."
-        )
-
-    vocabulary_size = int(
-        logits.shape[-1]
+    probabilities = token_selection_probabilities(
+        logits,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
     )
-
-    if top_k < 0:
-        raise ValueError(
-            "top_k cannot be negative."
-        )
-
-    if top_k > vocabulary_size:
-        raise ValueError(
-            "top_k cannot exceed the vocabulary size."
-        )
-
-    if not 0.0 < top_p <= 1.0:
-        raise ValueError(
-            "top_p must lie in (0, 1]."
-        )
-
-    filtered = (
-        logits
-        / float(temperature)
-    )
-
-    if top_k > 0:
-        threshold = torch.topk(
-            filtered,
-            k=top_k,
-            dim=-1,
-        ).values[
-            ...,
-            -1,
-            None,
-        ]
-
-        filtered = filtered.masked_fill(
-            filtered < threshold,
-            float("-inf"),
-        )
-
-    if top_p < 1.0:
-        sorted_logits, sorted_indices = (
-            torch.sort(
-                filtered,
-                dim=-1,
-                descending=True,
-            )
-        )
-
-        sorted_probabilities = torch.softmax(
-            sorted_logits,
-            dim=-1,
-        )
-
-        cumulative = sorted_probabilities.cumsum(
-            dim=-1
-        )
-
-        remove = cumulative > top_p
-
-        # Retain the first token whose inclusion crosses top_p.
-        shifted_remove = remove.clone()
-        shifted_remove[
-            ...,
-            1:,
-        ] = remove[
-            ...,
-            :-1,
-        ]
-        shifted_remove[
-            ...,
-            0,
-        ] = False
-
-        sorted_logits = sorted_logits.masked_fill(
-            shifted_remove,
-            float("-inf"),
-        )
-
-        filtered = torch.full_like(
-            filtered,
-            float("-inf"),
-        ).scatter(
-            dim=-1,
-            index=sorted_indices,
-            src=sorted_logits,
-        )
-
-    probabilities = torch.softmax(
-        filtered,
-        dim=-1,
-    )
-
-    if not torch.isfinite(
-        probabilities
-    ).all():
-        raise RuntimeError(
-            "Token filtering produced invalid probabilities."
-        )
-
-    flat_probabilities = probabilities.reshape(
-        -1,
-        vocabulary_size,
-    )
-
+    vocabulary_size = int(logits.shape[-1])
     sampled = torch.multinomial(
-        flat_probabilities,
+        probabilities.reshape(-1, vocabulary_size),
         num_samples=1,
         replacement=True,
     ).squeeze(-1)
-
-    return sampled.reshape(
-        logits.shape[:-1]
-    )
+    return sampled.reshape(logits.shape[:-1])
 
 
 class FutureTransformerLayer(nn.Module):

@@ -42,6 +42,8 @@ from src.models.modern_tcn_graph_round2_token import (
 )
 from src.training.final_token_v2_specs import make_final_token_v2_specs
 from src.training.run_final_token_v2_experiment import (
+    _backfill_probability_aggregates,
+    _compute_token_probability_aggregates,
     _decode_token_split,
     _hybrid_dense_token_targets,
     _train_token_epoch,
@@ -495,6 +497,41 @@ def _test_v2() -> None:
         if not any(value is not None for value in gradients):
             raise AssertionError("A V2 graph scorer received no gradient.")
 
+    # The same exact-probability inference path used for the completed
+    # ModernTCN/dense-Transformer backfill must also work for Dimitri V2.
+    v2_spec = {
+        spec.model_kind: spec
+        for spec in make_final_token_v2_specs()
+    }["dimitri_v2_token"]
+    v2_config = _small_dense_config(v2_spec.config)
+    v2_dataset = CachedTokenGraphDataset(_token_cache(), validate=False)
+    probability_values = _compute_token_probability_aggregates(
+        model=model,
+        kind="dimitri_v2_token",
+        dataset=v2_dataset,
+        config=v2_config,
+        device=torch.device("cpu"),
+        temperature=1.0,
+        top_k=0,
+        top_p=0.9,
+        description="V2 probability contract",
+    )
+    for key in (
+        "raw_model_mean_probability",
+        "sampling_policy_mean_probability",
+    ):
+        values = torch.as_tensor(probability_values[key])
+        if tuple(values.shape) != (4, 3, 1024):
+            raise AssertionError(
+                f"Dimitri V2 {key} has the wrong shape: {tuple(values.shape)}"
+            )
+        torch.testing.assert_close(
+            values.sum(dim=-1),
+            torch.ones(4, 3),
+            atol=2.0e-5,
+            rtol=0.0,
+        )
+
     continuous = DimitriV2DenseContinuousForecaster(
         num_nodes=3, context_length=4, horizons=(1, 2, 4), input_channels=5
     )
@@ -631,6 +668,49 @@ def _test_exports_and_graph_hub() -> None:
         )
         if tuple(sampled.sampled_close_paths.shape) != (2, 3, 4, 3, 1):
             raise AssertionError("Decoded sampled Close paths have the wrong shape.")
+
+        policy_artifacts = load_evaluation_artifacts(
+            run_dir,
+            split="validation",
+            policy="temperature_1",
+        )
+        if policy_artifacts.token_artifacts is None:
+            raise AssertionError("Decoded policy has no token artifacts.")
+        raw_mean = torch.as_tensor(
+            policy_artifacts.token_artifacts[
+                "raw_model_mean_probability"
+            ]
+        )
+        sampling_mean = torch.as_tensor(
+            policy_artifacts.token_artifacts[
+                "sampling_policy_mean_probability"
+            ]
+        )
+        if tuple(raw_mean.shape) != (4, 3, 1024):
+            raise AssertionError(
+                "Raw full-vocabulary probability aggregate has the wrong shape."
+            )
+        if tuple(sampling_mean.shape) != (4, 3, 1024):
+            raise AssertionError(
+                "Sampling-policy probability aggregate has the wrong shape."
+            )
+        if not torch.allclose(
+            raw_mean.sum(dim=-1),
+            torch.ones(4, 3),
+            atol=2.0e-5,
+            rtol=0.0,
+        ):
+            raise AssertionError("Raw model probabilities do not sum to one.")
+        if not torch.allclose(
+            sampling_mean.sum(dim=-1),
+            torch.ones(4, 3),
+            atol=2.0e-5,
+            rtol=0.0,
+        ):
+            raise AssertionError(
+                "Sampling-policy probabilities do not sum to one."
+            )
+
         distribution = analyse_coarse_token_predictive_distribution(
             run_dir,
             split="validation",
@@ -640,6 +720,7 @@ def _test_exports_and_graph_hub() -> None:
             plot_top_n=5,
             bars=(
                 "mean_probability",
+                "sampling_policy_probability",
                 "hard_prediction_frequency",
                 "training_target_frequency",
                 "sampled_frequency",
@@ -649,6 +730,85 @@ def _test_exports_and_graph_hub() -> None:
         )
         if distribution["distribution_table"].empty:
             raise AssertionError("Token predictive-distribution analysis is empty.")
+        if distribution["probability_distribution_is_truncated"]:
+            raise AssertionError(
+                "Graph Hub ignored exact full-vocabulary probabilities."
+            )
+        if abs(
+            float(distribution["mean_predictive_distribution"].sum()) - 1.0
+        ) > 2.0e-5:
+            raise AssertionError(
+                "Graph Hub raw model distribution does not sum to one."
+            )
+        if abs(
+            float(distribution["sampling_policy_distribution"].sum()) - 1.0
+        ) > 2.0e-5:
+            raise AssertionError(
+                "Graph Hub sampling-policy distribution does not sum to one."
+            )
+
+        # Remove the new fields and verify the inference-only backfill repairs
+        # both the canonical temperature file and its analysis copy without
+        # resampling or invoking the frozen decoder.
+        aggregate_keys = {
+            "raw_model_mean_probability",
+            "sampling_policy_mean_probability",
+            "raw_model_mean_max_probability",
+            "sampling_policy_mean_max_probability",
+            "probability_future_steps",
+            "probability_aggregate_window_count",
+            "probability_aggregate_scope",
+            "probability_aggregate_schema_version",
+        }
+        primary_tokens = (
+            run_dir
+            / "temperature_sweep"
+            / "temperature_1"
+            / "validation_tokens.pt"
+        )
+        analysis_tokens = (
+            run_dir
+            / "analysis"
+            / "validation"
+            / "temperature_1"
+            / "tokens.pt"
+        )
+        payload = torch.load(
+            primary_tokens, map_location="cpu", weights_only=False
+        )
+        for key in aggregate_keys:
+            payload["token_artifacts"].pop(key, None)
+        torch.save(payload, primary_tokens)
+        torch.save(payload, analysis_tokens)
+        backfill_args = SimpleNamespace(
+            decode_splits=("validation",),
+            temperature=1.0,
+            top_k=0,
+            top_p=0.9,
+        )
+        _backfill_probability_aggregates(
+            args=backfill_args,
+            config=dense_config,
+            model=dense_model,
+            datasets=datasets,
+            device=torch.device("cpu"),
+            run_dir=run_dir,
+        )
+        repaired = torch.load(
+            primary_tokens, map_location="cpu", weights_only=False
+        )["token_artifacts"]
+        if not aggregate_keys.issubset(repaired):
+            raise AssertionError(
+                "Inference-only probability backfill did not restore the "
+                "complete aggregate schema."
+            )
+        repaired_analysis = torch.load(
+            analysis_tokens, map_location="cpu", weights_only=False
+        )["token_artifacts"]
+        if not aggregate_keys.issubset(repaired_analysis):
+            raise AssertionError(
+                "Probability backfill did not refresh the analysis copy."
+            )
 
         # The one-block ModernTCN token counterpart must also construct with no
         # Transformer refinement and retain its selected graph contract.

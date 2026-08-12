@@ -57,7 +57,9 @@ from src.data.dense_parallel_forecast_dataset import (
 )
 from src.data.load_candle_data import clean_candle_splits, load_candle_splits
 from src.evaluation.metrics import ForecastEvaluator
-from src.models.dynamic_graph.future_predictor import select_token_ids
+from src.models.dynamic_graph.future_predictor import (
+    token_selection_probabilities,
+)
 from src.models.final_token_v2_models import (
     DenseTokenBackboneOutput,
     DenseTransformerTokenForecaster,
@@ -97,6 +99,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--decode-sampled", action="store_true")
+    parser.add_argument(
+        "--backfill-probability-aggregates",
+        action="store_true",
+        help=(
+            "Run selected-checkpoint inference only and add exact raw-model "
+            "and post-sampling-policy probability aggregates to an existing "
+            "decoded temperature policy. Existing samples, decoded prices, "
+            "and metric tables are preserved."
+        ),
+    )
     parser.add_argument("--forecasting-config", type=Path, default=None)
     parser.add_argument("--sample-count", type=int, default=10)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -1423,6 +1435,295 @@ def _invalid_candle_mask(decoded: Tensor) -> Tensor:
     )
 
 
+def _probability_policy_label(temperature: float) -> str:
+    return f"temperature_{float(temperature):g}".replace(".", "p")
+
+
+def _finalise_probability_aggregates(
+    *,
+    raw_probability_sum: Tensor,
+    sampling_probability_sum: Tensor,
+    raw_max_probability_sum: Tensor,
+    sampling_max_probability_sum: Tensor,
+    window_count: int,
+    future_steps: int,
+) -> dict[str, Any]:
+    """Return exact all-window probability means in the policy schema."""
+
+    if int(window_count) <= 0:
+        raise ValueError("Probability aggregation requires at least one window.")
+    raw_mean = (raw_probability_sum / float(window_count)).to(torch.float32)
+    sampling_mean = (
+        sampling_probability_sum / float(window_count)
+    ).to(torch.float32)
+    raw_mean_max = (
+        raw_max_probability_sum / float(window_count)
+    ).to(torch.float32)
+    sampling_mean_max = (
+        sampling_max_probability_sum / float(window_count)
+    ).to(torch.float32)
+    if int(raw_mean.shape[0]) != int(future_steps):
+        raise ValueError(
+            "Probability future-step axis differs from prediction length."
+        )
+    for label, values in (
+        ("raw model", raw_mean),
+        ("sampling policy", sampling_mean),
+    ):
+        if values.ndim != 3:
+            raise ValueError(
+                f"{label} probability aggregate must have shape [P,N,V]."
+            )
+        row_sum_error = float(
+            (values.sum(dim=-1) - 1.0).abs().max().item()
+        )
+        if row_sum_error > 2.0e-5:
+            raise RuntimeError(
+                f"{label} probability aggregate is not normalised; "
+                f"maximum error={row_sum_error:.3e}."
+            )
+    return {
+        "raw_model_mean_probability": raw_mean,
+        "sampling_policy_mean_probability": sampling_mean,
+        "raw_model_mean_max_probability": raw_mean_max,
+        "sampling_policy_mean_max_probability": sampling_mean_max,
+        "probability_future_steps": list(range(1, int(future_steps) + 1)),
+        "probability_aggregate_window_count": int(window_count),
+        "probability_aggregate_scope": (
+            "mean over every decoded split window; future-step and asset "
+            "axes retained"
+        ),
+        "probability_aggregate_schema_version": 1,
+    }
+
+
+def _compute_token_probability_aggregates(
+    *,
+    model: nn.Module,
+    kind: str,
+    dataset: CachedTokenGraphDataset,
+    config: Mapping[str, Any],
+    device: torch.device,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    description: str,
+) -> dict[str, Any]:
+    """Infer exact probabilities only; do not sample or call the decoder."""
+
+    training = config["training"]
+    loader = _build_loader(
+        dataset,
+        batch_size=int(training["export_batch_size"]),
+        shuffle=False,
+        num_workers=int(training["num_workers"]),
+        seed=int(training["seed"]),
+        pin_memory=device.type == "cuda",
+    )
+    use_amp = bool(training["mixed_precision"]) and device.type == "cuda"
+    raw_sum: Tensor | None = None
+    sampling_sum: Tensor | None = None
+    raw_max_sum: Tensor | None = None
+    sampling_max_sum: Tensor | None = None
+    window_count = 0
+    model.eval()
+    with torch.inference_mode():
+        for batch in tqdm(
+            loader,
+            desc=description,
+            leave=False,
+            dynamic_ncols=True,
+        ):
+            context, _ = _token_batch(batch, device=device)
+            with _autocast_context(device, use_amp):
+                logits, _ = _forward_token_final(
+                    model,
+                    kind,
+                    context,
+                    include_components=False,
+                )
+            raw = torch.softmax(logits.float(), dim=-1)
+            sampling = token_selection_probabilities(
+                logits.float(),
+                temperature=float(temperature),
+                top_k=int(top_k),
+                top_p=float(top_p),
+            )
+            if raw_sum is None:
+                shape = tuple(int(value) for value in raw.shape[1:])
+                raw_sum = torch.zeros(shape, dtype=torch.float64)
+                sampling_sum = torch.zeros(shape, dtype=torch.float64)
+                raw_max_sum = torch.zeros(shape[:-1], dtype=torch.float64)
+                sampling_max_sum = torch.zeros(shape[:-1], dtype=torch.float64)
+            raw_sum.add_(raw.sum(dim=0).detach().cpu().to(torch.float64))
+            sampling_sum.add_(
+                sampling.sum(dim=0).detach().cpu().to(torch.float64)
+            )
+            raw_max_sum.add_(
+                raw.max(dim=-1).values.sum(dim=0)
+                .detach().cpu().to(torch.float64)
+            )
+            sampling_max_sum.add_(
+                sampling.max(dim=-1).values.sum(dim=0)
+                .detach().cpu().to(torch.float64)
+            )
+            window_count += int(context.shape[0])
+    if (
+        raw_sum is None
+        or sampling_sum is None
+        or raw_max_sum is None
+        or sampling_max_sum is None
+        or int(window_count) != len(dataset)
+    ):
+        raise RuntimeError(
+            "Probability backfill did not cover the complete split."
+        )
+    return _finalise_probability_aggregates(
+        raw_probability_sum=raw_sum,
+        sampling_probability_sum=sampling_sum,
+        raw_max_probability_sum=raw_max_sum,
+        sampling_max_probability_sum=sampling_max_sum,
+        window_count=window_count,
+        future_steps=int(config["data"]["prediction_length"]),
+    )
+
+
+def _load_existing_policy_token_payload(
+    *,
+    run_dir: Path,
+    split_name: str,
+    policy: str,
+) -> tuple[dict[str, Any], Path, Path]:
+    primary = (
+        run_dir
+        / "temperature_sweep"
+        / policy
+        / f"{split_name}_tokens.pt"
+    )
+    analysis = run_dir / "analysis" / split_name / policy / "tokens.pt"
+    source = primary if primary.is_file() else analysis
+    if not source.is_file():
+        raise FileNotFoundError(
+            "Probability backfill requires an existing sampled-policy token "
+            f"artifact for {split_name}/{policy}: {primary}"
+        )
+    payload = torch.load(source, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("token_artifacts"), dict
+    ):
+        raise TypeError(f"Invalid sampled token payload: {source}")
+    return payload, primary, analysis
+
+
+def _backfill_probability_aggregates(
+    *,
+    args: argparse.Namespace,
+    config: Mapping[str, Any],
+    model: nn.Module,
+    datasets: Mapping[str, CachedTokenGraphDataset],
+    device: torch.device,
+    run_dir: Path,
+) -> None:
+    """Repair old sampled policies without resampling or re-decoding prices."""
+
+    checkpoint = torch.load(
+        run_dir / "best_checkpoint.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    model.to(device)
+    requested = tuple(str(value) for value in args.decode_splits)
+    if not requested or any(
+        value not in {"validation", "test"} for value in requested
+    ):
+        raise ValueError(
+            "decode_splits must contain validation and/or test for backfill."
+        )
+    policy = _probability_policy_label(float(args.temperature))
+    for split_name in requested:
+        payload, primary, analysis = _load_existing_policy_token_payload(
+            run_dir=run_dir,
+            split_name=split_name,
+            policy=policy,
+        )
+        token_artifacts = payload["token_artifacts"]
+        expected_policy = {
+            "temperature": float(args.temperature),
+            "top_k": int(args.top_k),
+            "top_p": float(args.top_p),
+        }
+        for key, expected in expected_policy.items():
+            observed = token_artifacts.get(key)
+            mismatch = observed is None
+            if isinstance(expected, float) and observed is not None:
+                mismatch = not math.isclose(
+                    float(observed),
+                    expected,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                )
+            elif observed is not None:
+                mismatch = int(observed) != expected
+            if mismatch:
+                raise ValueError(
+                    f"Existing {split_name}/{policy} policy has "
+                    f"{key}={observed!r}; requested {expected!r}. "
+                    "Refusing to attach mismatched probabilities to the "
+                    "saved sampled paths."
+                )
+        aggregates = _compute_token_probability_aggregates(
+            model=model,
+            kind=str(config["model_kind"]),
+            dataset=datasets[split_name],
+            config=config,
+            device=device,
+            temperature=float(args.temperature),
+            top_k=int(args.top_k),
+            top_p=float(args.top_p),
+            description=f"probability backfill {split_name}",
+        )
+        token_artifacts.update(aggregates)
+        payload["probability_backfilled_at_utc"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        _atomic_torch_save(payload, primary)
+        analysis.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(primary, analysis)
+
+        sampled_path = (
+            run_dir
+            / "temperature_sweep"
+            / policy
+            / f"{split_name}_sampled_price_paths.pt"
+        )
+        if sampled_path.is_file():
+            sampled_payload = torch.load(
+                sampled_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            sampled_values = sampled_payload.get(
+                "sampled_price_path_artifacts"
+            )
+            if isinstance(sampled_values, dict):
+                sampled_values.update(aggregates)
+                _atomic_torch_save(sampled_payload, sampled_path)
+                sampled_analysis = (
+                    run_dir
+                    / "analysis"
+                    / split_name
+                    / policy
+                    / "sampled_price_paths.pt"
+                )
+                sampled_analysis.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(sampled_path, sampled_analysis)
+        print(
+            f"Backfilled exact probabilities: {run_dir.name} / "
+            f"{split_name} / {policy}"
+        )
+
+
 def _decode_token_split(
     *,
     model: nn.Module,
@@ -1453,6 +1754,17 @@ def _decode_token_split(
     nodes = dataset.num_assets
     sampled_tokens = torch.empty(args.sample_count, windows, prediction, nodes, dtype=torch.int16)
     sampled_close = torch.empty(args.sample_count, windows, prediction, nodes, 1, dtype=torch.float32)
+
+    # Probability aggregates are accumulated over every saved window while
+    # preserving the future-step and asset axes.  This is the exact quantity
+    # required by Graph Hub: E_window[p(token | context)] for every token.
+    # We deliberately do not save the enormous per-window 1,024-way tensor.
+    raw_probability_sum: Tensor | None = None
+    sampling_probability_sum: Tensor | None = None
+    raw_max_probability_sum: Tensor | None = None
+    sampling_max_probability_sum: Tensor | None = None
+    probability_window_count = 0
+
     cursor = 0
     invalid_paths = invalid_path_total = invalid_ensemble = invalid_ensemble_total = 0
     model.eval()
@@ -1461,20 +1773,71 @@ def _decode_token_split(
             context, _ = _token_batch(batch, device=device)
             with _autocast_context(device, use_amp):
                 logits, _ = _forward_token_final(model, kind, context, include_components=False)
-            samples = torch.stack(
-                [
-                    select_token_ids(
-                        logits,
-                        mode="sample",
-                        temperature=float(args.temperature),
-                        top_k=int(args.top_k),
-                        top_p=float(args.top_p),
-                    )
-                    for _ in range(int(args.sample_count))
-                ],
-                dim=0,
-            ).cpu().long()
+
+            # Raw checkpoint probabilities before any sampling policy.
+            raw_probabilities = torch.softmax(logits.float(), dim=-1)
+
+            # Exact post-temperature/top-k/top-p categorical distribution used
+            # by the sampler.  Computing it once avoids repeating the full
+            # filtering and softmax operation for each of the ten paths.
+            sampling_probabilities = token_selection_probabilities(
+                logits.float(),
+                temperature=float(args.temperature),
+                top_k=int(args.top_k),
+                top_p=float(args.top_p),
+            )
+
+            if raw_probability_sum is None:
+                aggregate_shape = tuple(int(value) for value in raw_probabilities.shape[1:])
+                raw_probability_sum = torch.zeros(
+                    aggregate_shape, dtype=torch.float64
+                )
+                sampling_probability_sum = torch.zeros(
+                    aggregate_shape, dtype=torch.float64
+                )
+                max_shape = aggregate_shape[:-1]
+                raw_max_probability_sum = torch.zeros(
+                    max_shape, dtype=torch.float64
+                )
+                sampling_max_probability_sum = torch.zeros(
+                    max_shape, dtype=torch.float64
+                )
+
+            raw_probability_sum.add_(
+                raw_probabilities.sum(dim=0).detach().cpu().to(torch.float64)
+            )
+            sampling_probability_sum.add_(
+                sampling_probabilities.sum(dim=0).detach().cpu().to(torch.float64)
+            )
+            raw_max_probability_sum.add_(
+                raw_probabilities.max(dim=-1).values.sum(dim=0)
+                .detach().cpu().to(torch.float64)
+            )
+            sampling_max_probability_sum.add_(
+                sampling_probabilities.max(dim=-1).values.sum(dim=0)
+                .detach().cpu().to(torch.float64)
+            )
+
             current = int(context.shape[0])
+            probability_window_count += current
+
+            vocabulary_size = int(sampling_probabilities.shape[-1])
+            flat_probabilities = sampling_probabilities.reshape(
+                -1, vocabulary_size
+            )
+            sampled_flat = torch.multinomial(
+                flat_probabilities,
+                num_samples=int(args.sample_count),
+                replacement=True,
+            )
+            samples = (
+                sampled_flat
+                .reshape(current, prediction, nodes, int(args.sample_count))
+                .permute(3, 0, 1, 2)
+                .contiguous()
+                .cpu()
+                .long()
+            )
             start, stop = cursor, cursor + current
             sampled_tokens[:, start:stop] = samples.to(torch.int16)
             context_pairs = torch.as_tensor(batch["context_tokens"]).cpu().long()
@@ -1502,6 +1865,43 @@ def _decode_token_split(
             cursor = stop
     if cursor != windows or not torch.isfinite(sampled_close).all():
         raise RuntimeError("Sampled decoding did not produce a complete finite path.")
+    if (
+        raw_probability_sum is None
+        or sampling_probability_sum is None
+        or raw_max_probability_sum is None
+        or sampling_max_probability_sum is None
+        or probability_window_count != windows
+    ):
+        raise RuntimeError(
+            "Probability aggregation did not cover every decoded window."
+        )
+
+    raw_mean_probability = (
+        raw_probability_sum / float(probability_window_count)
+    ).to(torch.float32)
+    sampling_mean_probability = (
+        sampling_probability_sum / float(probability_window_count)
+    ).to(torch.float32)
+    raw_mean_max_probability = (
+        raw_max_probability_sum / float(probability_window_count)
+    ).to(torch.float32)
+    sampling_mean_max_probability = (
+        sampling_max_probability_sum / float(probability_window_count)
+    ).to(torch.float32)
+
+    for label, values in (
+        ("raw model", raw_mean_probability),
+        ("sampling policy", sampling_mean_probability),
+    ):
+        row_sum_error = float(
+            (values.sum(dim=-1) - 1.0).abs().max().item()
+        )
+        if row_sum_error > 2.0e-5:
+            raise RuntimeError(
+                f"{label} probability aggregate is not normalised; "
+                f"maximum error={row_sum_error:.3e}."
+            )
+
     evaluation_indices = torch.tensor([int(value) - 1 for value in config["data"]["evaluation_horizons"]], dtype=torch.long)
     ensemble_dense = sampled_close.mean(dim=0)
     prediction_result = {
@@ -1555,6 +1955,15 @@ def _decode_token_split(
         "sample_count": int(args.sample_count),
         "sampling_seed": int(args.sampling_seed),
         "averaging_space": "decoded raw continuous Close",
+        "raw_model_mean_probability": raw_mean_probability,
+        "sampling_policy_mean_probability": sampling_mean_probability,
+        "raw_model_mean_max_probability": raw_mean_max_probability,
+        "sampling_policy_mean_max_probability": sampling_mean_max_probability,
+        "probability_aggregate_window_count": int(probability_window_count),
+        "probability_aggregate_scope": (
+            "mean over every decoded split window; future-step and asset axes retained"
+        ),
+        "probability_aggregate_schema_version": 1,
     }
     diagnostics = {
         "split": split_name,
@@ -1562,6 +1971,13 @@ def _decode_token_split(
         "sample_path_invalid_candle_rate_percent": 100.0 * invalid_paths / max(invalid_path_total, 1),
         "ensemble_invalid_candle_rate_percent": 100.0 * invalid_ensemble / max(invalid_ensemble_total, 1),
         "bootstrap_sessions": 10000,
+        "probability_aggregate_window_count": int(probability_window_count),
+        "raw_probability_row_sum_max_error": float(
+            (raw_mean_probability.sum(dim=-1) - 1.0).abs().max().item()
+        ),
+        "sampling_probability_row_sum_max_error": float(
+            (sampling_mean_probability.sum(dim=-1) - 1.0).abs().max().item()
+        ),
     }
     paths = {
         "predictions": policy_root / f"{split_name}_predictions.pt",
@@ -1575,6 +1991,16 @@ def _decode_token_split(
     _atomic_torch_save({"epoch": checkpoint_epoch, "token_artifacts": {
         "sampled_s1_paths": sampled_tokens,
         "sampled_s1_evaluation": sampled_tokens.index_select(2, evaluation_indices),
+        "raw_model_mean_probability": raw_mean_probability,
+        "sampling_policy_mean_probability": sampling_mean_probability,
+        "raw_model_mean_max_probability": raw_mean_max_probability,
+        "sampling_policy_mean_max_probability": sampling_mean_max_probability,
+        "probability_future_steps": list(range(1, prediction + 1)),
+        "probability_aggregate_window_count": int(probability_window_count),
+        "probability_aggregate_scope": (
+            "mean over every decoded split window; future-step and asset axes retained"
+        ),
+        "probability_aggregate_schema_version": 1,
         "target_s1": torch.as_tensor(dataset.cache["target_s1"]).to(torch.int16),
         "temperature": float(args.temperature),
         "top_k": int(args.top_k),
@@ -1986,7 +2412,21 @@ def main() -> None:
         )
     device = _resolve_device(args.device)
     _set_seed(int(config["training"]["seed"]))
-    run_dir = _prepare_run_dir(args.output_dir, args.run_name, overwrite=args.overwrite, resume=args.resume or args.decode_sampled)
+    if args.decode_sampled and args.backfill_probability_aggregates:
+        raise ValueError(
+            "--decode-sampled and --backfill-probability-aggregates are "
+            "mutually exclusive."
+        )
+    run_dir = _prepare_run_dir(
+        args.output_dir,
+        args.run_name,
+        overwrite=args.overwrite,
+        resume=(
+            args.resume
+            or args.decode_sampled
+            or args.backfill_probability_aggregates
+        ),
+    )
     train_split, validation_split, test_split = _load_raw_splits(args.data_dir)
     raw_splits = {"train": train_split, "validation": validation_split, "test": test_split}
     token_datasets: dict[str, CachedTokenGraphDataset] | None = None
@@ -2003,6 +2443,20 @@ def main() -> None:
         train_split=train_split,
         device=device,
     )
+    if args.backfill_probability_aggregates:
+        if token_datasets is None:
+            raise ValueError(
+                "Continuous V2 has no token-probability backfill mode."
+            )
+        _backfill_probability_aggregates(
+            args=args,
+            config=config,
+            model=model,
+            datasets=token_datasets,
+            device=device,
+            run_dir=run_dir,
+        )
+        return
     if args.decode_sampled:
         if token_datasets is None:
             raise ValueError("Continuous V2 has no token-decoding mode.")

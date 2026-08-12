@@ -41,10 +41,11 @@ Current public API
 
 from __future__ import annotations
 
-EVALUATION_MODULE_VERSION = "2026-08-11-v13-intraday-averages"
+EVALUATION_MODULE_VERSION = "2026-08-12-v14-exact-token-probabilities"
 
 import json
 import re
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -8642,6 +8643,7 @@ WindowSelector = int | Literal["random"] | None
 AssetSelector = str | int | Literal["random"]
 TokenDistributionBar = Literal[
     "mean_probability",
+    "sampling_policy_probability",
     "hard_prediction_frequency",
     "training_target_frequency",
     "sampled_frequency",
@@ -10370,6 +10372,331 @@ def _distribution_entropy_from_probabilities(values: Tensor) -> float:
     return float(-(selected * selected.log()).sum().item())
 
 
+def _analyse_exact_token_predictive_distribution(
+    run_dir: Path,
+    *,
+    split: EvaluationSplitInput | str,
+    policy: str | None,
+    asset: str | int | None,
+    horizon: int,
+    window_indices: Sequence[int] | None,
+    max_windows: int | None,
+) -> dict[str, Any] | None:
+    """Load exact full-vocabulary probability means saved during decoding.
+
+    The policy artefact stores ``[future_step, asset, vocabulary]`` means over
+    every decoded window.  This is sufficient for exact all-window and
+    per-asset marginal distributions without storing the enormous
+    per-window logit tensor.  Arbitrary window subsets are intentionally not
+    approximated from these aggregates.
+    """
+
+    try:
+        policy_artifacts = load_evaluation_artifacts(
+            run_dir,
+            split=split,
+            policy=policy,
+        )
+    except FileNotFoundError:
+        return None
+    token_artifacts = policy_artifacts.token_artifacts
+    if token_artifacts is None:
+        return None
+
+    raw_values = token_artifacts.get("raw_model_mean_probability")
+    sampling_values = token_artifacts.get(
+        "sampling_policy_mean_probability"
+    )
+    future_steps_raw = token_artifacts.get("probability_future_steps")
+    if raw_values is None or sampling_values is None or future_steps_raw is None:
+        return None
+
+    raw_mean = torch.as_tensor(raw_values, dtype=torch.float64)
+    sampling_mean = torch.as_tensor(sampling_values, dtype=torch.float64)
+    if raw_mean.ndim != 3 or tuple(raw_mean.shape) != tuple(sampling_mean.shape):
+        raise ValueError(
+            "Exact probability aggregates must share shape "
+            "[future_step,asset,vocabulary]."
+        )
+    future_steps = tuple(int(value) for value in future_steps_raw)
+    if len(future_steps) != int(raw_mean.shape[0]):
+        raise ValueError(
+            "probability_future_steps does not match the aggregate horizon axis."
+        )
+    requested_horizon = int(horizon)
+    if requested_horizon not in future_steps:
+        raise ValueError(
+            f"Exact probability aggregates exist at future steps "
+            f"{future_steps}; received h={requested_horizon}."
+        )
+
+    aggregate_windows = int(
+        token_artifacts.get("probability_aggregate_window_count", 0)
+    )
+    if aggregate_windows <= 0:
+        raise ValueError(
+            "Exact probability aggregate has no valid window count."
+        )
+    if window_indices is not None or (
+        max_windows is not None and int(max_windows) < aggregate_windows
+    ):
+        warnings.warn(
+            "Exact full-vocabulary probabilities are stored as a complete-"
+            "split aggregate. window_indices/max_windows are ignored for the "
+            "probability, hard-frequency, target-frequency and sampled-"
+            "frequency comparison so that all bars use the same saved split "
+            f"of {aggregate_windows} windows.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    step_index = future_steps.index(requested_horizon)
+    raw_at_horizon = raw_mean[step_index]
+    sampling_at_horizon = sampling_mean[step_index]
+    asset_index, asset_label = _resolve_saved_token_asset(
+        asset,
+        policy_artifacts.info.asset_cols,
+    )
+    if asset_index is None:
+        raw_distribution = raw_at_horizon.mean(dim=0)
+        sampling_distribution = sampling_at_horizon.mean(dim=0)
+        selected_asset_count = int(raw_at_horizon.shape[0])
+    else:
+        raw_distribution = raw_at_horizon[asset_index]
+        sampling_distribution = sampling_at_horizon[asset_index]
+        selected_asset_count = 1
+
+    for label, values in (
+        ("raw model", raw_distribution),
+        ("sampling policy", sampling_distribution),
+    ):
+        if not torch.isfinite(values).all() or bool((values < 0).any()):
+            raise ValueError(f"{label} probability aggregate is invalid.")
+        normalisation_error = abs(float(values.sum().item()) - 1.0)
+        if normalisation_error > 2.0e-5:
+            raise ValueError(
+                f"{label} probability aggregate does not sum to one; "
+                f"error={normalisation_error:.3e}."
+            )
+
+    # Hard predictions come from the deterministic selected-checkpoint export.
+    best = load_evaluation_artifacts(
+        run_dir,
+        split=split,
+        policy="best",
+    )
+    if best.token_artifacts is None:
+        raise FileNotFoundError(
+            "No selected-checkpoint token artefact exists for hard predictions."
+        )
+    predicted_raw = best.token_artifacts.get(
+        "predicted_s1", best.token_artifacts.get("generated_s1")
+    )
+    if predicted_raw is None:
+        top_ids = best.token_artifacts.get(
+            "top10_s1_ids_at_reported_horizons"
+        )
+        if top_ids is None:
+            raise KeyError(
+                "Selected-checkpoint token artefacts contain neither "
+                "predicted_s1 nor top-10 IDs."
+            )
+        reported = _saved_token_horizons(
+            best.token_artifacts, best.info.horizons
+        )
+        if requested_horizon not in reported:
+            raise ValueError(
+                "Hard predictions are unavailable at the requested horizon."
+            )
+        hard_values = torch.as_tensor(top_ids).long()[
+            :, reported.index(requested_horizon), :, 0
+        ]
+    else:
+        predicted = torch.as_tensor(predicted_raw).long()
+        if predicted.ndim != 3 or int(predicted.shape[1]) < requested_horizon:
+            raise ValueError(
+                "predicted_s1 must have shape [window,future_step,asset] "
+                "and contain the requested horizon."
+            )
+        hard_values = predicted[:, requested_horizon - 1]
+    if asset_index is not None:
+        hard_values = hard_values[:, asset_index : asset_index + 1]
+    if int(hard_values.shape[0]) != aggregate_windows:
+        raise ValueError(
+            "Selected-checkpoint hard predictions and probability aggregate "
+            "cover different window counts."
+        )
+
+    training = load_evaluation_artifacts(
+        run_dir,
+        split="train",
+        policy="best",
+    )
+    if training.token_artifacts is None:
+        raise FileNotFoundError(
+            "No selected-checkpoint training token artefact exists."
+        )
+    training_reported = _saved_token_horizons(
+        training.token_artifacts, training.info.horizons
+    )
+    training_targets = _saved_token_targets_for_horizons(
+        training.token_artifacts,
+        requested_horizons=(requested_horizon,),
+        reported_horizons=training_reported,
+    )[:, 0]
+    if asset_index is not None:
+        training_targets = training_targets[:, asset_index : asset_index + 1]
+
+    vocabulary_size = int(raw_distribution.numel())
+    hard_flat = hard_values.reshape(-1)
+    training_flat = training_targets.reshape(-1).long()
+    hard_counts = torch.bincount(
+        hard_flat, minlength=vocabulary_size
+    ).to(torch.float64)
+    training_counts = torch.bincount(
+        training_flat, minlength=vocabulary_size
+    ).to(torch.float64)
+    hard_frequency = hard_counts / max(int(hard_flat.numel()), 1)
+    training_frequency = training_counts / max(int(training_flat.numel()), 1)
+
+    raw_entropy = _distribution_entropy_from_probabilities(raw_distribution)
+    policy_entropy = _distribution_entropy_from_probabilities(
+        sampling_distribution
+    )
+    hard_entropy = _distribution_entropy_from_probabilities(hard_frequency)
+
+    raw_max_values = token_artifacts.get("raw_model_mean_max_probability")
+    policy_max_values = token_artifacts.get(
+        "sampling_policy_mean_max_probability"
+    )
+    raw_mean_max = None
+    policy_mean_max = None
+    if raw_max_values is not None:
+        raw_max_tensor = torch.as_tensor(raw_max_values, dtype=torch.float64)
+        selected = raw_max_tensor[step_index]
+        raw_mean_max = float(
+            selected.mean().item()
+            if asset_index is None
+            else selected[asset_index].item()
+        )
+    if policy_max_values is not None:
+        policy_max_tensor = torch.as_tensor(
+            policy_max_values, dtype=torch.float64
+        )
+        selected = policy_max_tensor[step_index]
+        policy_mean_max = float(
+            selected.mean().item()
+            if asset_index is None
+            else selected[asset_index].item()
+        )
+
+    summary = pd.DataFrame(
+        [
+            {
+                "Checkpoint": "best",
+                "Asset": asset_label,
+                "Horizon": requested_horizon,
+                "Evaluation split": policy_artifacts.split,
+                "Policy": policy_artifacts.policy,
+                "Evaluation windows": aggregate_windows,
+                "Evaluation predictions": (
+                    aggregate_windows * selected_asset_count
+                ),
+                "Training targets": int(training_flat.numel()),
+                "Vocabulary size": vocabulary_size,
+                "Raw model probability sum (%)": (
+                    100.0 * float(raw_distribution.sum().item())
+                ),
+                "Sampling-policy probability sum (%)": (
+                    100.0 * float(sampling_distribution.sum().item())
+                ),
+                "Mean maximum raw-model probability (%)": (
+                    None if raw_mean_max is None else 100.0 * raw_mean_max
+                ),
+                "Mean maximum sampling-policy probability (%)": (
+                    None
+                    if policy_mean_max is None
+                    else 100.0 * policy_mean_max
+                ),
+                "Raw model marginal entropy (nats)": raw_entropy,
+                "Sampling-policy marginal entropy (nats)": policy_entropy,
+                "Hard-prediction entropy (nats)": hard_entropy,
+                "Hard-prediction effective vocabulary": float(
+                    np.exp(hard_entropy)
+                ),
+                "Distinct hard-predicted tokens": int(
+                    (hard_counts > 0).sum().item()
+                ),
+                "Largest hard-prediction share (%)": float(
+                    hard_frequency.max().item() * 100.0
+                ),
+                "Probability note": (
+                    "Exact full 1,024-way mean probabilities over every "
+                    "decoded split window. Raw model probabilities are before "
+                    "temperature/top-k/top-p; sampling-policy probabilities "
+                    "are after filtering and renormalisation."
+                ),
+            }
+        ]
+    )
+
+    token_index = pd.Index(
+        np.arange(vocabulary_size), name="Token ID"
+    )
+    token_table = pd.DataFrame(
+        {
+            "Token ID": np.arange(vocabulary_size),
+            "Mean model probability (%)": (
+                raw_distribution.numpy() * 100.0
+            ),
+            "Expected sampling-policy probability (%)": (
+                sampling_distribution.numpy() * 100.0
+            ),
+            "Hard argmax frequency (%)": hard_frequency.numpy() * 100.0,
+            "Training target frequency (%)": (
+                training_frequency.numpy() * 100.0
+            ),
+        }
+    ).sort_values(
+        ["Mean model probability (%)", "Token ID"],
+        ascending=[False, True],
+        ignore_index=True,
+    )
+
+    return {
+        "summary": summary,
+        "token_table": token_table,
+        "mean_predictive_distribution": pd.Series(
+            raw_distribution.numpy(),
+            index=token_index,
+            name="Mean model probability",
+        ),
+        "sampling_policy_distribution": pd.Series(
+            sampling_distribution.numpy(),
+            index=token_index,
+            name="Expected sampling-policy probability",
+        ),
+        "hard_prediction_distribution": pd.Series(
+            hard_frequency.numpy(),
+            index=token_index,
+            name="Hard prediction frequency",
+        ),
+        "training_target_distribution": pd.Series(
+            training_frequency.numpy(),
+            index=token_index,
+            name="Training target frequency",
+        ),
+        "validation_window_indices": tuple(range(aggregate_windows)),
+        "evaluation_window_indices": tuple(range(aggregate_windows)),
+        "probability_mass_coverage": 1.0,
+        "probability_distribution_is_truncated": False,
+        "saved_probability_top_k": None,
+        "probability_aggregate_window_count": aggregate_windows,
+        "figure": None,
+        "axes": None,
+    }
+
+
 def _analyse_saved_token_predictive_distribution(
     run_dir: Path,
     *,
@@ -10680,6 +11007,7 @@ def analyse_coarse_token_predictive_distribution(
 
     allowed = {
         "mean_probability",
+        "sampling_policy_probability",
         "hard_prediction_frequency",
         "training_target_frequency",
         "sampled_frequency",
@@ -10704,20 +11032,32 @@ def analyse_coarse_token_predictive_distribution(
 
     base: dict[str, Any] | None = None
     if source == "best":
-        base = _analyse_saved_token_predictive_distribution(
+        # New decoding artefacts contain exact full-vocabulary probability
+        # aggregates from the selected checkpoint.  Prefer them over the
+        # historical top-10-only fallback.
+        base = _analyse_exact_token_predictive_distribution(
             run_dir,
             split=resolved_split,
-            # Probability/top-k summaries belong to the selected checkpoint,
-            # not to a sampling policy.  The sampled-frequency branch below
-            # independently loads the requested temperature bundle.
-            policy="best",
+            policy=policy,
             asset=selected_asset,
             horizon=int(horizon),
             window_indices=window_indices,
             max_windows=max_windows,
-            plot_top_n=plot_top_n,
-            figsize=figsize,
         )
+        if base is None:
+            base = _analyse_saved_token_predictive_distribution(
+                run_dir,
+                split=resolved_split,
+                # Compact probability/top-k summaries belong to the selected
+                # checkpoint, not to a sampling policy.
+                policy="best",
+                asset=selected_asset,
+                horizon=int(horizon),
+                window_indices=window_indices,
+                max_windows=max_windows,
+                plot_top_n=plot_top_n,
+                figsize=figsize,
+            )
 
     if base is None:
         # Historical fallback.  New BaseDyGraph-v1/Round-2 token models never
@@ -10819,6 +11159,10 @@ def analyse_coarse_token_predictive_distribution(
         "hard_prediction_frequency": base["hard_prediction_distribution"],
         "training_target_frequency": base["training_target_distribution"],
     }
+    if base.get("sampling_policy_distribution") is not None:
+        distributions["sampling_policy_probability"] = base[
+            "sampling_policy_distribution"
+        ]
     if sampled_series is not None:
         distributions["sampled_frequency"] = sampled_series
 
@@ -10830,6 +11174,9 @@ def analyse_coarse_token_predictive_distribution(
     )
     labels = {
         "mean_probability": probability_label,
+        "sampling_policy_probability": (
+            "Expected sampling-policy probability"
+        ),
         "hard_prediction_frequency": "Hard argmax frequency",
         "training_target_frequency": "Training target frequency",
         "sampled_frequency": "Actual sampled frequency",
@@ -10884,6 +11231,11 @@ def analyse_coarse_token_predictive_distribution(
             if base.get("probability_distribution_is_truncated")
             else "Mean model probability (%)"
         ): distributions["mean_probability"].to_numpy() * 100.0,
+        "Expected sampling-policy probability (%)": (
+            distributions["sampling_policy_probability"].to_numpy() * 100.0
+            if "sampling_policy_probability" in distributions
+            else np.full(vocabulary_size, np.nan)
+        ),
         "Hard argmax frequency (%)": distributions[
             "hard_prediction_frequency"
         ].to_numpy()
