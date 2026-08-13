@@ -5,7 +5,8 @@ from __future__ import annotations
 The forecaster generates ten fixed coarse-token paths.  Only the pretrained
 coarse reconstruction decoder is optimised.  The loss is the stretched-
 exponential weighted cumulative-log-change MAE of the ten-path decoded ensemble
-at every future minute 1..60.
+at every future minute 1..60.  Decoder optimisation mirrors the executable
+Kronos tokenizer fine-tuning recipe: AdamW with a per-step OneCycleLR schedule.
 """
 
 import argparse
@@ -178,6 +179,53 @@ def _loader(
     if num_workers:
         values["prefetch_factor"] = 2
     return DataLoader(**values)
+
+
+def _build_decoder_optimizer_and_scheduler(
+    decoder: nn.Module,
+    training: Mapping[str, Any],
+    *,
+    steps_per_epoch: int,
+) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.OneCycleLR]:
+    """Build the executable Kronos tokenizer fine-tuning recipe.
+
+    The official script uses AdamW and steps OneCycleLR after every optimiser
+    update.  All defaults that the official code leaves implicit are pinned
+    here so a resumed dissertation run is reproducible across PyTorch versions.
+    """
+    if str(training.get("optimizer")) != "adamw":
+        raise ValueError("Decoder post-training requires optimizer='adamw'.")
+    if str(training.get("scheduler")) != "one_cycle":
+        raise ValueError("Decoder post-training requires scheduler='one_cycle'.")
+    if int(steps_per_epoch) <= 0:
+        raise ValueError("steps_per_epoch must be positive.")
+
+    max_learning_rate = float(training["max_learning_rate"])
+    betas = tuple(float(value) for value in training.get("adam_betas", (0.9, 0.999)))
+    if len(betas) != 2:
+        raise ValueError("adam_betas must contain exactly two values.")
+
+    optimizer = torch.optim.AdamW(
+        decoder.parameters(),
+        lr=max_learning_rate,
+        betas=betas,
+        eps=float(training.get("adam_eps", 1.0e-8)),
+        weight_decay=float(training["weight_decay"]),
+    )
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer=optimizer,
+        max_lr=max_learning_rate,
+        steps_per_epoch=int(steps_per_epoch),
+        epochs=int(training["max_epochs"]),
+        pct_start=float(training["one_cycle_pct_start"]),
+        anneal_strategy=str(training["one_cycle_anneal_strategy"]),
+        cycle_momentum=bool(training["one_cycle_cycle_momentum"]),
+        base_momentum=float(training["one_cycle_base_momentum"]),
+        max_momentum=float(training["one_cycle_max_momentum"]),
+        div_factor=float(training["one_cycle_div_factor"]),
+        final_div_factor=float(training["one_cycle_final_div_factor"]),
+    )
+    return optimizer, scheduler
 
 
 def _prepare_run_dir(output_dir: Path, run_name: str, *, overwrite: bool, resume: bool) -> Path:
@@ -548,6 +596,7 @@ def _train_epoch(
     decoder: TrainableKronosCoarseDecoder,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.OneCycleLR,
     scaler: Any,
     loss_function: WeightedAll60Loss,
     sample_chunk_size: int,
@@ -563,6 +612,9 @@ def _train_epoch(
     total_windows = 0
     gradient_norm_sum = 0.0
     batches = 0
+    optimizer_steps = 0
+    skipped_optimizer_steps = 0
+    learning_rates_used: list[float] = []
 
     for raw_batch in tqdm(
         loader,
@@ -614,8 +666,17 @@ def _train_epoch(
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             decoder.parameters(), float(gradient_clip_norm)
         )
+        learning_rates_used.append(float(optimizer.param_groups[0]["lr"]))
+        scale_before = float(scaler.get_scale())
         scaler.step(optimizer)
         scaler.update()
+        scale_after = float(scaler.get_scale())
+        step_was_skipped = bool(scaler.is_enabled() and scale_after < scale_before)
+        if step_was_skipped:
+            skipped_optimizer_steps += 1
+        else:
+            scheduler.step()
+            optimizer_steps += 1
 
         current = int(values["true_close"].shape[0])
         total_loss += float(loss.detach().item()) * current
@@ -623,9 +684,17 @@ def _train_epoch(
         gradient_norm_sum += float(torch.as_tensor(gradient_norm).item())
         batches += 1
 
+    if not learning_rates_used:
+        raise RuntimeError("The decoder training loader produced no batches.")
     return {
         "loss": total_loss / max(total_windows, 1),
         "gradient_norm": gradient_norm_sum / max(batches, 1),
+        "learning_rate_start": learning_rates_used[0],
+        "learning_rate_end": float(optimizer.param_groups[0]["lr"]),
+        "learning_rate_min": min(learning_rates_used),
+        "learning_rate_max": max(learning_rates_used),
+        "optimizer_steps": float(optimizer_steps),
+        "skipped_optimizer_steps": float(skipped_optimizer_steps),
     }
 
 
@@ -680,6 +749,7 @@ def _checkpoint_payload(
     epoch: int,
     decoder: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.OneCycleLR,
     best_score: float,
     best_epoch: int,
     bad_epochs: int,
@@ -689,6 +759,7 @@ def _checkpoint_payload(
         "epoch": int(epoch),
         "decoder_state_dict": decoder.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "best_score": float(best_score),
         "best_epoch": int(best_epoch),
         "bad_epochs": int(bad_epochs),
@@ -1045,6 +1116,29 @@ def _metadata(
         "epochs_completed": int(epochs_completed),
         "selection_split": "validation",
         "selection_metric": config["training"]["selection_metric"],
+        "optimisation_profile": config["training"].get("optimisation_profile"),
+        "optimizer": config["training"]["optimizer"],
+        "scheduler": config["training"]["scheduler"],
+        "max_learning_rate": float(config["training"]["max_learning_rate"]),
+        "initial_learning_rate": float(
+            config["training"]["initial_learning_rate"]
+        ),
+        "minimum_learning_rate": float(
+            config["training"]["minimum_learning_rate"]
+        ),
+        "weight_decay": float(config["training"]["weight_decay"]),
+        "one_cycle_pct_start": float(
+            config["training"]["one_cycle_pct_start"]
+        ),
+        "one_cycle_div_factor": float(
+            config["training"]["one_cycle_div_factor"]
+        ),
+        "one_cycle_final_div_factor": float(
+            config["training"]["one_cycle_final_div_factor"]
+        ),
+        "gradient_clip_norm": float(
+            config["training"]["gradient_clip_norm"]
+        ),
         "source_forecaster_run_name": source_metadata.get("run_name"),
         "source_forecaster_run_signature": source_metadata.get("run_signature"),
         "source_forecaster_best_epoch": int(source_metadata["best_epoch"]),
@@ -1190,10 +1284,10 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    optimizer = torch.optim.Adam(
-        decoder.parameters(),
-        lr=float(training["learning_rate"]),
-        weight_decay=0.0,
+    optimizer, scheduler = _build_decoder_optimizer_and_scheduler(
+        decoder,
+        training,
+        steps_per_epoch=len(train_loader),
     )
     scaler = _new_grad_scaler(
         bool(training["mixed_precision"]) and device.type == "cuda"
@@ -1210,6 +1304,7 @@ def main() -> None:
             raise ValueError("Resume checkpoint config signature differs.")
         decoder.load_state_dict(checkpoint["decoder_state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         best_score = float(checkpoint["best_score"])
         best_epoch = int(checkpoint["best_epoch"])
         bad_epochs = int(checkpoint["bad_epochs"])
@@ -1232,6 +1327,7 @@ def main() -> None:
             decoder=decoder,
             loader=train_loader,
             optimizer=optimizer,
+            scheduler=scheduler,
             scaler=scaler,
             loss_function=loss_function,
             sample_chunk_size=int(training["sample_chunk_size"]),
@@ -1271,7 +1367,18 @@ def main() -> None:
             "train_weighted_all_60_clg_mae": float(train_values["loss"]),
             "validation_weighted_all_60_clg_mae": score,
             "decoder_gradient_norm": float(train_values["gradient_norm"]),
-            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            # OneCycleLR changes within each epoch; retain the historical
+            # learning_rate column as the next-step/end-of-epoch value and
+            # save the complete epoch range explicitly.
+            "learning_rate": float(train_values["learning_rate_end"]),
+            "learning_rate_start": float(train_values["learning_rate_start"]),
+            "learning_rate_end": float(train_values["learning_rate_end"]),
+            "learning_rate_min": float(train_values["learning_rate_min"]),
+            "learning_rate_max": float(train_values["learning_rate_max"]),
+            "optimizer_steps": int(train_values["optimizer_steps"]),
+            "skipped_optimizer_steps": int(
+                train_values["skipped_optimizer_steps"]
+            ),
             "best_score": float(best_score),
             "bad_epochs": int(bad_epochs),
             "epoch_seconds": perf_counter() - started,
@@ -1290,6 +1397,7 @@ def main() -> None:
                 epoch=epoch,
                 decoder=decoder,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 best_score=best_score,
                 best_epoch=best_epoch,
                 bad_epochs=bad_epochs,

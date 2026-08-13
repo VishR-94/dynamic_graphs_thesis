@@ -15,7 +15,10 @@ from src.training.kronos_decoder_post_training_specs import (
     make_decoder_post_training_specs,
     stretched_exponential_weights,
 )
-from src.training.run_kronos_decoder_post_training import WeightedAll60Loss
+from src.training.run_kronos_decoder_post_training import (
+    WeightedAll60Loss,
+    _build_decoder_optimizer_and_scheduler,
+)
 
 
 def _tiny_decoder(seed: int = 7) -> TrainableKronosCoarseDecoder:
@@ -166,6 +169,41 @@ def _write_source(directory: Path, *, model_kind: str, run_signature: str) -> No
     torch.save({"model_state_dict": {}}, directory / "best_checkpoint.pt")
 
 
+def _test_official_kronos_optimizer_recipe() -> None:
+    decoder = _tiny_decoder(seed=11)
+    training = {
+        "optimizer": "adamw",
+        "max_learning_rate": 2.0e-4,
+        "weight_decay": 0.1,
+        "adam_betas": [0.9, 0.999],
+        "adam_eps": 1.0e-8,
+        "scheduler": "one_cycle",
+        "one_cycle_pct_start": 0.03,
+        "one_cycle_div_factor": 10.0,
+        "one_cycle_final_div_factor": 1.0e4,
+        "one_cycle_anneal_strategy": "cos",
+        "one_cycle_cycle_momentum": True,
+        "one_cycle_base_momentum": 0.85,
+        "one_cycle_max_momentum": 0.95,
+        "max_epochs": 10,
+    }
+    optimizer, scheduler = _build_decoder_optimizer_and_scheduler(
+        decoder, training, steps_per_epoch=10
+    )
+    initial_lr = float(optimizer.param_groups[0]["lr"])
+    assert abs(initial_lr - 2.0e-5) < 1.0e-10
+    observed = [initial_lr]
+    for _ in range(100):
+        optimizer.zero_grad(set_to_none=True)
+        sum(parameter.sum() for parameter in decoder.parameters()).backward()
+        optimizer.step()
+        scheduler.step()
+        observed.append(float(optimizer.param_groups[0]["lr"]))
+    assert max(observed) > 1.9e-4
+    assert observed[-1] < initial_lr
+    assert scheduler.state_dict()["last_epoch"] == 100
+
+
 def _test_spec_grid() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -182,7 +220,16 @@ def _test_spec_grid() -> None:
         for spec in specs:
             assert spec.config["sampling"]["sample_count"] == 10
             assert spec.config["decoder"]["forecasting_model_frozen"] is True
-            assert spec.config["training"]["selection_split"] == "validation"
+            training = spec.config["training"]
+            assert training["selection_split"] == "validation"
+            assert training["optimizer"] == "adamw"
+            assert training["scheduler"] == "one_cycle"
+            assert training["max_epochs"] == 100
+            assert training["patience"] == 10
+            assert training["max_learning_rate"] == 2.0e-4
+            assert training["initial_learning_rate"] == 2.0e-5
+            assert training["weight_decay"] == 0.1
+            assert training["gradient_clip_norm"] == 2.0
 
 
 
@@ -290,6 +337,7 @@ def main() -> None:
     _test_decoder_shapes_and_gradients()
     _test_two_pass_gradient_replay()
     _test_all_60_loss()
+    _test_official_kronos_optimizer_recipe()
     _test_spec_grid()
     _test_graph_hub_schema()
     print("Kronos decoder post-training contracts passed.")

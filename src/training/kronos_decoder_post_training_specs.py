@@ -124,7 +124,15 @@ def _make_config(
     evaluation_batch_size: int,
     forecaster_batch_size: int,
     sample_chunk_size: int,
-    learning_rate: float,
+    max_learning_rate: float,
+    weight_decay: float,
+    one_cycle_pct_start: float,
+    one_cycle_div_factor: float,
+    one_cycle_final_div_factor: float,
+    one_cycle_anneal_strategy: str,
+    one_cycle_cycle_momentum: bool,
+    one_cycle_base_momentum: float,
+    one_cycle_max_momentum: float,
     gradient_clip_norm: float,
     mixed_precision: bool,
     seed: int,
@@ -142,6 +150,24 @@ def _make_config(
         raise ValueError("All batch sizes must be positive.")
     if sample_chunk_size <= 0 or sample_chunk_size > sample_count:
         raise ValueError("sample_chunk_size must lie in [1, sample_count].")
+    if max_learning_rate <= 0.0:
+        raise ValueError("max_learning_rate must be positive.")
+    if weight_decay < 0.0:
+        raise ValueError("weight_decay must be non-negative.")
+    if not 0.0 < one_cycle_pct_start < 1.0:
+        raise ValueError("one_cycle_pct_start must lie strictly between 0 and 1.")
+    if one_cycle_div_factor <= 1.0:
+        raise ValueError("one_cycle_div_factor must be greater than 1.")
+    if one_cycle_final_div_factor <= 1.0:
+        raise ValueError("one_cycle_final_div_factor must be greater than 1.")
+    if one_cycle_anneal_strategy not in {"cos", "linear"}:
+        raise ValueError("one_cycle_anneal_strategy must be 'cos' or 'linear'.")
+    if not 0.0 <= one_cycle_base_momentum <= 1.0:
+        raise ValueError("one_cycle_base_momentum must lie in [0, 1].")
+    if not 0.0 <= one_cycle_max_momentum <= 1.0:
+        raise ValueError("one_cycle_max_momentum must lie in [0, 1].")
+    if one_cycle_base_momentum > one_cycle_max_momentum:
+        raise ValueError("one_cycle_base_momentum cannot exceed max momentum.")
 
     config: dict[str, Any] = {
         "schema_version": 1,
@@ -197,9 +223,35 @@ def _make_config(
             "ensemble_size": int(sample_count),
         },
         "training": {
-            "optimizer": "adam",
-            "learning_rate": float(learning_rate),
-            "weight_decay": 0.0,
+            # Mirror the executable Kronos tokenizer fine-tuning recipe:
+            # AdamW plus a per-optimizer-step OneCycleLR schedule.  The
+            # separately agreed 100-epoch / patience-10 outer protocol is
+            # retained by the notebook and remains configurable below.
+            "optimisation_profile": (
+                "official_kronos_tokenizer_adamw_onecycle_decoder_only"
+            ),
+            "optimizer": "adamw",
+            "max_learning_rate": float(max_learning_rate),
+            "initial_learning_rate": float(
+                max_learning_rate / one_cycle_div_factor
+            ),
+            "minimum_learning_rate": float(
+                max_learning_rate
+                / one_cycle_div_factor
+                / one_cycle_final_div_factor
+            ),
+            "weight_decay": float(weight_decay),
+            "adam_betas": [0.9, 0.999],
+            "adam_eps": 1.0e-8,
+            "scheduler": "one_cycle",
+            "one_cycle_pct_start": float(one_cycle_pct_start),
+            "one_cycle_div_factor": float(one_cycle_div_factor),
+            "one_cycle_final_div_factor": float(one_cycle_final_div_factor),
+            "one_cycle_anneal_strategy": str(one_cycle_anneal_strategy),
+            "one_cycle_cycle_momentum": bool(one_cycle_cycle_momentum),
+            "one_cycle_base_momentum": float(one_cycle_base_momentum),
+            "one_cycle_max_momentum": float(one_cycle_max_momentum),
+            "scheduler_step_unit": "optimizer_step",
             "gradient_clip_norm": float(gradient_clip_norm),
             "max_epochs": int(max_epochs),
             "patience": int(patience),
@@ -240,14 +292,22 @@ def make_decoder_post_training_specs(
     *,
     modern_tcn_source_dir: str | Path,
     dense_transformer_source_dir: str | Path,
-    max_epochs: int = 30,
-    patience: int = 5,
+    max_epochs: int = 100,
+    patience: int = 10,
     train_batch_size: int = 1,
     evaluation_batch_size: int = 1,
     forecaster_batch_size: int = 2,
     sample_chunk_size: int = 2,
-    learning_rate: float = 1.0e-5,
-    gradient_clip_norm: float = 1.0,
+    max_learning_rate: float = 2.0e-4,
+    weight_decay: float = 0.1,
+    one_cycle_pct_start: float = 0.03,
+    one_cycle_div_factor: float = 10.0,
+    one_cycle_final_div_factor: float = 1.0e4,
+    one_cycle_anneal_strategy: str = "cos",
+    one_cycle_cycle_momentum: bool = True,
+    one_cycle_base_momentum: float = 0.85,
+    one_cycle_max_momentum: float = 0.95,
+    gradient_clip_norm: float = 2.0,
     mixed_precision: bool = True,
     seed: int = 42,
     sample_count: int = 10,
@@ -264,7 +324,15 @@ def make_decoder_post_training_specs(
         "evaluation_batch_size": evaluation_batch_size,
         "forecaster_batch_size": forecaster_batch_size,
         "sample_chunk_size": sample_chunk_size,
-        "learning_rate": learning_rate,
+        "max_learning_rate": max_learning_rate,
+        "weight_decay": weight_decay,
+        "one_cycle_pct_start": one_cycle_pct_start,
+        "one_cycle_div_factor": one_cycle_div_factor,
+        "one_cycle_final_div_factor": one_cycle_final_div_factor,
+        "one_cycle_anneal_strategy": one_cycle_anneal_strategy,
+        "one_cycle_cycle_momentum": one_cycle_cycle_momentum,
+        "one_cycle_base_momentum": one_cycle_base_momentum,
+        "one_cycle_max_momentum": one_cycle_max_momentum,
         "gradient_clip_norm": gradient_clip_norm,
         "mixed_precision": mixed_precision,
         "seed": seed,
