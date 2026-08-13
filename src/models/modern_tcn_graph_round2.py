@@ -14,7 +14,7 @@ Two graph families are supported:
 
 ``prior_state``
     Every block has a trainable static graph initialised from a sector,
-    training-only absolute-correlation, or random prior.  A learned alpha
+    training-only absolute-correlation, random, or exact-uniform prior.  A learned alpha
     mixes this static graph with a dynamic graph, and the current continuous
     state is concatenated into both graph scoring and spatial values.
 
@@ -48,7 +48,7 @@ from src.models.modern_tcn_graph_round1 import (
 
 TemporalFamily = Literal["modern_tcn_transformer", "transformer_only"]
 GraphFamily = Literal["dynamic_only", "prior_state"]
-PriorType = Literal["none", "sector", "correlation"]
+PriorType = Literal["none", "sector", "correlation", "uniform"]
 GraphActivation = Literal["softmax", "sparsemax"]
 
 
@@ -128,7 +128,7 @@ class ModernTCNGraphRound2Config:
             raise ValueError("Transformer layers must be positive.")
         if self.graph_family not in {"dynamic_only", "prior_state"}:
             raise ValueError(f"Unsupported graph family {self.graph_family!r}.")
-        if self.prior_type not in {"none", "sector", "correlation"}:
+        if self.prior_type not in {"none", "sector", "correlation", "uniform"}:
             raise ValueError(f"Unsupported prior type {self.prior_type!r}.")
         if self.graph_family == "dynamic_only" and self.prior_type != "none":
             raise ValueError("Dynamic-only models must use prior_type='none'.")
@@ -633,7 +633,11 @@ class ModernTCNGraphRound2Model(nn.Module):
     ) -> None:
         super().__init__()
         config.validate()
-        if config.uses_static_graph and config.prior_type != "none" and static_prior is None:
+        if (
+            config.uses_static_graph
+            and config.prior_type in {"sector", "correlation"}
+            and static_prior is None
+        ):
             raise ValueError("Structured prior_state model requires static_prior.")
         if not config.uses_static_graph and static_prior is not None:
             raise ValueError("Dynamic-only model must not receive static_prior.")

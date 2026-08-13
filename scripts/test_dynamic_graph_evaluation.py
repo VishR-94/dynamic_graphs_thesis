@@ -758,12 +758,17 @@ def _write_artifact_first_token_run(
             positions = torch.tensor([value - 1 for value in HORIZONS])
             public_target = target_dense.index_select(1, positions)
             public_prediction = public_target.clone()
+        last_context_target = torch.zeros(
+            windows, len(ASSETS), 1, dtype=torch.int16
+        )
+        # Half of the windows persist token 1 while every target is token 0.
+        # The exact persistence accuracy is therefore 50% at every horizon,
+        # whereas the compact model Top-1 prediction is always correct.
+        last_context_target[: windows // 2] = 1
         prediction = {
             "y_pred": public_prediction.unsqueeze(-1),
             "y_true": public_target.unsqueeze(-1),
-            "last_context_target": torch.zeros(
-                windows, len(ASSETS), 1, dtype=torch.int16
-            ),
+            "last_context_target": last_context_target,
             "channels": ["s1"],
             "horizons": list(public_horizons),
             "asset_cols": list(ASSETS),
@@ -858,6 +863,28 @@ def main() -> None:
             name="artifact_token_parallel",
             prediction_mode="parallel_60",
         )
+        # Match the final token-run layout that exposed the regression:
+        # authoritative best_* files exist at the run root, while the analysis
+        # convenience bundle has predictions but no token file.  Also omit the
+        # legacy nested num_st_blocks key so any accidental model-rebuild path
+        # would fail exactly as the real run did.
+        parallel_config_path = token_parallel / "resolved_config.json"
+        parallel_config = json.loads(
+            parallel_config_path.read_text(encoding="utf-8")
+        )
+        parallel_config["model"]["num_st_blocks"] = 4
+        parallel_config["models"]["dynamic_graph"].pop(
+            "num_st_blocks", None
+        )
+        _save_json(parallel_config_path, parallel_config)
+        for split_name in ("train", "test"):
+            analysis_dir = token_parallel / "analysis" / split_name
+            for stem in ("predictions", "tokens"):
+                source_path = analysis_dir / f"{stem}.pt"
+                destination = token_parallel / f"best_{split_name}_{stem}.pt"
+                destination.write_bytes(source_path.read_bytes())
+            (analysis_dir / "tokens.pt").unlink()
+
         token_dense = _write_artifact_first_token_run(
             root,
             name="artifact_token_dense",
@@ -911,6 +938,20 @@ def main() -> None:
         )
         assert tuple(saved_topk.index) == HORIZONS
         assert saved_topk.attrs["source"] == "saved_selected_checkpoint_top10"
+        persistence_column = (
+            "Top-1",
+            "Excess vs Persistence (pp)",
+        )
+        assert persistence_column in saved_topk.columns
+        np.testing.assert_allclose(
+            saved_topk[persistence_column].to_numpy(),
+            np.full(len(HORIZONS), 50.0),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        assert saved_topk.attrs[
+            "persistence_baseline_accuracy_percent"
+        ] == {int(horizon): 50.0 for horizon in HORIZONS}
         saved_distribution = analyse_coarse_token_predictive_distribution(
             token_parallel,
             split="test",
@@ -930,6 +971,7 @@ def main() -> None:
             horizons=(1,),
         )
         assert tuple(dense_h1.index) == (1,)
+        assert float(dense_h1.loc[1, persistence_column]) == 50.0
         try:
             analyse_coarse_token_topk(
                 token_dense,

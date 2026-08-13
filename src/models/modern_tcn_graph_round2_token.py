@@ -140,7 +140,7 @@ class ModernTCNGraphRound2TokenConfig:
             raise ValueError("future_predictor_num_layers cannot be negative.")
         if self.graph_family not in {"dynamic_only", "prior_state"}:
             raise ValueError(f"Unsupported graph_family {self.graph_family!r}.")
-        if self.prior_type not in {"none", "sector", "correlation"}:
+        if self.prior_type not in {"none", "sector", "correlation", "uniform"}:
             raise ValueError(f"Unsupported prior_type {self.prior_type!r}.")
         if self.graph_family == "dynamic_only" and self.prior_type != "none":
             raise ValueError("dynamic_only requires prior_type='none'.")
@@ -581,7 +581,11 @@ class ModernTCNGraphRound2TokenModel(nn.Module):
     ) -> None:
         super().__init__()
         config.validate()
-        if config.uses_static_graph and config.prior_type != "none" and static_prior is None:
+        if (
+            config.uses_static_graph
+            and config.prior_type in {"sector", "correlation"}
+            and static_prior is None
+        ):
             raise ValueError("A structured prior_state model requires static_prior.")
         if not config.uses_static_graph and static_prior is not None:
             raise ValueError("dynamic_only must not receive static_prior.")

@@ -506,11 +506,20 @@ def _build_model(
     if kind == "modern_tcn_token":
         if token_dataset is None:
             raise ValueError("Token dataset is required.")
-        prior = build_absolute_correlation_graph_prior(
-            train_split,
-            expected_asset_cols=token_dataset.asset_cols,
-            threshold=None,
-        )
+        prior_type = str(config["model"]["prior"]["type"])
+        if prior_type == "correlation":
+            prior = build_absolute_correlation_graph_prior(
+                train_split,
+                expected_asset_cols=token_dataset.asset_cols,
+                threshold=None,
+            )
+        elif prior_type in {"none", "uniform"}:
+            prior = None
+        else:
+            raise ValueError(
+                "The final ModernTCN token path supports only correlation "
+                f"or uniform static initialisation; got {prior_type!r}."
+            )
         model_config = token_round2_model_config_from_mapping(
             dict(config),
             num_nodes=token_dataset.num_assets,

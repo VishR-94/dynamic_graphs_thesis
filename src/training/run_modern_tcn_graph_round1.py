@@ -152,6 +152,7 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         "prior_mixture",
         "prior_mixture_state",
         "random_static_mixture_state",
+        "uniform_static_mixture_state",
     }:
         raise ValueError("Unsupported Round-1 variant.")
     if int(model["graph"]["hidden_dim"]) % int(model["graph"]["num_heads"]):
@@ -1179,7 +1180,7 @@ def main() -> None:
     prior_type = str(resolved["model"]["prior"]["type"])
     static_prior: Tensor | None
     sectors: list[str] | None = None
-    if prior_type in {"none", "random"}:
+    if prior_type in {"none", "random", "uniform"}:
         static_prior = None
     elif prior_type == "sector":
         if args.company_profiles is None:

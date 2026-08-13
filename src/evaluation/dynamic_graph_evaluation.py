@@ -4266,12 +4266,15 @@ def analyse_s1_topk_accuracy_by_horizon(
     top_k_values: Sequence[int] = (1, 2, 5, 10),
     horizons: Sequence[int] | None = None,
 ) -> pd.DataFrame:
-    """Return free-running s1 Top-k accuracy and excess over a marginal baseline.
+    """Return free-running s1 Top-k accuracy and baseline excesses.
 
     The marginal baseline is fitted from training targets only. At each future
     horizon, under the same asset filter, it always proposes the k most frequent
-    training tokens. The visible subcolumns are model accuracy and model accuracy
-    minus marginal-baseline accuracy, in percentage points.
+    training tokens. The persistence baseline carries the final observed coarse
+    token forward unchanged to every future horizon. The visible subcolumns are
+    model accuracy, excess over the marginal baseline for each requested k, and
+    Top-1 excess over persistence, all expressed in percentage points where
+    applicable.
     """
 
     if source not in {"best", "last"}:
@@ -4436,12 +4439,30 @@ def analyse_s1_topk_accuracy_by_horizon(
     count_shape = (prediction_length, len(top_ks))
     model_correct = torch.zeros(count_shape, dtype=torch.float32)
     marginal_correct = torch.zeros(count_shape, dtype=torch.float32)
+    persistence_correct = torch.zeros(
+        prediction_length,
+        dtype=torch.float32,
+    )
     totals = torch.zeros(prediction_length, dtype=torch.float32)
 
     with torch.inference_mode():
         for batch in validation_loader:
             context_tokens = batch["context_tokens"].to(resolved_device)
             target_s1 = batch["target_s1"].to(resolved_device)
+            if context_tokens.ndim == 4:
+                if int(context_tokens.shape[-1]) < 1:
+                    raise ValueError(
+                        "context_tokens has no coarse-token channel."
+                    )
+                last_context_s1 = context_tokens[:, -1, :, 0]
+            elif context_tokens.ndim == 3:
+                last_context_s1 = context_tokens[:, -1, :]
+            else:
+                raise ValueError(
+                    "context_tokens must have shape [B,T,N,2] or [B,T,N] "
+                    "to compute the persistence baseline; observed "
+                    f"{tuple(context_tokens.shape)}."
+                )
             oracle_graph = (
                 batch["true_graph"].to(resolved_device)
                 if model.config.graph.type == "oracle"
@@ -4469,6 +4490,9 @@ def analyse_s1_topk_accuracy_by_horizon(
                 target_s1 = target_s1[
                     :, :, asset_index : asset_index + 1
                 ]
+                last_context_s1 = last_context_s1[
+                    :, asset_index : asset_index + 1
+                ]
 
             model_top_ids = torch.topk(
                 logits.float(),
@@ -4487,6 +4511,13 @@ def analyse_s1_topk_accuracy_by_horizon(
             )
 
             totals += float(target_s1.shape[0] * target_s1.shape[2])
+            persistence_correct += (
+                target_s1
+                .eq(last_context_s1.unsqueeze(1))
+                .to(torch.float32)
+                .sum(dim=(0, 2))
+                .cpu()
+            )
 
             for column_index, k in enumerate(top_ks):
                 model_correct[:, column_index] += (
@@ -4508,6 +4539,7 @@ def analyse_s1_topk_accuracy_by_horizon(
 
     model_accuracy = model_correct / totals.unsqueeze(-1) * 100.0
     marginal_accuracy = marginal_correct / totals.unsqueeze(-1) * 100.0
+    persistence_accuracy = persistence_correct / totals * 100.0
     excess = model_accuracy - marginal_accuracy
 
     # Both Top-k curves must be non-decreasing as k increases.
@@ -4531,6 +4563,9 @@ def analyse_s1_topk_accuracy_by_horizon(
 
     model_selected = model_accuracy[selected_horizon_indices].numpy()
     marginal_selected = marginal_accuracy[selected_horizon_indices].numpy()
+    persistence_selected = persistence_accuracy[
+        selected_horizon_indices
+    ].numpy()
     excess_selected = excess[selected_horizon_indices].numpy()
 
     data: dict[tuple[str, str], np.ndarray] = {}
@@ -4541,6 +4576,11 @@ def analyse_s1_topk_accuracy_by_horizon(
         data[(f"Top-{k}", "Excess vs Marginal (pp)")] = (
             excess_selected[:, column_index]
         )
+        if k == 1:
+            data[("Top-1", "Excess vs Persistence (pp)")] = (
+                model_selected[:, column_index]
+                - persistence_selected
+            )
 
     table = pd.DataFrame(
         data,
@@ -4571,6 +4611,14 @@ def analyse_s1_topk_accuracy_by_horizon(
                 }
                 for row_index, horizon in enumerate(selected_horizons)
             },
+            "persistence_baseline_accuracy_percent": {
+                int(horizon): float(persistence_selected[row_index])
+                for row_index, horizon in enumerate(selected_horizons)
+            },
+            "persistence_definition": (
+                "final observed coarse s1 token carried forward unchanged "
+                "to every future horizon"
+            ),
             "training_top_token_ids_by_horizon": {
                 int(horizon): marginal_order[
                     horizon - 1, :maximum_k
@@ -6639,6 +6687,29 @@ def _candidate_artifact_layouts(
 
     candidates: list[EvaluationArtifactPaths] = []
 
+    # Prefer the authoritative selected-checkpoint files in the run root.
+    # ``analysis/<split>`` contains convenience copies and may be incomplete
+    # after an interrupted Google Drive sync.  The old ordering let one such
+    # copy shadow complete ``best_<split>_*`` token artefacts.
+    historical_prefixes: tuple[str, ...]
+    if split == "validation":
+        historical_prefixes = ("best_validation_",)
+    elif split == "train":
+        historical_prefixes = ("best_train_", "best_training_")
+    else:
+        historical_prefixes = ("best_test_",)
+
+    if policy in {"best", f"best_{split}", "default"}:
+        for prefix in historical_prefixes:
+            candidates.append(
+                _artifact_paths_in_directory(
+                    run_dir,
+                    split=split,
+                    policy="best",
+                    prefix=prefix,
+                )
+            )
+
     # Canonical frozen-analysis layout.  An explicit inference policy must
     # never be shadowed by the split's base/best bundle.  The old ordering
     # checked ``analysis/<split>/predictions.pt`` first even when callers
@@ -6675,28 +6746,6 @@ def _candidate_artifact_layouts(
                 prefix=f"{split}_",
             )
         )
-
-    # Historical best-checkpoint layouts.  Validation is the established
-    # production spelling; train/training are accepted for final-checkpoint
-    # inference saved later by the baselines notebook.
-    historical_prefixes: tuple[str, ...]
-    if split == "validation":
-        historical_prefixes = ("best_validation_",)
-    elif split == "train":
-        historical_prefixes = ("best_train_", "best_training_")
-    else:
-        historical_prefixes = ("best_test_",)
-
-    if policy in {"best", f"best_{split}", "default"}:
-        for prefix in historical_prefixes:
-            candidates.append(
-                _artifact_paths_in_directory(
-                    run_dir,
-                    split=split,
-                    policy="best",
-                    prefix=prefix,
-                )
-            )
 
     # Temperature-policy layouts used by the tokenized runner and by frozen
     # split inference.  The historical validation runner uses validation_*
@@ -11387,6 +11436,61 @@ def _saved_token_targets_for_horizons(
     )
 
 
+def _saved_last_context_s1(
+    evaluation: EvaluationArtifacts,
+    *,
+    selected_window_indices: Sequence[int],
+    asset_index: int | None,
+) -> Tensor:
+    """Return the final observed coarse token as ``[W,N]``.
+
+    Selected-checkpoint token prediction artefacts save the final context token
+    as ``last_context_target``.  This is the exact persistence forecast input: it
+    is repeated unchanged at every future horizon.  Keeping the value in the
+    prediction artefact avoids reconstructing the model or inferring it from a
+    future target.
+    """
+
+    raw = evaluation.prediction_result.get("last_context_target")
+    if raw is None and evaluation.token_artifacts is not None:
+        raw = evaluation.token_artifacts.get("last_context_s1")
+    if raw is None:
+        raise KeyError(
+            "Saved token artefacts do not contain last_context_target, so "
+            "the token-persistence baseline cannot be computed without "
+            "rerunning inference or loading the aligned input cache."
+        )
+
+    values = torch.as_tensor(raw).long()
+    if values.ndim == 3 and int(values.shape[-1]) == 1:
+        values = values.squeeze(-1)
+    if values.ndim != 2:
+        raise ValueError(
+            "Saved token last_context_target must have shape [W,N] or "
+            f"[W,N,1]; observed {tuple(values.shape)}."
+        )
+
+    expected_windows = int(
+        torch.as_tensor(evaluation.prediction_result["y_true"]).shape[0]
+    )
+    expected_nodes = int(evaluation.info.num_nodes)
+    if tuple(values.shape) != (expected_windows, expected_nodes):
+        raise ValueError(
+            "Saved token last_context_target does not align with the "
+            "prediction artefact: "
+            f"{tuple(values.shape)} vs {(expected_windows, expected_nodes)}."
+        )
+
+    selected_tensor = torch.tensor(
+        list(selected_window_indices),
+        dtype=torch.long,
+    )
+    values = values.index_select(0, selected_tensor)
+    if asset_index is not None:
+        values = values[:, asset_index : asset_index + 1]
+    return values.contiguous()
+
+
 def _analyse_saved_coarse_token_topk(
     run_dir: Path,
     *,
@@ -11403,7 +11507,8 @@ def _analyse_saved_coarse_token_topk(
     New token runners intentionally save compact top-10 IDs/probabilities
     instead of the enormous full [W,60,N,1024] logit tensor.  Those IDs are
     sufficient for exact top-k accuracy for every requested k <= 10 and avoid
-    reconstructing an architecture-specific model inside Graph Hub.
+    reconstructing an architecture-specific model inside Graph Hub.  The saved
+    final context token additionally provides the exact persistence baseline.
     """
 
     try:
@@ -11506,6 +11611,27 @@ def _analyse_saved_coarse_token_topk(
         top_ids = top_ids[:, :, asset_index : asset_index + 1]
         targets = targets[:, :, asset_index : asset_index + 1]
 
+    last_context_s1 = _saved_last_context_s1(
+        evaluation,
+        selected_window_indices=selected,
+        asset_index=asset_index,
+    )
+    if tuple(last_context_s1.shape) != (
+        int(targets.shape[0]),
+        int(targets.shape[2]),
+    ):
+        raise ValueError(
+            "Saved persistence tokens and selected targets are misaligned: "
+            f"{tuple(last_context_s1.shape)} vs {tuple(targets.shape)}."
+        )
+    persistence_accuracy = (
+        targets
+        .eq(last_context_s1.unsqueeze(1))
+        .to(torch.float32)
+        .mean(dim=(0, 2))
+        * 100.0
+    )
+
     training = load_evaluation_artifacts(
         run_dir,
         split="train",
@@ -11532,6 +11658,7 @@ def _analyse_saved_coarse_token_topk(
 
     rows: dict[tuple[str, str], list[float]] = {}
     marginal_values: dict[int, dict[str, float]] = {}
+    persistence_values: dict[int, float] = {}
     marginal_ids: dict[int, list[int]] = {}
     for horizon_index, horizon in enumerate(requested_horizons):
         evaluation_target = targets[:, horizon_index].reshape(-1)
@@ -11556,6 +11683,9 @@ def _analyse_saved_coarse_token_topk(
         ).long()
         marginal_ids[int(horizon)] = order[: max(top_ks)].tolist()
         marginal_values[int(horizon)] = {}
+        persistence_values[int(horizon)] = float(
+            persistence_accuracy[horizon_index].item()
+        )
         for k in top_ks:
             model_accuracy = float(
                 evaluation_top_ids[:, :k]
@@ -11581,6 +11711,13 @@ def _analyse_saved_coarse_token_topk(
             rows.setdefault(
                 (f"Top-{k}", "Excess vs Marginal (pp)"), []
             ).append(model_accuracy - marginal_accuracy)
+            if k == 1:
+                rows.setdefault(
+                    ("Top-1", "Excess vs Persistence (pp)"), []
+                ).append(
+                    model_accuracy
+                    - persistence_values[int(horizon)]
+                )
             marginal_values[int(horizon)][f"Top-{k}"] = marginal_accuracy
 
     table = pd.DataFrame(
@@ -11604,6 +11741,11 @@ def _analyse_saved_coarse_token_topk(
             "evaluation_windows": len(selected),
             "validation_windows": len(selected),
             "marginal_baseline_accuracy_percent": marginal_values,
+            "persistence_baseline_accuracy_percent": persistence_values,
+            "persistence_definition": (
+                "final observed coarse s1 token carried forward unchanged "
+                "to every future horizon"
+            ),
             "training_top_token_ids_by_horizon": marginal_ids,
             "source": "saved_selected_checkpoint_top10",
         }
@@ -11626,14 +11768,22 @@ def analyse_coarse_token_topk(
     horizons: Sequence[int] | None = None,
     random_seed: int = 42,
 ) -> pd.DataFrame:
-    """Return coarse-token top-k accuracy from saved selected artefacts.
+    """Return coarse-token top-k accuracy and baseline excesses.
 
-    New token runners use architecture-specific model classes and save compact
-    top-10 predictions for the selected checkpoint.  Graph Hub consumes those
-    artefacts directly rather than trying to rebuild every run as the historical
-    ``DynamicGraphTokenForecaster``.  Legacy runs without compact artefacts keep
-    the previous inference fallback.
+    Token runners save compact Top-10 predictions for the selected checkpoint.
+    Graph Hub reads those artefacts directly and never rebuilds an architecture-
+    specific forecasting model.  The Top-1 block additionally reports model
+    accuracy minus token persistence accuracy, where persistence repeats the last
+    observed context token at every horizon.
     """
+
+    del batch_size, device, use_amp
+
+    if source != "best":
+        raise ValueError(
+            "analyse_coarse_token_topk reads the saved best-checkpoint token "
+            "artefacts; use source='best'."
+        )
 
     run_dir = resolve_model_folder(model)
     unified_info = load_unified_run_info(run_dir)
@@ -11644,40 +11794,22 @@ def analyse_coarse_token_topk(
         )
     resolved_split = normalise_evaluation_split(split)
 
-    if source == "best":
-        saved = _analyse_saved_coarse_token_topk(
-            run_dir,
-            split=resolved_split,
-            # Exact top-k IDs/probabilities are exported once from the best
-            # checkpoint.  Temperature policies contain sampled IDs instead.
-            policy="best",
-            asset=resolved_asset,
-            window_indices=window_indices,
-            max_windows=max_windows,
-            top_k_values=top_k_values,
-            horizons=horizons,
-        )
-        if saved is not None:
-            return saved
-
-    # Historical fallback for runs that predate selected-checkpoint token
-    # artefacts.  This path intentionally remains available, but it is not used
-    # for the new Round-2/BaseDyGraph-v1 token models.
-    result = analyse_s1_topk_accuracy_by_horizon(
+    saved = _analyse_saved_coarse_token_topk(
         run_dir,
+        split=resolved_split,
+        # Top-K accuracy belongs to the selected checkpoint, not a sampled
+        # temperature policy.
+        policy="best",
         asset=resolved_asset,
-        source=source,
-        validation_cache_path=resolve_token_cache_path(split=resolved_split),
-        training_cache_path=resolve_token_cache_path(split="train"),
         window_indices=window_indices,
         max_windows=max_windows,
-        batch_size=batch_size,
-        device=device,
-        use_amp=use_amp,
         top_k_values=top_k_values,
         horizons=horizons,
     )
-    result.attrs["split"] = resolved_split
-    result.attrs["policy"] = policy
-    result.attrs["source"] = "legacy_checkpoint_reinference"
-    return result
+    if saved is None:
+        raise FileNotFoundError(
+            "No saved selected-checkpoint Top-K token artefact was found for "
+            f"{run_dir}. Graph Hub does not reconstruct token models from "
+            "architecture-specific config files."
+        )
+    return saved

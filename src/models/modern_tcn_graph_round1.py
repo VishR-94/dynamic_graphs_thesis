@@ -7,7 +7,8 @@ supports controlled one-block graph variants. Historical Round-1 variants
 remain unchanged, while later diagnostics can independently choose:
 
 * whether a trainable static graph is present;
-* whether that static graph is prior-initialised or randomly initialised;
+* whether that static graph is prior-initialised, randomly initialised, or
+  exactly uniform at initialisation;
 * whether the current continuous state is exposed directly to graph scoring
   and graph-weighted value propagation;
 * softmax, sparsemax, or 1.5-entmax graph normalisation.
@@ -38,6 +39,7 @@ Round1GraphVariant = Literal[
     "prior_mixture",
     "prior_mixture_state",
     "random_static_mixture_state",
+    "uniform_static_mixture_state",
 ]
 
 
@@ -75,12 +77,17 @@ class ModernTCNGraphRound1Config:
             "prior_mixture",
             "prior_mixture_state",
             "random_static_mixture_state",
+            "uniform_static_mixture_state",
         }:
             raise ValueError(f"Unsupported graph variant {self.graph_variant!r}.")
         if not math.isfinite(float(self.prior_scale)) or self.prior_scale <= 0:
             raise ValueError("prior_scale must be finite and positive.")
         if not math.isfinite(float(self.prior_jitter)) or self.prior_jitter < 0:
             raise ValueError("prior_jitter must be finite and non-negative.")
+        if self.uses_uniform_static_graph and float(self.prior_jitter) != 0.0:
+            raise ValueError(
+                "uniform_static_mixture_state requires prior_jitter=0.0."
+            )
 
     @property
     def uses_static_graph(self) -> bool:
@@ -88,6 +95,7 @@ class ModernTCNGraphRound1Config:
             "prior_mixture",
             "prior_mixture_state",
             "random_static_mixture_state",
+            "uniform_static_mixture_state",
         }
 
     @property
@@ -99,11 +107,20 @@ class ModernTCNGraphRound1Config:
         return self.graph_variant == "random_static_mixture_state"
 
     @property
+    def uses_uniform_static_graph(self) -> bool:
+        return self.graph_variant == "uniform_static_mixture_state"
+
+    @property
+    def uses_unstructured_static_graph(self) -> bool:
+        return self.uses_random_static_graph or self.uses_uniform_static_graph
+
+    @property
     def uses_state_pathway(self) -> bool:
         return self.graph_variant in {
             "dynamic_only_state",
             "prior_mixture_state",
             "random_static_mixture_state",
+            "uniform_static_mixture_state",
         }
 
 
@@ -519,7 +536,7 @@ class ModernTCNGraphRound1Model(nn.Module):
             use_state_pathway=config.uses_state_pathway,
             use_static_graph=config.uses_static_graph,
             static_prior=(static_prior if config.uses_static_prior else None),
-            random_static_initialisation=config.uses_random_static_graph,
+            random_static_initialisation=config.uses_unstructured_static_graph,
             initial_alpha=forecaster.graph.initial_alpha,
             prior_scale=config.prior_scale,
             prior_jitter=config.prior_jitter,
