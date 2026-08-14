@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-"""Post-train the frozen Kronos coarse decoder for two frozen token forecasters.
+"""Train a Kronos-initialised coarse decoder for frozen token forecasters.
 
-The forecaster generates ten fixed coarse-token paths.  Only the pretrained
-coarse reconstruction decoder is optimised.  The loss is the stretched-
+The forecaster generates ten fixed coarse-token paths and remains frozen. Only
+the coarse reconstruction decoder is optimised against the stretched-
 exponential weighted cumulative-log-change MAE of the ten-path decoded ensemble
-at every future minute 1..60.  Decoder optimisation mirrors the executable
-Kronos tokenizer fine-tuning recipe: AdamW with a per-step OneCycleLR schedule.
+at every future minute 1..60.
+
+Two backwards-compatible optimisation profiles are supported: the historical
+Kronos-style AdamW/OneCycle post-training run and task-specific decoder training
+with one epoch of linear warm-up followed by validation-driven LR reductions.
 """
 
 import argparse
@@ -148,6 +151,172 @@ def _new_grad_scaler(enabled: bool):
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+class _WarmupReduceOnPlateauScheduler:
+    """Per-step linear warm-up followed by validation-driven LR reductions."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        start_learning_rate: float,
+        peak_learning_rate: float,
+        warmup_steps: int,
+        factor: float,
+        patience: int,
+        minimum_learning_rate: float,
+        threshold: float = 0.0,
+    ) -> None:
+        if not 0.0 < start_learning_rate <= peak_learning_rate:
+            raise ValueError(
+                "start_learning_rate must lie in (0, peak_learning_rate]."
+            )
+        if warmup_steps < 0:
+            raise ValueError("warmup_steps must be non-negative.")
+        if not 0.0 < factor < 1.0:
+            raise ValueError("factor must lie strictly between 0 and 1.")
+        if patience <= 0:
+            raise ValueError("patience must be positive.")
+        if not 0.0 < minimum_learning_rate <= peak_learning_rate:
+            raise ValueError(
+                "minimum_learning_rate must lie in (0, peak_learning_rate]."
+            )
+        if threshold < 0.0:
+            raise ValueError("threshold must be non-negative.")
+
+        self.optimizer = optimizer
+        self.start_learning_rate = float(start_learning_rate)
+        self.peak_learning_rate = float(peak_learning_rate)
+        self.warmup_steps = int(warmup_steps)
+        self.factor = float(factor)
+        self.patience = int(patience)
+        self.minimum_learning_rate = float(minimum_learning_rate)
+        self.threshold = float(threshold)
+        self.optimizer_steps = 0
+        self.best_metric = math.inf
+        self.bad_epochs = 0
+        self.reductions = 0
+        initial = (
+            self.peak_learning_rate
+            if self.warmup_steps == 0
+            else self.start_learning_rate
+        )
+        self._set_learning_rate(initial)
+
+    def _set_learning_rate(self, value: float) -> None:
+        for group in self.optimizer.param_groups:
+            group["lr"] = float(value)
+
+    @property
+    def warmup_complete(self) -> bool:
+        return self.optimizer_steps >= self.warmup_steps
+
+    def step_after_optimizer(self) -> None:
+        self.optimizer_steps += 1
+        if self.warmup_steps <= 0 or self.optimizer_steps > self.warmup_steps:
+            return
+        fraction = float(self.optimizer_steps) / float(self.warmup_steps)
+        value = self.start_learning_rate + fraction * (
+            self.peak_learning_rate - self.start_learning_rate
+        )
+        self._set_learning_rate(value)
+
+    def step_after_validation(self, metric: float) -> bool:
+        metric = float(metric)
+        if metric < self.best_metric - self.threshold:
+            self.best_metric = metric
+            self.bad_epochs = 0
+            return False
+        self.bad_epochs += 1
+        if not self.warmup_complete or self.bad_epochs < self.patience:
+            return False
+        current = float(self.optimizer.param_groups[0]["lr"])
+        reduced = max(current * self.factor, self.minimum_learning_rate)
+        self.bad_epochs = 0
+        if reduced >= current:
+            return False
+        self._set_learning_rate(reduced)
+        self.reductions += 1
+        return True
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "start_learning_rate": self.start_learning_rate,
+            "peak_learning_rate": self.peak_learning_rate,
+            "warmup_steps": self.warmup_steps,
+            "factor": self.factor,
+            "patience": self.patience,
+            "minimum_learning_rate": self.minimum_learning_rate,
+            "threshold": self.threshold,
+            "optimizer_steps": self.optimizer_steps,
+            "best_metric": self.best_metric,
+            "bad_epochs": self.bad_epochs,
+            "reductions": self.reductions,
+            "current_learning_rate": float(
+                self.optimizer.param_groups[0]["lr"]
+            ),
+        }
+
+    def load_state_dict(self, values: Mapping[str, Any]) -> None:
+        for key in (
+            "start_learning_rate",
+            "peak_learning_rate",
+            "warmup_steps",
+            "factor",
+            "patience",
+            "minimum_learning_rate",
+            "threshold",
+        ):
+            expected = getattr(self, key)
+            observed = values[key]
+            if isinstance(expected, float):
+                matches = math.isclose(
+                    float(expected), float(observed), rel_tol=0.0, abs_tol=1.0e-15
+                )
+            else:
+                matches = expected == observed
+            if not matches:
+                raise ValueError(
+                    f"Scheduler resume field {key!r} differs: "
+                    f"expected {expected!r}, observed {observed!r}."
+                )
+        self.optimizer_steps = int(values["optimizer_steps"])
+        self.best_metric = float(values["best_metric"])
+        self.bad_epochs = int(values["bad_epochs"])
+        self.reductions = int(values["reductions"])
+        self._set_learning_rate(float(values["current_learning_rate"]))
+
+
+def _step_scheduler_after_optimizer(scheduler: Any) -> None:
+    if isinstance(scheduler, _WarmupReduceOnPlateauScheduler):
+        scheduler.step_after_optimizer()
+    else:
+        scheduler.step()
+
+
+def _step_scheduler_after_validation(scheduler: Any, metric: float) -> bool:
+    if isinstance(scheduler, _WarmupReduceOnPlateauScheduler):
+        return scheduler.step_after_validation(metric)
+    return False
+
+
+def _scheduler_diagnostics(scheduler: Any) -> dict[str, Any]:
+    if isinstance(scheduler, _WarmupReduceOnPlateauScheduler):
+        return {
+            "scheduler_warmup_complete": bool(scheduler.warmup_complete),
+            "scheduler_optimizer_steps": int(scheduler.optimizer_steps),
+            "scheduler_bad_epochs": int(scheduler.bad_epochs),
+            "scheduler_reductions": int(scheduler.reductions),
+            "scheduler_best_metric": float(scheduler.best_metric),
+        }
+    return {
+        "scheduler_warmup_complete": None,
+        "scheduler_optimizer_steps": None,
+        "scheduler_bad_epochs": None,
+        "scheduler_reductions": None,
+        "scheduler_best_metric": None,
+    }
+
+
 def _seed_worker(worker_id: int) -> None:
     del worker_id
     worker_seed = torch.initial_seed() % (2**32)
@@ -186,22 +355,22 @@ def _build_decoder_optimizer_and_scheduler(
     training: Mapping[str, Any],
     *,
     steps_per_epoch: int,
-) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.OneCycleLR]:
-    """Build the executable Kronos tokenizer fine-tuning recipe.
+) -> tuple[torch.optim.Optimizer, Any]:
+    """Build the requested decoder optimiser and scheduler.
 
-    The official script uses AdamW and steps OneCycleLR after every optimiser
-    update.  All defaults that the official code leaves implicit are pinned
-    here so a resumed dissertation run is reproducible across PyTorch versions.
+    Existing ``scheduler='one_cycle'`` configurations retain the historical
+    behaviour.  ``scheduler='warmup_reduce_on_plateau'`` is an additive
+    task-specific profile.
     """
     if str(training.get("optimizer")) != "adamw":
-        raise ValueError("Decoder post-training requires optimizer='adamw'.")
-    if str(training.get("scheduler")) != "one_cycle":
-        raise ValueError("Decoder post-training requires scheduler='one_cycle'.")
+        raise ValueError("Decoder training requires optimizer='adamw'.")
     if int(steps_per_epoch) <= 0:
         raise ValueError("steps_per_epoch must be positive.")
 
     max_learning_rate = float(training["max_learning_rate"])
-    betas = tuple(float(value) for value in training.get("adam_betas", (0.9, 0.999)))
+    betas = tuple(
+        float(value) for value in training.get("adam_betas", (0.9, 0.999))
+    )
     if len(betas) != 2:
         raise ValueError("adam_betas must contain exactly two values.")
 
@@ -212,20 +381,44 @@ def _build_decoder_optimizer_and_scheduler(
         eps=float(training.get("adam_eps", 1.0e-8)),
         weight_decay=float(training["weight_decay"]),
     )
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer=optimizer,
-        max_lr=max_learning_rate,
-        steps_per_epoch=int(steps_per_epoch),
-        epochs=int(training["max_epochs"]),
-        pct_start=float(training["one_cycle_pct_start"]),
-        anneal_strategy=str(training["one_cycle_anneal_strategy"]),
-        cycle_momentum=bool(training["one_cycle_cycle_momentum"]),
-        base_momentum=float(training["one_cycle_base_momentum"]),
-        max_momentum=float(training["one_cycle_max_momentum"]),
-        div_factor=float(training["one_cycle_div_factor"]),
-        final_div_factor=float(training["one_cycle_final_div_factor"]),
+
+    scheduler_name = str(training.get("scheduler"))
+    if scheduler_name == "one_cycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer=optimizer,
+            max_lr=max_learning_rate,
+            steps_per_epoch=int(steps_per_epoch),
+            epochs=int(training["max_epochs"]),
+            pct_start=float(training["one_cycle_pct_start"]),
+            anneal_strategy=str(training["one_cycle_anneal_strategy"]),
+            cycle_momentum=bool(training["one_cycle_cycle_momentum"]),
+            base_momentum=float(training["one_cycle_base_momentum"]),
+            max_momentum=float(training["one_cycle_max_momentum"]),
+            div_factor=float(training["one_cycle_div_factor"]),
+            final_div_factor=float(training["one_cycle_final_div_factor"]),
+        )
+        return optimizer, scheduler
+
+    if scheduler_name == "warmup_reduce_on_plateau":
+        warmup_epochs = int(training.get("warmup_epochs", 1))
+        if warmup_epochs <= 0:
+            raise ValueError("warmup_epochs must be positive.")
+        scheduler = _WarmupReduceOnPlateauScheduler(
+            optimizer,
+            start_learning_rate=float(training["warmup_start_learning_rate"]),
+            peak_learning_rate=max_learning_rate,
+            warmup_steps=warmup_epochs * int(steps_per_epoch),
+            factor=float(training["plateau_factor"]),
+            patience=int(training["plateau_patience"]),
+            minimum_learning_rate=float(training["minimum_learning_rate"]),
+            threshold=float(training.get("plateau_threshold", 0.0)),
+        )
+        return optimizer, scheduler
+
+    raise ValueError(
+        "Unsupported decoder scheduler. Expected 'one_cycle' or "
+        f"'warmup_reduce_on_plateau'; observed {scheduler_name!r}."
     )
-    return optimizer, scheduler
 
 
 def _prepare_run_dir(output_dir: Path, run_name: str, *, overwrite: bool, resume: bool) -> Path:
@@ -596,7 +789,7 @@ def _train_epoch(
     decoder: TrainableKronosCoarseDecoder,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.OneCycleLR,
+    scheduler: Any,
     scaler: Any,
     loss_function: WeightedAll60Loss,
     sample_chunk_size: int,
@@ -610,7 +803,10 @@ def _train_epoch(
     decoder.eval()
     total_loss = 0.0
     total_windows = 0
-    gradient_norm_sum = 0.0
+    finite_gradient_norm_sum = 0.0
+    finite_gradient_norm_max = 0.0
+    finite_gradient_norm_batches = 0
+    nonfinite_gradient_norm_batches = 0
     batches = 0
     optimizer_steps = 0
     skipped_optimizer_steps = 0
@@ -675,24 +871,46 @@ def _train_epoch(
         if step_was_skipped:
             skipped_optimizer_steps += 1
         else:
-            scheduler.step()
+            _step_scheduler_after_optimizer(scheduler)
             optimizer_steps += 1
 
         current = int(values["true_close"].shape[0])
         total_loss += float(loss.detach().item()) * current
         total_windows += current
-        gradient_norm_sum += float(torch.as_tensor(gradient_norm).item())
+        gradient_norm_value = float(torch.as_tensor(gradient_norm).item())
+        if math.isfinite(gradient_norm_value):
+            finite_gradient_norm_sum += gradient_norm_value
+            finite_gradient_norm_max = max(
+                finite_gradient_norm_max, gradient_norm_value
+            )
+            finite_gradient_norm_batches += 1
+        else:
+            nonfinite_gradient_norm_batches += 1
         batches += 1
 
     if not learning_rates_used:
         raise RuntimeError("The decoder training loader produced no batches.")
+    ending_learning_rate = float(optimizer.param_groups[0]["lr"])
+    learning_rate_values = [*learning_rates_used, ending_learning_rate]
     return {
         "loss": total_loss / max(total_windows, 1),
-        "gradient_norm": gradient_norm_sum / max(batches, 1),
+        "gradient_norm": (
+            finite_gradient_norm_sum / max(finite_gradient_norm_batches, 1)
+        ),
+        "gradient_norm_max": (
+            finite_gradient_norm_max
+            if finite_gradient_norm_batches
+            else math.nan
+        ),
+        "finite_gradient_norm_batches": float(finite_gradient_norm_batches),
+        "nonfinite_gradient_norm_batches": float(
+            nonfinite_gradient_norm_batches
+        ),
+        "training_batches": float(batches),
         "learning_rate_start": learning_rates_used[0],
-        "learning_rate_end": float(optimizer.param_groups[0]["lr"]),
-        "learning_rate_min": min(learning_rates_used),
-        "learning_rate_max": max(learning_rates_used),
+        "learning_rate_end": ending_learning_rate,
+        "learning_rate_min": min(learning_rate_values),
+        "learning_rate_max": max(learning_rate_values),
         "optimizer_steps": float(optimizer_steps),
         "skipped_optimizer_steps": float(skipped_optimizer_steps),
     }
@@ -715,6 +933,8 @@ def _evaluate_weighted_loss(
     error_sum = torch.zeros(60, dtype=torch.float64)
     error_count = 0
     invalid = total = 0
+    decoded_close_min = math.inf
+    decoded_close_max = -math.inf
     for raw_batch in tqdm(loader, desc=description, leave=False, dynamic_ncols=True):
         values = _batch_to_device(raw_batch, device)
         ensemble, _, batch_invalid, batch_total = _decode_ensemble(
@@ -730,6 +950,8 @@ def _evaluate_weighted_loss(
             values["true_close"],
             values["last_close"],
         )
+        decoded_close_min = min(decoded_close_min, float(ensemble.min().item()))
+        decoded_close_max = max(decoded_close_max, float(ensemble.max().item()))
         current = int(values["true_close"].shape[0])
         total_loss += float(loss.item()) * current
         total_windows += current
@@ -741,6 +963,8 @@ def _evaluate_weighted_loss(
         "weighted_loss": total_loss / max(total_windows, 1),
         "clg_mae_by_horizon": (error_sum / max(error_count, 1)).float(),
         "invalid_sample_candle_rate_percent": 100.0 * invalid / max(total, 1),
+        "decoded_close_min": float(decoded_close_min),
+        "decoded_close_max": float(decoded_close_max),
     }
 
 
@@ -749,7 +973,7 @@ def _checkpoint_payload(
     epoch: int,
     decoder: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.OneCycleLR,
+    scheduler: Any,
     best_score: float,
     best_epoch: int,
     bad_epochs: int,
@@ -873,7 +1097,11 @@ def _export_split(
     invalid = total = 0
     for raw_batch in tqdm(
         loader,
-        desc=("baseline" if baseline else "post-trained") + f" export {split_name}",
+        desc=(
+            "baseline"
+            if baseline
+            else _decoder_result_label(config)
+        ) + f" export {split_name}",
         leave=False,
         dynamic_ncols=True,
     ):
@@ -995,7 +1223,9 @@ def _export_split(
             "top_p": float(config["sampling"]["top_p"]),
             "sample_count": int(config["sampling"]["sample_count"]),
             "sampling_seed": int(config["sampling"]["seed"]),
-            "averaging_space": "post-trained decoded raw continuous Close",
+            "averaging_space": (
+                f"{_decoder_result_label(config)} decoded raw continuous Close"
+            ),
             "raw_model_mean_probability": torch.as_tensor(
                 sample_cache["raw_model_mean_probability"]
             ).float(),
@@ -1083,6 +1313,20 @@ def _export_split(
     }
 
 
+def _is_task_specific_decoder_training(config: Mapping[str, Any]) -> bool:
+    return str(config.get("experiment_family", "")) == (
+        "kronos_task_specific_coarse_decoder_training"
+    )
+
+
+def _decoder_result_label(config: Mapping[str, Any]) -> str:
+    return (
+        "task-trained"
+        if _is_task_specific_decoder_training(config)
+        else "post-trained"
+    )
+
+
 def _metadata(
     *,
     config: Mapping[str, Any],
@@ -1106,41 +1350,38 @@ def _metadata(
         commit = None
     graph_values = source_config.get("model", {}).get("graph", {})
     if not graph_values:
-        graph_values = source_config.get("models", {}).get("dynamic_graph", {}).get("graph", {})
-    return {
+        graph_values = (
+            source_config.get("models", {})
+            .get("dynamic_graph", {})
+            .get("graph", {})
+        )
+    training = config["training"]
+    task_specific = _is_task_specific_decoder_training(config)
+    values: dict[str, Any] = {
         "status": "completed",
+        # Keep the established Graph Hub model family. The experiment profile
+        # is distinguished by ``experiment_family`` and the decoder config,
+        # not by introducing another artefact schema.
         "model_family": "kronos_decoder_post_training_token",
+        "experiment_family": config.get("experiment_family"),
         "run_name": config.get("run_name"),
         "best_epoch": int(best_epoch),
         "best_score": float(best_score),
         "epochs_completed": int(epochs_completed),
         "selection_split": "validation",
-        "selection_metric": config["training"]["selection_metric"],
-        "optimisation_profile": config["training"].get("optimisation_profile"),
-        "optimizer": config["training"]["optimizer"],
-        "scheduler": config["training"]["scheduler"],
-        "max_learning_rate": float(config["training"]["max_learning_rate"]),
-        "initial_learning_rate": float(
-            config["training"]["initial_learning_rate"]
-        ),
-        "minimum_learning_rate": float(
-            config["training"]["minimum_learning_rate"]
-        ),
-        "weight_decay": float(config["training"]["weight_decay"]),
-        "one_cycle_pct_start": float(
-            config["training"]["one_cycle_pct_start"]
-        ),
-        "one_cycle_div_factor": float(
-            config["training"]["one_cycle_div_factor"]
-        ),
-        "one_cycle_final_div_factor": float(
-            config["training"]["one_cycle_final_div_factor"]
-        ),
-        "gradient_clip_norm": float(
-            config["training"]["gradient_clip_norm"]
-        ),
+        "selection_metric": training["selection_metric"],
+        "optimisation_profile": training.get("optimisation_profile"),
+        "optimizer": training["optimizer"],
+        "scheduler": training["scheduler"],
+        "max_learning_rate": float(training["max_learning_rate"]),
+        "initial_learning_rate": float(training["initial_learning_rate"]),
+        "minimum_learning_rate": float(training["minimum_learning_rate"]),
+        "weight_decay": float(training["weight_decay"]),
+        "gradient_clip_norm": float(training["gradient_clip_norm"]),
         "source_forecaster_run_name": source_metadata.get("run_name"),
-        "source_forecaster_run_signature": source_metadata.get("run_signature"),
+        "source_forecaster_run_signature": source_metadata.get(
+            "run_signature"
+        ),
         "source_forecaster_best_epoch": int(source_metadata["best_epoch"]),
         "source_forecaster_frozen": True,
         "tokenizer_encoder_frozen": True,
@@ -1148,17 +1389,51 @@ def _metadata(
         "decoder_trainable_parameters": decoder.trainable_parameter_count(),
         "trainable_parameters": decoder.trainable_parameter_count(),
         "asset_cols": list(asset_cols),
-        "graph_type": source_metadata.get("graph_type", graph_values.get("type")),
-        "graph_heads": source_metadata.get("graph_heads", graph_values.get("num_heads", 1)),
+        "graph_type": source_metadata.get(
+            "graph_type", graph_values.get("type")
+        ),
+        "graph_heads": source_metadata.get(
+            "graph_heads", graph_values.get("num_heads", 1)
+        ),
         "graph_heads_per_layer": source_metadata.get(
             "graph_heads_per_layer",
-            graph_values.get("num_heads_per_block") or graph_values.get("num_heads_per_layer"),
+            graph_values.get("num_heads_per_block")
+            or graph_values.get("num_heads_per_layer"),
         ),
         "test_set_contaminated": True,
         "do_not_report": True,
         "project_git_commit": commit,
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+    if training["scheduler"] == "one_cycle":
+        values.update(
+            {
+                "one_cycle_pct_start": float(
+                    training["one_cycle_pct_start"]
+                ),
+                "one_cycle_div_factor": float(
+                    training["one_cycle_div_factor"]
+                ),
+                "one_cycle_final_div_factor": float(
+                    training["one_cycle_final_div_factor"]
+                ),
+            }
+        )
+    elif training["scheduler"] == "warmup_reduce_on_plateau":
+        values.update(
+            {
+                "warmup_epochs": int(training["warmup_epochs"]),
+                "warmup_start_learning_rate": float(
+                    training["warmup_start_learning_rate"]
+                ),
+                "plateau_factor": float(training["plateau_factor"]),
+                "plateau_patience": int(training["plateau_patience"]),
+                "plateau_threshold": float(
+                    training.get("plateau_threshold", 0.0)
+                ),
+            }
+        )
+    return values
 
 
 def _resolved_config(
@@ -1167,13 +1442,21 @@ def _resolved_config(
     source_config: Mapping[str, Any],
 ) -> dict[str, Any]:
     values = deepcopy(dict(source_config))
+    task_specific = _is_task_specific_decoder_training(config)
+    # Preserve the existing Graph Hub schema while recording the new
+    # optimisation intent under ``decoder_task_training``.
     values["model_family"] = "kronos_decoder_post_training_token"
-    values["decoder_post_training"] = deepcopy(dict(config))
+    if task_specific:
+        values["decoder_task_training"] = deepcopy(dict(config))
+    else:
+        values["decoder_post_training"] = deepcopy(dict(config))
     values["do_not_report"] = True
     values["test_set_contaminated"] = True
     training = values.setdefault("training", {})
     if isinstance(training, dict):
-        training["early_stopping_metric"] = config["training"]["selection_metric"]
+        training["early_stopping_metric"] = config["training"][
+            "selection_metric"
+        ]
         training["selection_metric"] = config["training"]["selection_metric"]
         training["selection_split"] = "validation"
     return values
@@ -1207,7 +1490,12 @@ def main() -> None:
         overwrite=args.overwrite,
         resume=args.resume,
     )
-    _atomic_json_save(config, run_dir / "decoder_post_training_config.json")
+    config_filename = (
+        "decoder_task_training_config.json"
+        if _is_task_specific_decoder_training(config)
+        else "decoder_post_training_config.json"
+    )
+    _atomic_json_save(config, run_dir / config_filename)
 
     source_dir = Path(config["source_forecaster"]["path"]).expanduser().resolve()
     source_config = _load_json(source_dir / "resolved_config.json")
@@ -1346,6 +1634,15 @@ def main() -> None:
             description=f"decoder validation epoch {epoch}",
         )
         score = float(validation_values["weighted_loss"])
+        learning_rate_before_validation_scheduler = float(
+            optimizer.param_groups[0]["lr"]
+        )
+        scheduler_reduced_learning_rate = _step_scheduler_after_validation(
+            scheduler, score
+        )
+        learning_rate_after_validation_scheduler = float(
+            optimizer.param_groups[0]["lr"]
+        )
         improved = score < best_score - float(training["min_delta"])
         if improved:
             best_score = score
@@ -1366,24 +1663,46 @@ def main() -> None:
             "epoch": int(epoch),
             "train_weighted_all_60_clg_mae": float(train_values["loss"]),
             "validation_weighted_all_60_clg_mae": score,
+            # Mean/max use finite batch norms only. A single AMP overflow no
+            # longer turns the complete epoch diagnostic into ``inf``.
             "decoder_gradient_norm": float(train_values["gradient_norm"]),
-            # OneCycleLR changes within each epoch; retain the historical
-            # learning_rate column as the next-step/end-of-epoch value and
-            # save the complete epoch range explicitly.
-            "learning_rate": float(train_values["learning_rate_end"]),
+            "decoder_gradient_norm_max": float(
+                train_values["gradient_norm_max"]
+            ),
+            "finite_gradient_norm_batches": int(
+                train_values["finite_gradient_norm_batches"]
+            ),
+            "nonfinite_gradient_norm_batches": int(
+                train_values["nonfinite_gradient_norm_batches"]
+            ),
+            "training_batches": int(train_values["training_batches"]),
+            "learning_rate": learning_rate_after_validation_scheduler,
             "learning_rate_start": float(train_values["learning_rate_start"]),
-            "learning_rate_end": float(train_values["learning_rate_end"]),
+            "learning_rate_end": learning_rate_after_validation_scheduler,
+            "learning_rate_before_validation_scheduler": (
+                learning_rate_before_validation_scheduler
+            ),
             "learning_rate_min": float(train_values["learning_rate_min"]),
             "learning_rate_max": float(train_values["learning_rate_max"]),
+            "scheduler_reduced_learning_rate": bool(
+                scheduler_reduced_learning_rate
+            ),
             "optimizer_steps": int(train_values["optimizer_steps"]),
             "skipped_optimizer_steps": int(
                 train_values["skipped_optimizer_steps"]
             ),
+            **_scheduler_diagnostics(scheduler),
             "best_score": float(best_score),
             "bad_epochs": int(bad_epochs),
             "epoch_seconds": perf_counter() - started,
             "validation_invalid_sample_candle_rate_percent": float(
                 validation_values["invalid_sample_candle_rate_percent"]
+            ),
+            "validation_decoded_close_min": float(
+                validation_values["decoded_close_min"]
+            ),
+            "validation_decoded_close_max": float(
+                validation_values["decoded_close_max"]
             ),
         }
         for index, value in enumerate(
@@ -1405,7 +1724,20 @@ def main() -> None:
             ),
             last_path,
         )
-        print(json.dumps({"epoch": epoch, "score": score, "best": best_score, "bad_epochs": bad_epochs}))
+        print(
+            json.dumps(
+                {
+                    "epoch": epoch,
+                    "score": score,
+                    "best": best_score,
+                    "bad_epochs": bad_epochs,
+                    "learning_rate": learning_rate_after_validation_scheduler,
+                    "scheduler_reduced_learning_rate": bool(
+                        scheduler_reduced_learning_rate
+                    ),
+                }
+            )
+        )
         if bad_epochs >= int(training["patience"]):
             break
 
@@ -1421,7 +1753,7 @@ def main() -> None:
     resolved = _resolved_config(config=config, source_config=source_config)
     _atomic_json_save(resolved, run_dir / "resolved_config.json")
 
-    # Baseline and post-trained evaluations use the exact same fixed ten paths.
+    # Baseline and selected trained-decoder evaluations use the exact same fixed ten paths.
     post_results: dict[str, Any] = {}
     for split_name in ("train", "validation", "test"):
         post_results[split_name] = _export_split(
@@ -1473,14 +1805,23 @@ def main() -> None:
     metadata["validation_baseline_weighted_loss"] = float(
         baseline_results["validation"]["weighted_loss"]
     )
-    metadata["validation_posttrained_weighted_loss"] = float(
-        post_results["validation"]["weighted_loss"]
-    )
+    if _is_task_specific_decoder_training(config):
+        metadata["validation_task_trained_weighted_loss"] = float(
+            post_results["validation"]["weighted_loss"]
+        )
+        metadata["test_task_trained_weighted_loss"] = float(
+            post_results["test"]["weighted_loss"]
+        )
+    else:
+        # Preserve the historical metadata keys for OneCycle runs.
+        metadata["validation_posttrained_weighted_loss"] = float(
+            post_results["validation"]["weighted_loss"]
+        )
+        metadata["test_posttrained_weighted_loss"] = float(
+            post_results["test"]["weighted_loss"]
+        )
     metadata["test_baseline_weighted_loss"] = float(
         baseline_results["test"]["weighted_loss"]
-    )
-    metadata["test_posttrained_weighted_loss"] = float(
-        post_results["test"]["weighted_loss"]
     )
     _atomic_json_save(metadata, run_dir / "run_metadata.json")
     _atomic_json_save(
@@ -1495,18 +1836,31 @@ def main() -> None:
         },
         run_dir / "temperature_sweep" / "temperature_selection.json",
     )
+    selected_column = (
+        "task_trained_weighted_all_60_clg_mae"
+        if _is_task_specific_decoder_training(config)
+        else "posttrained_weighted_all_60_clg_mae"
+    )
     comparison = pd.DataFrame(
         [
             {
                 "split": split,
-                "baseline_weighted_all_60_clg_mae": baseline_results[split]["weighted_loss"],
-                "posttrained_weighted_all_60_clg_mae": post_results[split]["weighted_loss"],
-                "improvement": baseline_results[split]["weighted_loss"] - post_results[split]["weighted_loss"],
+                "baseline_weighted_all_60_clg_mae": baseline_results[split][
+                    "weighted_loss"
+                ],
+                selected_column: post_results[split]["weighted_loss"],
+                "improvement": baseline_results[split]["weighted_loss"]
+                - post_results[split]["weighted_loss"],
             }
             for split in ("validation", "test")
         ]
     )
-    _atomic_csv_save(comparison, run_dir / "decoder_post_training_comparison.csv")
+    comparison_name = (
+        "decoder_task_training_comparison.csv"
+        if _is_task_specific_decoder_training(config)
+        else "decoder_post_training_comparison.csv"
+    )
+    _atomic_csv_save(comparison, run_dir / comparison_name)
     print(comparison.to_string(index=False))
 
 
