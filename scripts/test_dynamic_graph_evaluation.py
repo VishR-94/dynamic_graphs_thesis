@@ -17,6 +17,7 @@ from src.evaluation.dynamic_graph_evaluation import (
     analyse_coarse_token_predictive_distribution,
     analyse_coarse_token_topk,
     analyse_graph,
+    analyse_graph_layers,
     analyse_graph_entropy,
     analyse_graph_window,
     analyse_sector_graph,
@@ -1211,6 +1212,78 @@ def main() -> None:
         assert "sector-grouped" in sector_grouped_graph.adjacency_axes.get_title()
         sector_grouped_graph.adjacency_figure.clf()
         sector_grouped_graph.frequency_figure.clf()
+
+        layer_pdf = Path(temporary) / "round2_layers.pdf"
+        layer_panel = analyse_graph_layers(
+            round2,
+            split="train",
+            component="selected",
+            head="mean",
+            company_profiles_path=profiles_path,
+            show_sector_labels=True,
+            save_path=layer_pdf,
+        )
+        assert len(layer_panel.graphs) == 2
+        assert len(layer_panel.axes) == 2
+        assert len(layer_panel.plotted_adjacencies) == 2
+        assert layer_panel.saved_path == layer_pdf.resolve()
+        assert layer_pdf.is_file() and layer_pdf.stat().st_size > 0
+        assert all(axis.get_title() == "" for axis in layer_panel.axes)
+        assert [text.get_text() for text in layer_panel.axes[0].texts] == [
+            "Layer 1"
+        ]
+        assert [text.get_text() for text in layer_panel.axes[1].texts] == [
+            "Layer 2"
+        ]
+        assert list(layer_panel.plotted_adjacencies[0].index) == [
+            "BBB",
+            "AAA",
+            "CCC",
+        ]
+        assert [
+            tick.get_text()
+            for tick in layer_panel.axes[0].get_yticklabels()
+        ] == ["Financial Services", "Technology"]
+        assert not any(
+            tick.get_text() in ASSETS
+            for axis in layer_panel.axes
+            for tick in (
+                *axis.get_xticklabels(),
+                *axis.get_yticklabels(),
+            )
+        )
+        assert layer_panel.axes[0].get_ylabel() == ""
+        assert len(layer_panel.colour_scale_maxima) == 2
+        assert len(layer_panel.figure.axes) == 4
+        for axis, plotted, maximum in zip(
+            layer_panel.axes,
+            layer_panel.plotted_adjacencies,
+            layer_panel.colour_scale_maxima,
+            strict=True,
+        ):
+            displayed = plotted.to_numpy(dtype=np.float64, copy=True)
+            np.fill_diagonal(displayed, np.nan)
+            expected_maximum = float(np.nanmax(displayed))
+            assert np.isclose(axis.images[0].get_clim()[1], expected_maximum)
+            assert np.isclose(maximum, expected_maximum)
+        layer_panel.figure.clf()
+
+        one_layer_panel = analyse_graph_layers(
+            dynamic,
+            split="validation",
+            component="selected",
+            head="mean",
+            company_profiles_path=profiles_path,
+            show_sector_labels=False,
+            show_layer_labels=False,
+        )
+        assert len(one_layer_panel.graphs) == 1
+        assert len(one_layer_panel.axes) == 1
+        assert one_layer_panel.axes[0].get_title() == ""
+        assert not one_layer_panel.axes[0].texts
+        assert len(one_layer_panel.axes[0].get_xticks()) == 0
+        assert len(one_layer_panel.axes[0].get_yticks()) == 0
+        one_layer_panel.figure.clf()
 
         day_graph = analyse_graph(
             dynamic, split="validation", day="2024-09-03", window=None, cluster=False

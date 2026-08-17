@@ -41,7 +41,7 @@ Current public API
 
 from __future__ import annotations
 
-EVALUATION_MODULE_VERSION = "2026-08-12-v14-exact-token-probabilities"
+EVALUATION_MODULE_VERSION = "2026-08-16-v16-independent-layer-scales"
 
 import json
 import re
@@ -8759,6 +8759,19 @@ class GraphAnalysisReport:
 
 
 @dataclass(frozen=True)
+class GraphLayersReport:
+    """Sector-grouped adjacency heatmaps for every saved graph layer."""
+
+    graphs: tuple[SelectedGraph, ...]
+    figure: Figure
+    axes: tuple[Axes, ...]
+    plotted_adjacencies: tuple[pd.DataFrame, ...]
+    asset_sector_mapping: pd.DataFrame
+    colour_scale_maxima: tuple[float, ...]
+    saved_path: Path | None
+
+
+@dataclass(frozen=True)
 class GraphEntropyReport:
     """Dynamic-graph row entropy across dates/windows and target assets."""
 
@@ -9072,47 +9085,23 @@ def _select_day_window_rows(
     return working, selected_day, selected_window, description
 
 
-def select_graph(
-    model: str | Path,
+def _select_graph_from_loaded_artifacts(
     *,
-    split: EvaluationSplitInput | str = "validation",
-    policy: str | None = None,
-    day: str | None = None,
-    window: int | str | None = None,
-    component: GraphComponent = "selected",
-    layer: int = -1,
-    head: HeadSelection = "mean",
-    random_seed: int = 42,
-    models_root: str | Path | None = None,
+    artifacts: EvaluationArtifacts,
+    run_dir: Path,
+    resolved_split: EvaluationSplit,
+    selected_rows: pd.DataFrame,
+    selected_day: str | None,
+    selected_window: int | None,
+    description: str,
+    day: str | None,
+    window: int | str | None,
+    component: GraphComponent,
+    layer: int,
+    head: HeadSelection,
 ) -> SelectedGraph:
-    """Select or average graphs using the final day/window convention.
+    """Build one selected/averaged graph from already-loaded artefacts."""
 
-    ``day=None`` and ``window=None`` average the full split.  Supplying only a
-    day averages all windows on that day.  Supplying only a one-based window
-    number averages that intraday window across all days.  Use the explicit
-    string ``"random"`` for reproducible random day/window selection; ``None``
-    is never interpreted as random.
-    """
-
-    run_dir = resolve_model_folder(model, models_root=models_root)
-    resolved_split = normalise_evaluation_split(split)
-    artifacts = load_evaluation_artifacts(
-        run_dir,
-        split=resolved_split,
-        policy=policy,
-        require_graph=True,
-    )
-    table = make_evaluation_window_table(
-        run_dir,
-        split=resolved_split,
-        policy=artifacts.policy,
-    )
-    selected_rows, selected_day, selected_window, description = _select_day_window_rows(
-        table,
-        day=day,
-        window=window,
-        random_seed=random_seed,
-    )
     indices = torch.as_tensor(
         selected_rows["Global window index"].to_numpy(dtype=np.int64),
         dtype=torch.long,
@@ -9122,33 +9111,34 @@ def select_graph(
         component=component,
         layer=layer,
     ).index_select(0, indices)
-
     if head == "mean":
         per_window = tensor.mean(dim=1)
     else:
         head_index = int(head)
         if not 0 <= head_index < int(tensor.shape[1]):
             raise IndexError(
-                f"Graph head {head_index} is out of range for {int(tensor.shape[1])} heads."
+                f"Graph head {head_index} is out of range for "
+                f"{int(tensor.shape[1])} heads in layer {int(layer) + 1}."
             )
         per_window = tensor[:, head_index]
-
     displayed = per_window.mean(dim=0)
     displayed_entropy = -(
         displayed.clamp_min(1.0e-12) * displayed.clamp_min(1.0e-12).log()
     ).sum(dim=-1)
     per_window_entropy = -(
-        per_window.clamp_min(1.0e-12) * per_window.clamp_min(1.0e-12).log()
+        per_window.clamp_min(1.0e-12)
+        * per_window.clamp_min(1.0e-12).log()
     ).sum(dim=-1)
     available_neighbours = displayed.shape[-1] - 1
     top_k = max(1, min(5, available_neighbours))
     top5_mass = displayed.topk(top_k, dim=-1).values.sum(dim=-1)
-
     unique_time_windows = tuple(
         str(value)
         for value in selected_rows["Time window"].dropna().unique().tolist()
     )
-    time_description = unique_time_windows[0] if len(unique_time_windows) == 1 else None
+    time_description = (
+        unique_time_windows[0] if len(unique_time_windows) == 1 else None
+    )
     frame = pd.DataFrame(
         displayed.numpy(),
         index=artifacts.info.asset_cols,
@@ -9176,14 +9166,76 @@ def select_graph(
         selection_description=description,
         time_window_description=time_description,
         displayed_mean_row_entropy=float(displayed_entropy.mean().item()),
-        displayed_effective_neighbours=float(displayed_entropy.exp().mean().item()),
+        displayed_effective_neighbours=float(
+            displayed_entropy.exp().mean().item()
+        ),
         mean_window_row_entropy=float(per_window_entropy.mean().item()),
-        mean_window_effective_neighbours=float(per_window_entropy.exp().mean().item()),
+        mean_window_effective_neighbours=float(
+            per_window_entropy.exp().mean().item()
+        ),
         maximum_edge_weight=float(displayed.max().item()),
         mean_top5_row_mass=float(top5_mass.mean().item()),
         add_self_loops=artifacts.info.add_self_loops,
     )
 
+
+def select_graph(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    day: str | None = None,
+    window: int | str | None = None,
+    component: GraphComponent = "selected",
+    layer: int = -1,
+    head: HeadSelection = "mean",
+    random_seed: int = 42,
+    models_root: str | Path | None = None,
+) -> SelectedGraph:
+    """Select or average graphs using the final day/window convention.
+
+    ``day=None`` and ``window=None`` average the full split. Supplying only a
+    day averages all windows on that day. Supplying only a one-based window
+    number averages that intraday window across all days. Use the explicit
+    string ``"random"`` for reproducible random day/window selection; ``None``
+    is never interpreted as random.
+    """
+
+    run_dir = resolve_model_folder(model, models_root=models_root)
+    resolved_split = normalise_evaluation_split(split)
+    artifacts = load_evaluation_artifacts(
+        run_dir,
+        split=resolved_split,
+        policy=policy,
+        require_graph=True,
+    )
+    table = make_evaluation_window_table(
+        run_dir,
+        split=resolved_split,
+        policy=artifacts.policy,
+    )
+    selected_rows, selected_day, selected_window, description = (
+        _select_day_window_rows(
+            table,
+            day=day,
+            window=window,
+            random_seed=random_seed,
+        )
+    )
+    return _select_graph_from_loaded_artifacts(
+        artifacts=artifacts,
+        run_dir=run_dir,
+        resolved_split=resolved_split,
+        selected_rows=selected_rows,
+        selected_day=selected_day,
+        selected_window=selected_window,
+        description=description,
+        day=day,
+        window=window,
+        component=component,
+        layer=layer,
+        head=head,
+    )
 
 def make_selected_graph_summary(graph: SelectedGraph) -> pd.DataFrame:
     """Summarise the displayed mean graph and its window-level concentration."""
@@ -9279,24 +9331,23 @@ def plot_selected_graph(
     figsize: tuple[float, float] = (13.0, 11.0),
     tick_fontsize: float = 8.0,
     ax: Axes | None = None,
+    colour_scale_maximum: float | None = None,
+    show_asset_labels: bool = True,
+    show_sector_labels: bool = False,
+    show_axis_labels: bool = True,
+    show_title: bool = True,
+    show_colourbar: bool = True,
+    colourbar_label: str | None = "Adjacency weight",
+    finalise_layout: bool = True,
 ) -> tuple[Figure, Axes, pd.DataFrame]:
     """Plot actual adjacency weights, optionally grouped by company sector.
 
-    ``cluster=False`` preserves the saved model asset order. ``cluster=True``
-    no longer performs unsupervised hierarchical clustering: it reads column 1
-    (ticker) and column 6 (sector) from ``company_profiles.csv``, orders sectors
-    alphabetically, and orders tickers alphabetically within each sector. This
-    fixed economic ordering makes graphs directly comparable across windows.
-
-    ``cluster_method`` is retained only for backward call compatibility and is
-    ignored when sector grouping is requested.
-
-    ``heatmap_cap_top_k`` is a display-only colour-scale control.  The default
-    value ``0`` preserves the ordinary maximum-edge colour scale.  A positive
-    value ignores that many largest finite off-diagonal entries when choosing
-    ``vmax``; those entries are visually saturated at the next-highest value.
-    The adjacency returned by this function, and every metric/table calculated
-    from it, always retain the original uncapped weights.
+    Existing calls retain their original appearance. The additional display
+    switches allow the same heatmap to be embedded in compact multi-panel
+    figures without repeating stock labels, titles, axes labels or colourbars.
+    ``colour_scale_maximum`` can be supplied to enforce a common scale across
+    several panels. All display controls leave the returned adjacency values
+    unchanged.
     """
 
     del cluster_method
@@ -9310,9 +9361,8 @@ def plot_selected_graph(
         )
         matrix = matrix[np.ix_(order, order)]
         labels = labels[order]
-        ordered_sectors = (
-            ordered_mapping["Sector"].astype(str).to_numpy()
-        )
+        ordered_sectors = ordered_mapping["Sector"].astype(str).to_numpy()
+
     plotted_values = matrix.copy()
     if not graph.add_self_loops:
         np.fill_diagonal(plotted_values, np.nan)
@@ -9322,12 +9372,14 @@ def plot_selected_graph(
     applied_cap_count = 0
     maximum = uncapped_maximum
     if cap_count > 0 and finite.size > cap_count:
-        # The (k+1)-th largest finite displayed edge becomes the colourbar
-        # maximum. Matplotlib saturates all larger values at that colour.
-        candidate = float(np.partition(finite, -(cap_count + 1))[-(cap_count + 1)])
+        candidate = float(
+            np.partition(finite, -(cap_count + 1))[-(cap_count + 1)]
+        )
         if np.isfinite(candidate) and candidate > 0.0:
             maximum = candidate
             applied_cap_count = cap_count
+    if colour_scale_maximum is not None:
+        maximum = float(colour_scale_maximum)
     if not np.isfinite(maximum) or maximum <= 0.0:
         maximum = 1.0
 
@@ -9346,49 +9398,90 @@ def plot_selected_graph(
         interpolation="nearest",
         aspect="equal",
     )
-    axes.set_xticks(np.arange(len(labels)))
-    axes.set_yticks(np.arange(len(labels)))
-    axes.set_xticklabels(labels, rotation=90, fontsize=tick_fontsize)
-    axes.set_yticklabels(labels, fontsize=tick_fontsize)
-    axes.set_xlabel("Source asset (influences target)")
-    axes.set_ylabel("Target asset (receives influence)")
+
+    boundaries = np.asarray([], dtype=np.int64)
+    sector_centres = np.asarray([], dtype=np.float64)
+    sector_names: tuple[str, ...] = ()
     if ordered_sectors is not None and len(ordered_sectors):
         boundaries = (
             np.flatnonzero(ordered_sectors[1:] != ordered_sectors[:-1]) + 1
         )
+        starts = np.concatenate(([0], boundaries))
+        ends = np.concatenate((boundaries, [len(ordered_sectors)]))
+        sector_centres = (starts + ends - 1) / 2.0
+        sector_names = tuple(str(ordered_sectors[index]) for index in starts)
         for boundary in boundaries:
             coordinate = float(boundary) - 0.5
             axes.axhline(coordinate, color="black", linewidth=0.8, alpha=0.65)
             axes.axvline(coordinate, color="black", linewidth=0.8, alpha=0.65)
-    time_text = (
-        f" — {graph.time_window_description}" if graph.time_window_description else ""
-    )
-    cap_text = (
-        "\n"
-        f"display-only colour cap: top {applied_cap_count} edge(s) saturated "
-        f"at {maximum:.6g}; true maximum={uncapped_maximum:.6g}"
-        if applied_cap_count > 0
-        else ""
-    )
-    axes.set_title(
-        f"{graph.run_name} — {graph.split} / {graph.policy}\n"
-        f"{graph.selection_description}{time_text}"
-        f"{' — sector-grouped' if cluster else ''}\n"
-        f"H(mean adjacency)={graph.displayed_mean_row_entropy:.4f}; "
-        f"mean H(window adjacency)={graph.mean_window_row_entropy:.4f}"
-        f"{cap_text}"
-    )
-    colourbar = figure.colorbar(image, ax=axes, fraction=0.046, pad=0.03)
-    colourbar.set_label(
-        "Adjacency weight"
-        + (" (display capped)" if applied_cap_count > 0 else "")
-    )
-    figure.tight_layout()
+
+    if show_sector_labels:
+        if ordered_sectors is None:
+            raise ValueError("show_sector_labels=True requires cluster=True.")
+        axes.set_xticks(sector_centres)
+        axes.set_yticks(sector_centres)
+        axes.set_xticklabels(
+            sector_names,
+            rotation=90,
+            fontsize=tick_fontsize,
+            ha="center",
+            va="top",
+        )
+        axes.set_yticklabels(sector_names, fontsize=tick_fontsize)
+    elif show_asset_labels:
+        axes.set_xticks(np.arange(len(labels)))
+        axes.set_yticks(np.arange(len(labels)))
+        axes.set_xticklabels(labels, rotation=90, fontsize=tick_fontsize)
+        axes.set_yticklabels(labels, fontsize=tick_fontsize)
+    else:
+        axes.set_xticks([])
+        axes.set_yticks([])
+
+    if show_axis_labels:
+        axes.set_xlabel("Source asset (influences target)")
+        axes.set_ylabel("Target asset (receives influence)")
+    else:
+        axes.set_xlabel("")
+        axes.set_ylabel("")
+
+    if show_title:
+        time_text = (
+            f" — {graph.time_window_description}"
+            if graph.time_window_description
+            else ""
+        )
+        cap_text = (
+            "\n"
+            f"display-only colour cap: top {applied_cap_count} edge(s) "
+            f"saturated at {maximum:.6g}; true maximum={uncapped_maximum:.6g}"
+            if applied_cap_count > 0
+            else ""
+        )
+        axes.set_title(
+            f"{graph.run_name} — {graph.split} / {graph.policy}\n"
+            f"{graph.selection_description}{time_text}"
+            f"{' — sector-grouped' if cluster else ''}\n"
+            f"H(mean adjacency)={graph.displayed_mean_row_entropy:.4f}; "
+            f"mean H(window adjacency)={graph.mean_window_row_entropy:.4f}"
+            f"{cap_text}"
+        )
+    else:
+        axes.set_title("")
+
+    if show_colourbar:
+        colourbar = figure.colorbar(image, ax=axes, fraction=0.046, pad=0.03)
+        if colourbar_label is not None:
+            colourbar.set_label(
+                str(colourbar_label)
+                + (" (display capped)" if applied_cap_count > 0 else "")
+            )
+    if finalise_layout:
+        figure.tight_layout()
+
     plotted = pd.DataFrame(matrix, index=labels, columns=labels)
     plotted.index.name = "Target"
     plotted.columns.name = "Source"
     return figure, axes, plotted
-
 
 def plot_top_source_frequency(
     table: pd.DataFrame,
@@ -9445,6 +9538,7 @@ def analyse_graph(
     heatmap_cap_top_k: int = 0,
     random_seed: int = 42,
     models_root: str | Path | None = None,
+    show_title: bool = True
 ) -> GraphAnalysisReport:
     """Run the complete actual-adjacency analysis for one graph selection.
 
@@ -9474,6 +9568,7 @@ def analyse_graph(
         cluster=cluster,
         company_profiles_path=company_profiles_path,
         heatmap_cap_top_k=heatmap_cap_top_k,
+        show_title=show_title,
     )
     frequency_figure, frequency_axes = plot_top_source_frequency(
         frequency,
@@ -9489,6 +9584,212 @@ def analyse_graph(
         frequency_figure=frequency_figure,
         frequency_axes=frequency_axes,
         plotted_adjacency=plotted,
+    )
+
+
+
+def _graph_component_layer_indices(
+    artifacts: EvaluationArtifacts,
+    *,
+    component: GraphComponent,
+) -> tuple[tuple[int, ...], bool]:
+    """Infer saved layer count from graph artefacts, not model config keys."""
+
+    if artifacts.graph_artifacts is None:
+        raise FileNotFoundError(
+            f"No {artifacts.split} graph artefact exists for "
+            f"{artifacts.info.run_dir}."
+        )
+    graph = artifacts.graph_artifacts
+    per_layer_key = {
+        "selected": "per_layer",
+        "base": "per_layer_base",
+        "dynamic": "per_layer_dynamic",
+    }[component]
+    per_layer = graph.get(per_layer_key)
+    if isinstance(per_layer, Sequence) and not isinstance(
+        per_layer,
+        (str, bytes),
+    ):
+        if len(per_layer) == 0:
+            raise ValueError(f"Saved {per_layer_key} collection is empty.")
+        return tuple(range(len(per_layer))), True
+    if graph.get(component) is not None:
+        return (0,), False
+    raise ValueError(f"Graph component {component!r} is unavailable.")
+
+
+def analyse_graph_layers(
+    model: str | Path,
+    *,
+    split: EvaluationSplitInput | str = "validation",
+    policy: str | None = None,
+    day: str | None = None,
+    window: int | str | None = None,
+    component: GraphComponent = "selected",
+    head: HeadSelection = "mean",
+    company_profiles_path: str | Path | None = None,
+    show_sector_labels: bool = True,
+    show_layer_labels: bool = True,
+    heatmap_cap_top_k: int = 0,
+    random_seed: int = 42,
+    models_root: str | Path | None = None,
+    figsize: tuple[float, float] | None = None,
+    sector_label_fontsize: float = 7.0,
+    layer_label_fontsize: float = 9.0,
+    save_path: str | Path | None = None,
+) -> GraphLayersReport:
+    """Plot every saved graph layer side by side using independent scales.
+
+    The day/window selection is identical to :func:`analyse_graph`. Assets are
+    always ordered by sector and ticker. Individual stock labels are omitted;
+    optional sector labels appear once at the centre of each sector block. No
+    model title, subplot title, or target-axis label is added. Small in-panel
+    layer labels can be disabled with ``show_layer_labels=False``.
+
+    Every layer receives its own colour scale and its own slim colourbar. This
+    preserves within-layer contrast when earlier softmax layers have much
+    smaller maximum edge weights than a later sparse layer. ``heatmap_cap_top_k``
+    is applied independently within each layer.
+
+    The graph file is loaded only once, which matters for large multi-layer
+    exports. A PDF ``save_path`` produces a tightly cropped vector figure ready
+    for ``\\includegraphics`` in LaTeX.
+    """
+
+    run_dir = resolve_model_folder(model, models_root=models_root)
+    resolved_split = normalise_evaluation_split(split)
+    artifacts = load_evaluation_artifacts(
+        run_dir,
+        split=resolved_split,
+        policy=policy,
+        require_graph=True,
+    )
+    table = make_evaluation_window_table(
+        run_dir,
+        split=resolved_split,
+        policy=artifacts.policy,
+    )
+    selected_rows, selected_day, selected_window, description = (
+        _select_day_window_rows(
+            table,
+            day=day,
+            window=window,
+            random_seed=random_seed,
+        )
+    )
+    layer_indices, has_per_layer = _graph_component_layer_indices(
+        artifacts,
+        component=component,
+    )
+    graphs = tuple(
+        _select_graph_from_loaded_artifacts(
+            artifacts=artifacts,
+            run_dir=run_dir,
+            resolved_split=resolved_split,
+            selected_rows=selected_rows,
+            selected_day=selected_day,
+            selected_window=selected_window,
+            description=description,
+            day=day,
+            window=window,
+            component=component,
+            layer=(layer if has_per_layer else -1),
+            head=head,
+        )
+        for layer in layer_indices
+    )
+
+    assets = tuple(str(value) for value in graphs[0].adjacency.index)
+    _, ordered_mapping = make_sector_group_order(
+        assets,
+        company_profiles_path=company_profiles_path,
+    )
+
+    layer_count = len(graphs)
+    resolved_figsize = (
+        (max(4.7 * layer_count, 5.2), 4.65)
+        if figsize is None
+        else tuple(float(value) for value in figsize)
+    )
+    figure, axes_array = plt.subplots(
+        1,
+        layer_count,
+        figsize=resolved_figsize,
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    axes = tuple(axes_array[0])
+    plotted: list[pd.DataFrame] = []
+    colour_scale_maxima: list[float] = []
+
+    for panel, (axis, graph) in enumerate(zip(axes, graphs, strict=True)):
+        _, _, frame = plot_selected_graph(
+            graph,
+            cluster=True,
+            company_profiles_path=company_profiles_path,
+            tick_fontsize=sector_label_fontsize,
+            ax=axis,
+            show_asset_labels=False,
+            show_sector_labels=show_sector_labels,
+            show_axis_labels=False,
+            show_title=False,
+            show_colourbar=True,
+            colourbar_label=(
+                "Adjacency weight" if panel == layer_count - 1 else None
+            ),
+            heatmap_cap_top_k=heatmap_cap_top_k,
+            finalise_layout=False,
+        )
+        plotted.append(frame)
+        colour_scale_maxima.append(float(axis.images[0].get_clim()[1]))
+        colourbar_axis = figure.axes[-1]
+        colourbar_axis.tick_params(labelsize=6.5)
+        if panel == layer_count - 1:
+            colourbar_axis.yaxis.label.set_size(7.5)
+        if show_sector_labels and panel > 0:
+            axis.tick_params(axis="y", labelleft=False)
+        if show_layer_labels:
+            axis.text(
+                0.02,
+                0.98,
+                f"Layer {graph.layer + 1}",
+                transform=axis.transAxes,
+                ha="left",
+                va="top",
+                fontsize=layer_label_fontsize,
+                fontweight="bold",
+                bbox={
+                    "facecolor": "white",
+                    "edgecolor": "none",
+                    "alpha": 0.82,
+                    "pad": 1.5,
+                },
+            )
+
+    if show_sector_labels:
+        figure.supxlabel(
+            "Source sector (influences target)",
+            fontsize=8.5,
+        )
+
+    written_path: Path | None = None
+    if save_path is not None:
+        destination = Path(save_path).expanduser()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(destination, bbox_inches="tight", pad_inches=0.02)
+        written_path = destination.resolve()
+
+    return GraphLayersReport(
+        graphs=graphs,
+        figure=figure,
+        axes=axes,
+        plotted_adjacencies=tuple(plotted),
+        asset_sector_mapping=ordered_mapping.copy(),
+        colour_scale_maxima=tuple(colour_scale_maxima),
+        saved_path=written_path,
     )
 
 
