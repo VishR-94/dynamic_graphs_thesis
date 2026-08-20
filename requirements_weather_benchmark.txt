@@ -1,0 +1,9 @@
+# Additive dependencies for the Sonnet weather benchmark port.
+# PyTorch is supplied by the selected Colab CUDA runtime.
+numpy
+pandas
+scikit-learn
+scipy
+tqdm
+joblib
+einops==0.8.1
