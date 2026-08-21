@@ -324,6 +324,15 @@ def _training_loss(
     raise TypeError(type(output))
 
 
+def _loader_worker_options(config: WeatherRunConfig) -> dict[str, Any]:
+    if int(config.num_workers) <= 0:
+        return {}
+    return {
+        "persistent_workers": True,
+        "prefetch_factor": int(config.prefetch_factor),
+    }
+
+
 def _make_train_loader(
     dataset: Dataset[dict[str, Any]],
     *,
@@ -339,7 +348,7 @@ def _make_train_loader(
         num_workers=int(config.num_workers),
         pin_memory=bool(config.pin_memory and torch.cuda.is_available()),
         drop_last=False,
-        persistent_workers=bool(config.num_workers > 0),
+        **_loader_worker_options(config),
     )
 
 
@@ -356,7 +365,7 @@ def _make_eval_loader(
         num_workers=int(config.num_workers),
         pin_memory=bool(config.pin_memory and torch.cuda.is_available()),
         drop_last=False,
-        persistent_workers=bool(config.num_workers > 0),
+        **_loader_worker_options(config),
     )
 
 
@@ -373,11 +382,16 @@ def _train_epoch(
 ) -> dict[str, float]:
     model.train()
     loader = _make_train_loader(dataset, config=config, epoch=epoch)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    train_started = time.perf_counter()
     diagnostics = WeightedScalarAccumulator()
     loss_sum = 0.0
     loss_count = 0
     final_sse = 0.0
     final_count = 0
+    optimizer_steps = 0
 
     graph_ids = graph_parameter_ids(model)
     graph_parameters = [
@@ -393,7 +407,9 @@ def _train_epoch(
         leave=False,
         dynamic_ncols=True,
     )
-    for batch in progress:
+    total_batches = len(loader)
+    update_interval = max(1, int(config.progress_update_interval))
+    for batch_index, batch in enumerate(progress, start=1):
         optimizer.zero_grad(set_to_none=True)
         batch_size = int(torch.as_tensor(batch["x"]).shape[0])
         with _amp_context(device, use_amp):
@@ -426,6 +442,7 @@ def _train_epoch(
             diagnostic_taken = True
         scaler.step(optimizer)
         scaler.update()
+        optimizer_steps += 1
 
         loss_sum += float(loss.detach().item()) * batch_size
         loss_count += batch_size
@@ -433,15 +450,30 @@ def _train_epoch(
             torch.sum((final_pred.detach().float() - final_true.detach().float()) ** 2).item()
         )
         final_count += int(final_pred.numel())
-        progress.set_postfix(loss=f"{float(loss.detach().item()):.5f}")
+        if batch_index % update_interval == 0 or batch_index == total_batches:
+            progress.set_postfix(loss=f"{float(loss.detach().item()):.5f}")
 
     if loss_count <= 0 or final_count <= 0:
         raise RuntimeError("Training loader produced no examples.")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    train_duration = max(time.perf_counter() - train_started, 1.0e-12)
     result = {
         "train_loss": loss_sum / loss_count,
         "train_central_final_horizon_mse": final_sse / final_count,
+        "train_duration_seconds": train_duration,
+        "train_examples_per_second": float(loss_count) / train_duration,
+        "train_optimizer_steps": float(optimizer_steps),
+        "train_batches_per_second": float(optimizer_steps) / train_duration,
         **diagnostics.means(),
     }
+    if device.type == "cuda":
+        result["train_peak_cuda_memory_allocated_gib"] = float(
+            torch.cuda.max_memory_allocated(device) / (1024**3)
+        )
+        result["train_peak_cuda_memory_reserved_gib"] = float(
+            torch.cuda.max_memory_reserved(device) / (1024**3)
+        )
     for index, alpha in enumerate(model_alphas(model), start=1):
         result[f"alpha_block_{index}"] = float(alpha.detach().item())
     for index, beta in enumerate(model_betas(model), start=1):
@@ -612,6 +644,12 @@ def _prepare_run_metadata(
             "scheduler_decay_start_epoch": int(config.scheduler_decay_start_epoch),
             "scheduler_decay_factor": float(config.scheduler_decay_factor),
             "dense_prefix_training": bool(config.dense_prefix_training),
+            "num_workers": int(config.num_workers),
+            "prefetch_factor": (
+                int(config.prefetch_factor) if int(config.num_workers) > 0 else None
+            ),
+            "progress_update_interval": int(config.progress_update_interval),
+            "cache_causal_masks": bool(config.cache_causal_masks),
             "loss": "normalised-space MSE over all output steps and all nodes",
             "dense_prefix_scope": (
                 "all context origins, all forecast steps, all nodes"
@@ -1202,6 +1240,15 @@ def train_weather_model(
             "test_year": int(config.test_year),
             "horizon": int(config.horizon),
             "context_length": int(config.context_length),
+            "run_suffix": config.run_suffix,
+            "modern_tcn_large_kernel": (
+                int(config.modern_tcn_large_kernel)
+                if config.model_kind == "modern_tcn_1st"
+                else None
+            ),
+            "train_batch_size": int(config.batch_size),
+            "validation_batch_size": int(config.validation_batch_size),
+            "export_batch_size": int(config.export_batch_size),
             "best_epoch": int(best_epoch),
             "best_validation_score": float(best_score),
             "stopped_early": bool(stopped_early),

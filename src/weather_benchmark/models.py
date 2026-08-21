@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Adapters from the frozen financial architectures to the weather task."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +38,45 @@ def _dense_forecast_steps(horizon: int) -> tuple[int, ...]:
     return tuple(range(1, int(horizon) + 1))
 
 
+def _cached_causal_mask_factory(
+    original: Callable[..., Tensor],
+) -> Callable[..., Tensor]:
+    """Cache the exact boolean causal mask by sequence length and device.
+
+    The imported 3ST architecture otherwise constructs the same ``[L, L]``
+    mask once per ST block and batch.  This weather-only runtime optimisation
+    changes neither parameters nor attention mathematics.
+    """
+
+    cache: dict[tuple[int, str, int | None], Tensor] = {}
+
+    def cached(num_steps: int, *, device: torch.device) -> Tensor:
+        resolved = torch.device(device)
+        key = (int(num_steps), resolved.type, resolved.index)
+        value = cache.get(key)
+        if value is None or value.device != resolved:
+            value = original(int(num_steps), device=resolved)
+            cache[key] = value
+        return value
+
+    return cached
+
+
+def _install_transformer_causal_mask_caches(
+    model: StackedDenseTransformerGraphModel,
+) -> int:
+    """Install non-persistent mask caches on all three weather ST blocks."""
+
+    installed = 0
+    for block in model.blocks:
+        encoder = block.temporal_encoder
+        encoder.causal_mask = _cached_causal_mask_factory(  # type: ignore[method-assign]
+            encoder.causal_mask
+        )
+        installed += 1
+    return installed
+
+
 def build_modern_tcn_weather_model(
     config: WeatherRunConfig,
     data: SonnetWeatherDataBundle,
@@ -56,7 +96,7 @@ def build_modern_tcn_weather_model(
         patch_stride=4,
         modern_tcn_ffn_ratio=1,
         modern_tcn_num_blocks=1,
-        modern_tcn_large_kernel=15,
+        modern_tcn_large_kernel=int(config.modern_tcn_large_kernel),
         modern_tcn_small_kernel=5,
         modern_tcn_dropout=0.05,
         modern_tcn_head_dropout=0.0,
@@ -116,6 +156,7 @@ def build_modern_tcn_weather_model(
         "prior_scale": float(config.prior_scale),
         "prior_jitter": float(config.prior_jitter),
         "prior_seed": int(config.prior_seed),
+        "large_kernel": int(config.modern_tcn_large_kernel),
         "initial_alpha": float(model.alpha().detach().item()),
         "initial_beta": float(model.beta().detach().item()),
     }
@@ -135,7 +176,7 @@ def build_modern_tcn_weather_model(
                 "num_blocks": 1,
                 "patch_size": 8,
                 "patch_stride": 4,
-                "large_kernel": 15,
+                "large_kernel": int(config.modern_tcn_large_kernel),
                 "small_kernel": 5,
                 "ffn_ratio": 1,
                 "dropout": 0.05,
@@ -191,6 +232,11 @@ def build_transformer_3st_weather_model(
         spatial_dropout=0.0,
     )
     model = StackedDenseTransformerGraphModel(model_config)
+    cached_mask_blocks = (
+        _install_transformer_causal_mask_caches(model)
+        if bool(config.cache_causal_masks)
+        else 0
+    )
     initial_bases = model.initial_base_graphs()
     payload = {
         "model_kind": config.model_kind,
@@ -205,6 +251,7 @@ def build_transformer_3st_weather_model(
         "initial_beta_per_layer": [
             float(value.detach().item()) for value in model.betas()
         ],
+        "runtime_cached_causal_mask_blocks": int(cached_mask_blocks),
     }
     return WeatherModelBundle(
         model=model,

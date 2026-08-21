@@ -9,6 +9,7 @@ changes required by the Sonnet WeatherBench protocol.
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import re
 from typing import Literal
 
 
@@ -20,6 +21,20 @@ WEATHER_HORIZON_TO_CONTEXT: dict[int, int] = {
     28: 56,
     120: 240,
 }
+
+# Three validation candidates per Sonnet weather task.  Kernels operate on the
+# ModernTCN patch sequence (patch size 8, stride 4), not directly on raw
+# six-hour observations.  The short-context grids span local to full-context
+# final-patch coverage.  For H=120, the three values give the final graph
+# state a local, approximately half-context, and full-context receptive field
+# over the 60-patch sequence while retaining the frozen kernel-15 candidate.
+MODERN_TCN_KERNEL_GRID_BY_HORIZON: dict[int, tuple[int, ...]] = {
+    4: (7, 11, 15),
+    12: (7, 11, 15),
+    28: (15, 21, 27),
+    120: (15, 61, 119),
+}
+
 SUPPORTED_CITIES: tuple[str, ...] = (
     "capetown",
     "hongkong",
@@ -71,15 +86,29 @@ class WeatherRunConfig:
     pin_memory: bool = True
 
     # Existing financial optimisation schedules; these are not re-tuned for
-    # the weather benchmark in the initial experiment.
+    # the weather benchmark unless explicitly changed by a later experiment.
     backbone_learning_rate: float = 2.5e-4
     graph_learning_rate: float = 5.0e-4
     scheduler_decay_factor: float = 0.9
 
-    # Existing price-model architecture constants.
+    # Existing price-model graph-prior constants.
     prior_scale: float = 4.0
     prior_jitter: float = 0.02
     prior_seed: int = 42
+
+    # Weather-only experiment controls.  Their defaults exactly preserve the
+    # original frozen-transfer run topology and directory layout.
+    modern_tcn_large_kernel: int = 15
+    train_batch_size_override: int | None = None
+    validation_batch_size_override: int | None = None
+    export_batch_size_override: int | None = None
+    run_suffix: str | None = None
+
+    # Runtime-only accelerations.  They do not change model parameters, loss,
+    # causal constraints, optimiser or learning-rate schedule.
+    cache_causal_masks: bool = False
+    progress_update_interval: int = 1
+    prefetch_factor: int = 2
 
     # Execution controls.
     device: str = "auto"
@@ -90,7 +119,9 @@ class WeatherRunConfig:
 
     def __post_init__(self) -> None:
         city = str(self.city).lower().strip()
+        suffix = None if self.run_suffix is None else str(self.run_suffix).strip()
         object.__setattr__(self, "city", city)
+        object.__setattr__(self, "run_suffix", suffix or None)
         object.__setattr__(self, "data_path", Path(self.data_path).expanduser())
         object.__setattr__(self, "output_root", Path(self.output_root).expanduser())
         self.validate()
@@ -127,6 +158,28 @@ class WeatherRunConfig:
             raise ValueError("prior_scale must be positive.")
         if float(self.prior_jitter) < 0.0:
             raise ValueError("prior_jitter must be non-negative.")
+        if int(self.modern_tcn_large_kernel) < 5:
+            raise ValueError("modern_tcn_large_kernel must be at least 5.")
+        if int(self.modern_tcn_large_kernel) % 2 == 0:
+            raise ValueError("modern_tcn_large_kernel must be odd.")
+        for name, value in (
+            ("train_batch_size_override", self.train_batch_size_override),
+            ("validation_batch_size_override", self.validation_batch_size_override),
+            ("export_batch_size_override", self.export_batch_size_override),
+        ):
+            if value is not None and int(value) <= 0:
+                raise ValueError(f"{name} must be positive when provided.")
+        if self.run_suffix is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]*", self.run_suffix
+        ):
+            raise ValueError(
+                "run_suffix must contain only letters, numbers, '.', '_' or '-', "
+                "and must start with a letter or number."
+            )
+        if int(self.progress_update_interval) <= 0:
+            raise ValueError("progress_update_interval must be positive.")
+        if int(self.prefetch_factor) <= 0:
+            raise ValueError("prefetch_factor must be positive.")
 
     @property
     def context_length(self) -> int:
@@ -142,14 +195,20 @@ class WeatherRunConfig:
 
     @property
     def batch_size(self) -> int:
+        if self.train_batch_size_override is not None:
+            return int(self.train_batch_size_override)
         return 16 if self.model_kind == "modern_tcn_1st" else 1
 
     @property
     def validation_batch_size(self) -> int:
+        if self.validation_batch_size_override is not None:
+            return int(self.validation_batch_size_override)
         return 32 if self.model_kind == "modern_tcn_1st" else 2
 
     @property
     def export_batch_size(self) -> int:
+        if self.export_batch_size_override is not None:
+            return int(self.export_batch_size_override)
         return 32 if self.model_kind == "modern_tcn_1st" else 2
 
     @property
@@ -163,12 +222,15 @@ class WeatherRunConfig:
 
     @property
     def run_directory(self) -> Path:
+        leaf = f"test_year_{int(self.test_year)}"
+        if self.run_suffix is not None:
+            leaf = f"{leaf}_{self.run_suffix}"
         return (
             self.output_root
             / self.model_output_directory
             / self.city
             / f"horizon_{int(self.horizon)}"
-            / f"test_year_{int(self.test_year)}"
+            / leaf
         )
 
     @property
@@ -177,6 +239,30 @@ class WeatherRunConfig:
 
     def to_dict(self) -> dict[str, object]:
         values = asdict(self)
+
+        # Keep legacy checkpoint signatures valid for the original frozen
+        # weather runs.  New fields are absent when they are at their old-
+        # behaviour defaults, but are included for every ablation/accelerated
+        # run where they materially identify the experiment.
+        if int(self.modern_tcn_large_kernel) == 15:
+            values.pop("modern_tcn_large_kernel")
+        if self.train_batch_size_override is None:
+            values.pop("train_batch_size_override")
+        if self.validation_batch_size_override is None:
+            values.pop("validation_batch_size_override")
+        if self.export_batch_size_override is None:
+            values.pop("export_batch_size_override")
+        if self.run_suffix is None:
+            values.pop("run_suffix")
+        if not bool(self.cache_causal_masks):
+            values.pop("cache_causal_masks")
+        if int(self.progress_update_interval) == 1:
+            values.pop("progress_update_interval")
+        # DataLoader's historical default is already 2, so omitting it at 2
+        # retains the prior signature and behaviour.
+        if int(self.prefetch_factor) == 2:
+            values.pop("prefetch_factor")
+
         values["data_path"] = str(self.data_path)
         values["output_root"] = str(self.output_root)
         values.update(

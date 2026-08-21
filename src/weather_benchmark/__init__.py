@@ -2,6 +2,7 @@
 
 from .config import (
     CENTRAL_NODE_INDEX,
+    MODERN_TCN_KERNEL_GRID_BY_HORIZON,
     MODEL_OUTPUT_DIRECTORIES,
     SUPPORTED_CITIES,
     WEATHER_FEATURES,
@@ -13,12 +14,15 @@ from .runner import (
     ensure_weather_csv,
     make_weather_run_config,
     preflight_weather_run,
+    probe_weather_training_batch,
     run_weather_experiment,
+    run_modern_tcn_kernel_sweep,
     run_weather_suite,
 )
 
 __all__ = [
     "CENTRAL_NODE_INDEX",
+    "MODERN_TCN_KERNEL_GRID_BY_HORIZON",
     "MODEL_OUTPUT_DIRECTORIES",
     "SUPPORTED_CITIES",
     "WEATHER_FEATURES",
@@ -28,6 +32,8 @@ __all__ = [
     "ensure_weather_csv",
     "make_weather_run_config",
     "preflight_weather_run",
+    "probe_weather_training_batch",
     "run_weather_experiment",
+    "run_modern_tcn_kernel_sweep",
     "run_weather_suite",
 ]

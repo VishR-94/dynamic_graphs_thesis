@@ -12,10 +12,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.weather_benchmark.config import (  # noqa: E402
+    MODERN_TCN_KERNEL_GRID_BY_HORIZON,
     SUPPORTED_CITIES,
     WEATHER_HORIZON_TO_CONTEXT,
 )
-from src.weather_benchmark.runner import ensure_weather_csv, run_weather_suite  # noqa: E402
+from src.weather_benchmark.runner import (  # noqa: E402
+    ensure_weather_csv,
+    run_modern_tcn_kernel_sweep,
+    run_weather_suite,
+)
 
 
 def _parse_horizons(value: str) -> tuple[int, ...]:
@@ -75,6 +80,23 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
+        "--modern-tcn-kernel-sweep",
+        action="store_true",
+        help="Run the three-kernel validation grid for every requested horizon.",
+    )
+    parser.add_argument("--modern-tcn-large-kernel", type=int, default=15)
+    parser.add_argument("--train-batch-size", type=int, default=None)
+    parser.add_argument("--validation-batch-size", type=int, default=None)
+    parser.add_argument("--export-batch-size", type=int, default=None)
+    parser.add_argument("--run-suffix", default=None)
+    parser.add_argument(
+        "--cache-causal-masks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--progress-update-interval", type=int, default=1)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -106,24 +128,56 @@ def main() -> None:
         if args.data_path is not None
         else ensure_weather_csv(args.city, args.data_cache)
     )
-    summary = run_weather_suite(
-        model_kinds=model_kinds,
-        city=args.city,
-        test_year=args.test_year,
-        horizons=args.horizons,
-        data_path=data_path,
-        output_root=args.output_root,
-        project_root=PROJECT_ROOT,
-        device=args.device,
-        resume=args.resume,
-        overwrite=args.overwrite,
-        skip_completed=args.skip_completed,
-        export_train_split=args.export_train_split,
-        max_epochs=args.max_epochs,
-        patience=args.patience,
-        num_workers=args.num_workers,
-        continue_on_error=args.continue_on_error,
-    )
+    if args.modern_tcn_kernel_sweep:
+        if args.model not in {"modern_tcn_1st", "all"}:
+            raise ValueError("Kernel sweep requires --model modern_tcn_1st or all.")
+        summary = run_modern_tcn_kernel_sweep(
+            city=args.city,
+            test_year=args.test_year,
+            horizons=args.horizons,
+            data_path=data_path,
+            output_root=args.output_root,
+            project_root=PROJECT_ROOT,
+            kernel_grid=MODERN_TCN_KERNEL_GRID_BY_HORIZON,
+            device=args.device,
+            resume=args.resume,
+            overwrite=args.overwrite,
+            skip_completed=args.skip_completed,
+            export_train_split=args.export_train_split,
+            max_epochs=args.max_epochs,
+            patience=args.patience,
+            num_workers=args.num_workers,
+            continue_on_error=args.continue_on_error,
+            progress_update_interval=args.progress_update_interval,
+            prefetch_factor=args.prefetch_factor,
+        )
+    else:
+        summary = run_weather_suite(
+            model_kinds=model_kinds,
+            city=args.city,
+            test_year=args.test_year,
+            horizons=args.horizons,
+            data_path=data_path,
+            output_root=args.output_root,
+            project_root=PROJECT_ROOT,
+            device=args.device,
+            resume=args.resume,
+            overwrite=args.overwrite,
+            skip_completed=args.skip_completed,
+            export_train_split=args.export_train_split,
+            max_epochs=args.max_epochs,
+            patience=args.patience,
+            num_workers=args.num_workers,
+            continue_on_error=args.continue_on_error,
+            modern_tcn_large_kernel=args.modern_tcn_large_kernel,
+            train_batch_size=args.train_batch_size,
+            validation_batch_size=args.validation_batch_size,
+            export_batch_size=args.export_batch_size,
+            run_suffix=args.run_suffix,
+            cache_causal_masks=args.cache_causal_masks,
+            progress_update_interval=args.progress_update_interval,
+            prefetch_factor=args.prefetch_factor,
+        )
     args.output_root.mkdir(parents=True, exist_ok=True)
     summary_path = args.output_root / (
         f"suite_summary_{args.city}_test{args.test_year}.csv"
