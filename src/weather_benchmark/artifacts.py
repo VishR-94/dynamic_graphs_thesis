@@ -84,15 +84,32 @@ def capture_rng_state() -> dict[str, Any]:
     return values
 
 
+def _cpu_byte_tensor(value: Any) -> torch.Tensor:
+    """Return an RNG-state value as a contiguous CPU uint8 tensor."""
+
+    if torch.is_tensor(value):
+        return value.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    return torch.as_tensor(value, dtype=torch.uint8, device="cpu").contiguous()
+
+
 def restore_rng_state(values: Mapping[str, Any]) -> None:
     if "python" in values:
         random.setstate(values["python"])
     if "numpy" in values:
         np.random.set_state(values["numpy"])
     if "torch_cpu" in values:
-        torch.set_rng_state(values["torch_cpu"])
+        # Checkpoints are loaded with map_location=<training device>. On a CUDA
+        # run that also remaps the saved CPU RNG tensor to CUDA, but
+        # torch.set_rng_state accepts a CPU ByteTensor only.
+        torch.set_rng_state(_cpu_byte_tensor(values["torch_cpu"]))
     if "torch_cuda" in values and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(values["torch_cuda"])
+        cuda_states = [
+            _cpu_byte_tensor(state)
+            for state in values["torch_cuda"]
+        ]
+        torch.cuda.set_rng_state_all(
+            cuda_states[: torch.cuda.device_count()]
+        )
 
 
 def git_value(project_root: Path, arguments: list[str]) -> str | None:
