@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from src.models.dense_transformer_depth_sweep import (
     GRAPH_ORIENTATION,
@@ -328,7 +328,7 @@ def _loader_worker_options(config: WeatherRunConfig) -> dict[str, Any]:
     if int(config.num_workers) <= 0:
         return {}
     return {
-        "persistent_workers": True,
+        "persistent_workers": False,
         "prefetch_factor": int(config.prefetch_factor),
     }
 
