@@ -75,12 +75,30 @@ def resolve_device(requested: str) -> torch.device:
     return device
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, *, deterministic: bool = False) -> None:
     random.seed(int(seed))
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
+    if deterministic:
+        # Improve repeatability for the controlled weather sweep without
+        # enabling strict deterministic-algorithm errors in the imported
+        # ModernTCN implementation.  The resolved flag is saved in every run.
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        if hasattr(torch.backends, "cuda") and hasattr(
+            torch.backends.cuda, "matmul"
+        ):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = False
+        # Prefer deterministic implementations where PyTorch can provide them.
+        # ``warn_only`` keeps third-party ModernTCN operations usable while
+        # surfacing any operation for which deterministic execution is not
+        # available on the current Colab stack.
+        if hasattr(torch, "use_deterministic_algorithms"):
+            torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def _signature(values: Mapping[str, Any]) -> str:
@@ -650,6 +668,12 @@ def _prepare_run_metadata(
             ),
             "progress_update_interval": int(config.progress_update_interval),
             "cache_causal_masks": bool(config.cache_causal_masks),
+            "deterministic_runtime": bool(config.deterministic_runtime),
+            "torch_deterministic_algorithms_enabled": (
+                bool(torch.are_deterministic_algorithms_enabled())
+                if hasattr(torch, "are_deterministic_algorithms_enabled")
+                else None
+            ),
             "loss": "normalised-space MSE over all output steps and all nodes",
             "dense_prefix_scope": (
                 "all context origins, all forecast steps, all nodes"
@@ -1033,7 +1057,10 @@ def train_weather_model(
 
     device = resolve_device(config.device)
     use_amp = bool(config.mixed_precision) and device.type == "cuda"
-    set_seed(config.seed)
+    set_seed(
+        config.seed,
+        deterministic=bool(config.deterministic_runtime),
+    )
 
     model = model_bundle.model.to(device)
     optimizer = _build_optimizer(model, config)

@@ -85,7 +85,7 @@ def build_modern_tcn_weather_model(
 
     temporal = ContinuousTemporalConfig(
         type="modern_tcn",
-        d_model=32,
+        d_model=int(config.modern_tcn_d_model),
         num_layers=1,
         num_heads=4,
         feedforward_multiplier=2,
@@ -93,7 +93,7 @@ def build_modern_tcn_weather_model(
         relative_position_embedding=False,
         session_position_encoding=False,
         patch_size=8,
-        patch_stride=4,
+        patch_stride=int(config.modern_tcn_patch_stride),
         modern_tcn_ffn_ratio=1,
         modern_tcn_num_blocks=1,
         modern_tcn_large_kernel=int(config.modern_tcn_large_kernel),
@@ -113,7 +113,7 @@ def build_modern_tcn_weather_model(
         graph=GraphConfig(
             type="dynamic",
             num_heads=1,
-            hidden_dim=32,
+            hidden_dim=int(config.modern_tcn_graph_hidden_dim),
             activation="softmax",
             add_self_loops=False,
             mtgnn_top_k=min(4, len(WEATHER_NODES) - 1),
@@ -157,6 +157,9 @@ def build_modern_tcn_weather_model(
         "prior_jitter": float(config.prior_jitter),
         "prior_seed": int(config.prior_seed),
         "large_kernel": int(config.modern_tcn_large_kernel),
+        "patch_stride": int(config.modern_tcn_patch_stride),
+        "d_model": int(config.modern_tcn_d_model),
+        "graph_hidden_dim": int(config.modern_tcn_graph_hidden_dim),
         "initial_alpha": float(model.alpha().detach().item()),
         "initial_beta": float(model.beta().detach().item()),
     }
@@ -172,10 +175,10 @@ def build_modern_tcn_weather_model(
             "target": "t850_all_nodes",
             "temporal": {
                 "type": "modern_tcn",
-                "d_model": 32,
+                "d_model": int(config.modern_tcn_d_model),
                 "num_blocks": 1,
                 "patch_size": 8,
-                "patch_stride": 4,
+                "patch_stride": int(config.modern_tcn_patch_stride),
                 "large_kernel": int(config.modern_tcn_large_kernel),
                 "small_kernel": 5,
                 "ffn_ratio": 1,
@@ -187,7 +190,7 @@ def build_modern_tcn_weather_model(
                 "type": "static_dynamic_mixture",
                 "activation": "softmax",
                 "num_heads": 1,
-                "hidden_dim": 32,
+                "hidden_dim": int(config.modern_tcn_graph_hidden_dim),
                 "initial_alpha": 0.5,
                 "static_initialisation": "correlation_prior",
                 "prior_scale": float(config.prior_scale),

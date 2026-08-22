@@ -49,6 +49,48 @@ Because the original 2018 results motivated this sweep, retain the frozen
 `test_year_2018` runs as the clean no-weather-tuning transfer result and label
 the kernel sweep as a subsequent exploratory optimisation.
 
+## ModernTCN patch-stride and coupled-width sweep
+
+The next Hong Kong search fixes the best kernel from the preceding sweep at
+each horizon:
+
+```python
+{4: 7, 12: 7, 28: 15, 120: 119}
+```
+
+Patch size remains 8.  The stride grids are `(2,4,7)` for the 28-step contexts
+and `(2,4,8)` for the 56- and 240-step contexts.  Each stride is crossed with
+whole-model widths `(32,64,128)`.  Width is coupled as:
+
+```text
+ModernTCN d_model = graph hidden_dim = D
+```
+
+This produces 36 models.  Every candidate retains one ModernTCN block, small
+kernel 5, the training-only differenced-T850 correlation prior, alpha/beta
+mixtures, batch size 16, Adam learning rates `2.5e-4/5e-4`, and the existing
+delayed decay schedule.  The supplied notebook also enables the optional
+weather-only deterministic cuDNN/TF32 controls and PyTorch warn-only
+deterministic algorithms for a more internally consistent sweep; this setting is saved in each resolved configuration.  Candidate
+directories are explicit, for example:
+
+```text
+weather/modernTCN/hongkong/horizon_120/
+  test_year_2018_kernel_119_stride_2_dmodel_128_graphdim_128/
+```
+
+Each model is early-stopped using 2017 central-node final-horizon MSE.  The best
+checkpoint is then exported on train, validation, and 2018 test, including all
+predictions, Sonnet metrics, checkpoints, epoch histories, and final-context
+static/dynamic/mixed graphs.  The summary records both validation rank and test
+MAE rank; architectural selection remains identifiable from the validation
+score.
+
+The public API is `run_modern_tcn_stride_width_sweep`.  Individual selected
+architectures can later be retrained for test years 2016/2017 or transferred to
+a different supported city by changing the city/year and passing the chosen
+kernel, stride, `d_model`, and graph hidden dimension to `run_weather_suite`.
+
 ## Faster dense-prefix 3ST execution
 
 The 3ST architecture and dense-prefix loss are unchanged.  The optimized Colab

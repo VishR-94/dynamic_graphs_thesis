@@ -13,12 +13,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.weather_benchmark.config import (  # noqa: E402
     MODERN_TCN_KERNEL_GRID_BY_HORIZON,
+    MODERN_TCN_PATCH_STRIDE_GRID_BY_HORIZON,
+    MODERN_TCN_SELECTED_KERNEL_BY_HORIZON,
+    MODERN_TCN_WIDTH_GRID,
     SUPPORTED_CITIES,
     WEATHER_HORIZON_TO_CONTEXT,
 )
 from src.weather_benchmark.runner import (  # noqa: E402
     ensure_weather_csv,
     run_modern_tcn_kernel_sweep,
+    run_modern_tcn_stride_width_sweep,
     run_weather_suite,
 )
 
@@ -84,7 +88,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run the three-kernel validation grid for every requested horizon.",
     )
+    parser.add_argument(
+        "--modern-tcn-stride-width-sweep",
+        action="store_true",
+        help=(
+            "Run the 36-model selected-kernel x patch-stride x coupled-width "
+            "grid across the requested horizons."
+        ),
+    )
     parser.add_argument("--modern-tcn-large-kernel", type=int, default=15)
+    parser.add_argument("--modern-tcn-patch-stride", type=int, default=4)
+    parser.add_argument("--modern-tcn-d-model", type=int, default=32)
+    parser.add_argument("--modern-tcn-graph-hidden-dim", type=int, default=32)
     parser.add_argument("--train-batch-size", type=int, default=None)
     parser.add_argument("--validation-batch-size", type=int, default=None)
     parser.add_argument("--export-batch-size", type=int, default=None)
@@ -96,6 +111,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--progress-update-interval", type=int, default=1)
     parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--deterministic-runtime",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use deterministic cuDNN convolution selection, disable TF32, and "
+            "enable PyTorch deterministic algorithms in warn-only mode."
+        ),
+    )
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
@@ -128,7 +152,43 @@ def main() -> None:
         if args.data_path is not None
         else ensure_weather_csv(args.city, args.data_cache)
     )
-    if args.modern_tcn_kernel_sweep:
+    if args.modern_tcn_kernel_sweep and args.modern_tcn_stride_width_sweep:
+        raise ValueError(
+            "Choose either --modern-tcn-kernel-sweep or "
+            "--modern-tcn-stride-width-sweep, not both."
+        )
+    if args.modern_tcn_stride_width_sweep:
+        if args.model not in {"modern_tcn_1st", "all"}:
+            raise ValueError(
+                "Stride/width sweep requires --model modern_tcn_1st or all."
+            )
+        summary = run_modern_tcn_stride_width_sweep(
+            city=args.city,
+            test_year=args.test_year,
+            horizons=args.horizons,
+            data_path=data_path,
+            output_root=args.output_root,
+            project_root=PROJECT_ROOT,
+            selected_kernels=MODERN_TCN_SELECTED_KERNEL_BY_HORIZON,
+            stride_grid=MODERN_TCN_PATCH_STRIDE_GRID_BY_HORIZON,
+            d_model_grid=MODERN_TCN_WIDTH_GRID,
+            device=args.device,
+            resume=args.resume,
+            overwrite=args.overwrite,
+            skip_completed=args.skip_completed,
+            export_train_split=args.export_train_split,
+            max_epochs=args.max_epochs,
+            patience=args.patience,
+            num_workers=args.num_workers,
+            continue_on_error=args.continue_on_error,
+            train_batch_size=args.train_batch_size,
+            validation_batch_size=args.validation_batch_size,
+            export_batch_size=args.export_batch_size,
+            progress_update_interval=args.progress_update_interval,
+            prefetch_factor=args.prefetch_factor,
+            deterministic_runtime=args.deterministic_runtime,
+        )
+    elif args.modern_tcn_kernel_sweep:
         if args.model not in {"modern_tcn_1st", "all"}:
             raise ValueError("Kernel sweep requires --model modern_tcn_1st or all.")
         summary = run_modern_tcn_kernel_sweep(
@@ -150,6 +210,7 @@ def main() -> None:
             continue_on_error=args.continue_on_error,
             progress_update_interval=args.progress_update_interval,
             prefetch_factor=args.prefetch_factor,
+            deterministic_runtime=args.deterministic_runtime,
         )
     else:
         summary = run_weather_suite(
@@ -170,6 +231,9 @@ def main() -> None:
             num_workers=args.num_workers,
             continue_on_error=args.continue_on_error,
             modern_tcn_large_kernel=args.modern_tcn_large_kernel,
+            modern_tcn_patch_stride=args.modern_tcn_patch_stride,
+            modern_tcn_d_model=args.modern_tcn_d_model,
+            modern_tcn_graph_hidden_dim=args.modern_tcn_graph_hidden_dim,
             train_batch_size=args.train_batch_size,
             validation_batch_size=args.validation_batch_size,
             export_batch_size=args.export_batch_size,
@@ -177,6 +241,7 @@ def main() -> None:
             cache_causal_masks=args.cache_causal_masks,
             progress_update_interval=args.progress_update_interval,
             prefetch_factor=args.prefetch_factor,
+            deterministic_runtime=args.deterministic_runtime,
         )
     args.output_root.mkdir(parents=True, exist_ok=True)
     summary_path = args.output_root / (

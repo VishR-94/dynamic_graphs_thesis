@@ -35,6 +35,30 @@ MODERN_TCN_KERNEL_GRID_BY_HORIZON: dict[int, tuple[int, ...]] = {
     120: (15, 61, 119),
 }
 
+# Kernels selected from the preceding Hong Kong 2018 kernel sweep.  The next
+# weather-only search keeps these fixed and varies internal patch resolution
+# and coupled temporal/graph capacity.
+MODERN_TCN_SELECTED_KERNEL_BY_HORIZON: dict[int, int] = {
+    4: 7,
+    12: 7,
+    28: 15,
+    120: 119,
+}
+
+# Patch size remains fixed at 8.  The longer stride must divide the Sonnet
+# look-back exactly and cannot exceed the patch size under the one-stage
+# ModernTCN contract.
+MODERN_TCN_PATCH_STRIDE_GRID_BY_HORIZON: dict[int, tuple[int, ...]] = {
+    4: (2, 4, 7),
+    12: (2, 4, 7),
+    28: (2, 4, 8),
+    120: (2, 4, 8),
+}
+
+# The sweep couples ModernTCN d_model and graph hidden_dim so the relational
+# path does not become an unintended fixed-width bottleneck.
+MODERN_TCN_WIDTH_GRID: tuple[int, ...] = (32, 64, 128)
+
 SUPPORTED_CITIES: tuple[str, ...] = (
     "capetown",
     "hongkong",
@@ -99,6 +123,9 @@ class WeatherRunConfig:
     # Weather-only experiment controls.  Their defaults exactly preserve the
     # original frozen-transfer run topology and directory layout.
     modern_tcn_large_kernel: int = 15
+    modern_tcn_patch_stride: int = 4
+    modern_tcn_d_model: int = 32
+    modern_tcn_graph_hidden_dim: int = 32
     train_batch_size_override: int | None = None
     validation_batch_size_override: int | None = None
     export_batch_size_override: int | None = None
@@ -109,6 +136,7 @@ class WeatherRunConfig:
     cache_causal_masks: bool = False
     progress_update_interval: int = 1
     prefetch_factor: int = 2
+    deterministic_runtime: bool = False
 
     # Execution controls.
     device: str = "auto"
@@ -162,6 +190,21 @@ class WeatherRunConfig:
             raise ValueError("modern_tcn_large_kernel must be at least 5.")
         if int(self.modern_tcn_large_kernel) % 2 == 0:
             raise ValueError("modern_tcn_large_kernel must be odd.")
+        if int(self.modern_tcn_patch_stride) <= 0:
+            raise ValueError("modern_tcn_patch_stride must be positive.")
+        if int(self.modern_tcn_patch_stride) > 8:
+            raise ValueError(
+                "modern_tcn_patch_stride cannot exceed the fixed patch size 8."
+            )
+        if int(self.context_length) % int(self.modern_tcn_patch_stride) != 0:
+            raise ValueError(
+                "The Sonnet context length must be divisible by "
+                "modern_tcn_patch_stride."
+            )
+        if int(self.modern_tcn_d_model) <= 0:
+            raise ValueError("modern_tcn_d_model must be positive.")
+        if int(self.modern_tcn_graph_hidden_dim) <= 0:
+            raise ValueError("modern_tcn_graph_hidden_dim must be positive.")
         for name, value in (
             ("train_batch_size_override", self.train_batch_size_override),
             ("validation_batch_size_override", self.validation_batch_size_override),
@@ -246,6 +289,12 @@ class WeatherRunConfig:
         # run where they materially identify the experiment.
         if int(self.modern_tcn_large_kernel) == 15:
             values.pop("modern_tcn_large_kernel")
+        if int(self.modern_tcn_patch_stride) == 4:
+            values.pop("modern_tcn_patch_stride")
+        if int(self.modern_tcn_d_model) == 32:
+            values.pop("modern_tcn_d_model")
+        if int(self.modern_tcn_graph_hidden_dim) == 32:
+            values.pop("modern_tcn_graph_hidden_dim")
         if self.train_batch_size_override is None:
             values.pop("train_batch_size_override")
         if self.validation_batch_size_override is None:
@@ -262,6 +311,8 @@ class WeatherRunConfig:
         # retains the prior signature and behaviour.
         if int(self.prefetch_factor) == 2:
             values.pop("prefetch_factor")
+        if not bool(self.deterministic_runtime):
+            values.pop("deterministic_runtime")
 
         values["data_path"] = str(self.data_path)
         values["output_root"] = str(self.output_root)

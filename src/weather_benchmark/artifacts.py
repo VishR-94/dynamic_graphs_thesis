@@ -134,6 +134,30 @@ def environment_manifest(project_root: Path, device: torch.device) -> dict[str, 
         "cuda_available": bool(torch.cuda.is_available()),
         "cuda_version": torch.version.cuda,
         "cudnn_version": torch.backends.cudnn.version(),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cudnn_allow_tf32": (
+            bool(torch.backends.cudnn.allow_tf32)
+            if hasattr(torch.backends.cudnn, "allow_tf32")
+            else None
+        ),
+        "cuda_matmul_allow_tf32": (
+            bool(torch.backends.cuda.matmul.allow_tf32)
+            if hasattr(torch.backends, "cuda")
+            and hasattr(torch.backends.cuda, "matmul")
+            else None
+        ),
+        "deterministic_algorithms_enabled": (
+            bool(torch.are_deterministic_algorithms_enabled())
+            if hasattr(torch, "are_deterministic_algorithms_enabled")
+            else None
+        ),
+        "deterministic_algorithms_warn_only": (
+            bool(torch.is_deterministic_algorithms_warn_only_enabled())
+            if hasattr(torch, "is_deterministic_algorithms_warn_only_enabled")
+            else None
+        ),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         "gpu_name": (
             torch.cuda.get_device_name(device)
             if device.type == "cuda"
