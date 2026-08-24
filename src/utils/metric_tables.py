@@ -22,6 +22,10 @@ DEFAULT_METRIC_DISPLAY_NAMES = {
     "persistence_win_rate": "Win Rate",
     "cumulative_log_change_directional_accuracy": "Sign Acc.",
     "cumulative_log_change_pearson_correlation": "Pearson",
+    "raw_price_temporal_pearson_correlation": "Price Pearson",
+    "forecast_series_log_return_temporal_pearson_correlation": (
+        "Series-Return Pearson"
+    ),
     "cumulative_log_change_cross_sectional_pearson_ic": "IC",
     "cumulative_log_change_cross_sectional_spearman_rank_ic": (
         "Rank IC"
@@ -52,6 +56,8 @@ DEFAULT_SUMMARY_METRICS = (
     "persistence_win_rate",
     "cumulative_log_change_directional_accuracy",
     "cumulative_log_change_pearson_correlation",
+    "raw_price_temporal_pearson_correlation",
+    "forecast_series_log_return_temporal_pearson_correlation",
     "cumulative_log_change_cross_sectional_pearson_ic",
     "cumulative_log_change_cross_sectional_spearman_rank_ic",
     "cumulative_log_change_movement_magnitude_ratio",

@@ -41,7 +41,7 @@ Current public API
 
 from __future__ import annotations
 
-EVALUATION_MODULE_VERSION = "2026-08-16-v16-independent-layer-scales"
+EVALUATION_MODULE_VERSION = "2026-08-24-v17-secondary-temporal-correlations"
 
 import json
 import re
@@ -1337,6 +1337,8 @@ def _augment_best_metrics_from_saved_predictions(
         "cumulative_log_change_median_absolute_error",
         "cumulative_log_change_p95_absolute_error",
         "cumulative_log_change_directional_accuracy",
+        "raw_price_temporal_pearson_correlation",
+        "forecast_series_log_return_temporal_pearson_correlation",
     }
 
     recomputable = [
@@ -7251,6 +7253,8 @@ def _augment_common_metrics_from_saved_predictions(
 
     backfillable_metrics = (
         "cumulative_log_change_directional_accuracy",
+        "raw_price_temporal_pearson_correlation",
+        "forecast_series_log_return_temporal_pearson_correlation",
     )
 
     missing = [

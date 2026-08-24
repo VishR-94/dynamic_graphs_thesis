@@ -1012,6 +1012,400 @@ def pearson_correlation(
         num_channels,
     )
 
+
+def assetwise_temporal_pearson_correlation(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    reduce_dims: Sequence[int] = (0, 2),
+    eps: float = 0.0,
+) -> torch.Tensor:
+    """Compute Pearson correlation through time for each asset.
+
+    Correlation is calculated separately across forecast windows for
+    every asset, horizon and channel.  The valid asset-level
+    correlations are then averaged across assets:
+
+        [B, H, N, C] -> [H, N, C] -> [H, C]
+
+    Pairwise non-finite observations are ignored.  This allows the same
+    implementation to be used for horizon-aligned forecast-series log
+    returns, whose first observation in each trading session is
+    intentionally undefined.
+
+    Inputs are accumulated in float64 so small intraday price changes do
+    not disappear through centring or squaring.
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred,
+        y_true=y_true,
+    )
+
+    if y_pred.ndim != 4:
+        raise ValueError(
+            "Expected y_pred and y_true to have shape [B, H, N, C], "
+            f"got {tuple(y_pred.shape)}."
+        )
+
+    if tuple(reduce_dims) != (0, 2):
+        raise ValueError(
+            "assetwise_temporal_pearson_correlation currently supports "
+            "reduce_dims=(0, 2) only."
+        )
+
+    if y_pred.shape[0] < 2:
+        raise ValueError(
+            "Asset-wise temporal correlation requires at least two "
+            "forecast windows."
+        )
+
+    predicted = y_pred.to(dtype=torch.float64)
+    realised = y_true.to(dtype=torch.float64)
+
+    valid_pair = (
+        torch.isfinite(predicted)
+        & torch.isfinite(realised)
+    )
+
+    safe_predicted = torch.where(
+        valid_pair,
+        predicted,
+        torch.zeros_like(predicted),
+    )
+    safe_realised = torch.where(
+        valid_pair,
+        realised,
+        torch.zeros_like(realised),
+    )
+
+    observation_count = valid_pair.sum(
+        dim=0,
+    ).to(dtype=torch.float64)
+
+    predicted_sum = safe_predicted.sum(dim=0)
+    realised_sum = safe_realised.sum(dim=0)
+    predicted_squared_sum = safe_predicted.square().sum(dim=0)
+    realised_squared_sum = safe_realised.square().sum(dim=0)
+    cross_sum = (safe_predicted * safe_realised).sum(dim=0)
+
+    numerator = (
+        observation_count * cross_sum
+        - predicted_sum * realised_sum
+    )
+
+    predicted_variation = torch.clamp_min(
+        observation_count * predicted_squared_sum
+        - predicted_sum.square(),
+        0.0,
+    )
+    realised_variation = torch.clamp_min(
+        observation_count * realised_squared_sum
+        - realised_sum.square(),
+        0.0,
+    )
+
+    denominator = torch.sqrt(
+        predicted_variation
+        * realised_variation
+    )
+
+    valid_correlation = (
+        observation_count > 1
+    ) & (
+        denominator > float(eps)
+    )
+
+    safe_denominator = torch.where(
+        valid_correlation,
+        denominator,
+        torch.ones_like(denominator),
+    )
+
+    asset_correlations = torch.where(
+        valid_correlation,
+        numerator / safe_denominator,
+        torch.full_like(denominator, torch.nan),
+    ).clamp(min=-1.0, max=1.0)
+
+    # [H, N, C] -> [H, C]
+    return torch.nanmean(
+        asset_correlations,
+        dim=1,
+    )
+
+
+def forecast_series_log_return_values(
+    y_pred_raw: torch.Tensor,
+    y_true_raw: torch.Tensor,
+    sample_idx: torch.Tensor,
+    origin_idx: torch.Tensor,
+    *,
+    expected_origin_stride: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Construct log returns from each horizon-aligned price series.
+
+    For every horizon and asset, the prediction sequence is treated as a
+    time series in its own right.  Consecutive log returns are formed
+    only when two forecast origins belong to the same trading session
+    and are exactly one expected origin stride apart.  Overnight changes
+    and gaps in the saved prediction sequence are therefore excluded.
+
+    The returned tensors retain shape ``[B, H, N, C]``.  Entries without
+    a valid preceding within-session forecast are NaN.  A pair is also
+    marked NaN when either predicted or realised price is non-finite or
+    non-positive, because its log return is undefined.  The third return
+    value is the validated or inferred origin stride.
+    """
+    validate_prediction_shapes(
+        y_pred=y_pred_raw,
+        y_true=y_true_raw,
+    )
+
+    if y_pred_raw.ndim != 4:
+        raise ValueError(
+            "Expected y_pred_raw and y_true_raw to have shape "
+            f"[B, H, N, C], got {tuple(y_pred_raw.shape)}."
+        )
+
+    batch_size = int(y_pred_raw.shape[0])
+
+    if batch_size < 2:
+        raise ValueError(
+            "Forecast-series log returns require at least two "
+            "forecast windows."
+        )
+
+    metadata: dict[str, torch.Tensor] = {
+        "sample_idx": sample_idx,
+        "origin_idx": origin_idx,
+    }
+
+    integer_dtypes = {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }
+
+    metadata_cpu: dict[str, torch.Tensor] = {}
+
+    for name, values in metadata.items():
+        if not isinstance(values, torch.Tensor):
+            raise TypeError(
+                f"{name} must be a torch.Tensor."
+            )
+        if values.ndim != 1 or values.shape[0] != batch_size:
+            raise ValueError(
+                f"{name} must have shape [{batch_size}], got "
+                f"{tuple(values.shape)}."
+            )
+        if values.dtype not in integer_dtypes:
+            raise TypeError(
+                f"{name} must use an integer dtype, got "
+                f"{values.dtype}."
+            )
+
+        metadata_cpu[name] = (
+            values
+            .detach()
+            .cpu()
+            .to(dtype=torch.long)
+        )
+
+    sample_values = metadata_cpu["sample_idx"].tolist()
+    origin_values = metadata_cpu["origin_idx"].tolist()
+
+    ordered_positions = sorted(
+        range(batch_size),
+        key=lambda position: (
+            sample_values[position],
+            origin_values[position],
+        ),
+    )
+
+    order_cpu = torch.tensor(
+        ordered_positions,
+        dtype=torch.long,
+    )
+
+    ordered_sample_idx = metadata_cpu["sample_idx"].index_select(
+        0,
+        order_cpu,
+    )
+    ordered_origin_idx = metadata_cpu["origin_idx"].index_select(
+        0,
+        order_cpu,
+    )
+
+    same_session = (
+        ordered_sample_idx[1:]
+        == ordered_sample_idx[:-1]
+    )
+    origin_differences = (
+        ordered_origin_idx[1:]
+        - ordered_origin_idx[:-1]
+    )
+
+    within_session_differences = origin_differences[
+        same_session
+    ]
+
+    if within_session_differences.numel() == 0:
+        raise ValueError(
+            "No within-session forecast pairs were available."
+        )
+
+    if torch.any(within_session_differences <= 0):
+        raise ValueError(
+            "origin_idx must be unique within each trading session."
+        )
+
+    if expected_origin_stride is None:
+        resolved_stride = int(
+            within_session_differences.min().item()
+        )
+    else:
+        if not isinstance(expected_origin_stride, int):
+            raise TypeError(
+                "expected_origin_stride must be an integer or None."
+            )
+        resolved_stride = int(expected_origin_stride)
+
+    if resolved_stride <= 0:
+        raise ValueError(
+            "expected_origin_stride must be positive."
+        )
+
+    if torch.any(
+        within_session_differences.remainder(resolved_stride) != 0
+    ):
+        raise ValueError(
+            "Within-session origin differences are not integer "
+            f"multiples of the resolved stride {resolved_stride}."
+        )
+
+    valid_pair = (
+        same_session
+        & (origin_differences == resolved_stride)
+    )
+
+    if not torch.any(valid_pair):
+        raise ValueError(
+            "No forecast pairs were exactly one expected origin "
+            "stride apart."
+        )
+
+    order_device = order_cpu.to(
+        device=y_pred_raw.device,
+    )
+
+    ordered_predicted = y_pred_raw.index_select(
+        0,
+        order_device,
+    ).to(dtype=torch.float64)
+    ordered_realised = y_true_raw.index_select(
+        0,
+        order_device,
+    ).to(dtype=torch.float64)
+
+    predicted_returns_ordered = torch.full_like(
+        ordered_predicted,
+        torch.nan,
+    )
+    realised_returns_ordered = torch.full_like(
+        ordered_realised,
+        torch.nan,
+    )
+
+    current_positions_cpu = (
+        torch.nonzero(
+            valid_pair,
+            as_tuple=False,
+        ).flatten()
+        + 1
+    )
+    previous_positions_cpu = current_positions_cpu - 1
+
+    current_positions = current_positions_cpu.to(
+        device=y_pred_raw.device,
+    )
+    previous_positions = previous_positions_cpu.to(
+        device=y_pred_raw.device,
+    )
+
+    predicted_current = ordered_predicted[current_positions]
+    predicted_previous = ordered_predicted[previous_positions]
+    realised_current = ordered_realised[current_positions]
+    realised_previous = ordered_realised[previous_positions]
+
+    valid_price_pair = (
+        torch.isfinite(predicted_current)
+        & torch.isfinite(predicted_previous)
+        & torch.isfinite(realised_current)
+        & torch.isfinite(realised_previous)
+        & (predicted_current > 0)
+        & (predicted_previous > 0)
+        & (realised_current > 0)
+        & (realised_previous > 0)
+    )
+
+    safe_predicted_current = torch.where(
+        valid_price_pair,
+        predicted_current,
+        torch.ones_like(predicted_current),
+    )
+    safe_predicted_previous = torch.where(
+        valid_price_pair,
+        predicted_previous,
+        torch.ones_like(predicted_previous),
+    )
+    safe_realised_current = torch.where(
+        valid_price_pair,
+        realised_current,
+        torch.ones_like(realised_current),
+    )
+    safe_realised_previous = torch.where(
+        valid_price_pair,
+        realised_previous,
+        torch.ones_like(realised_previous),
+    )
+
+    predicted_return_values = (
+        safe_predicted_current.log()
+        - safe_predicted_previous.log()
+    )
+    realised_return_values = (
+        safe_realised_current.log()
+        - safe_realised_previous.log()
+    )
+
+    predicted_returns_ordered[current_positions] = torch.where(
+        valid_price_pair,
+        predicted_return_values,
+        torch.full_like(predicted_return_values, torch.nan),
+    )
+    realised_returns_ordered[current_positions] = torch.where(
+        valid_price_pair,
+        realised_return_values,
+        torch.full_like(realised_return_values, torch.nan),
+    )
+
+    predicted_returns = torch.empty_like(
+        predicted_returns_ordered
+    )
+    realised_returns = torch.empty_like(
+        realised_returns_ordered
+    )
+
+    predicted_returns[order_device] = predicted_returns_ordered
+    realised_returns[order_device] = realised_returns_ordered
+
+    return (
+        predicted_returns,
+        realised_returns,
+        resolved_stride,
+    )
+
 def movement_magnitude_ratio(
     y_pred: torch.Tensor,
     y_true: torch.Tensor,
@@ -1536,8 +1930,11 @@ class BootstrapSessionStatistics:
 
     Shapes:
         session_ids:              [D]
-        observation_count:        [D]
-        value_sum:                 [D, H, C]
+        observation_count:        [D] for pooled metrics, or
+                                  [D, H, N, C] for asset-wise
+                                  correlations with pairwise masks
+        value_sum:                 [D, H, C] for pooled metrics, or
+                                  [D, H, N, C] for asset-wise metrics
 
     Additional tensors are populated according to metric kind:
 
@@ -1558,7 +1955,9 @@ class BootstrapSessionStatistics:
         assetwise_correlation:
             The same sufficient statistics are retained with shape
             [D, H, N, C] so correlations can be reconstructed for
-            each asset before averaging across assets.
+            each asset before averaging across assets.  Observation
+            counts use the same shape so undefined session-opening
+            forecast-series returns are excluded exactly.
 
         assetwise_ratio:
             value_sum and reference_sum retain shape [D, H, N, C]
@@ -1626,6 +2025,7 @@ class ForecastEvaluator:
         self.channels = list(prediction_result["channels"])
         self.horizons = list(prediction_result["horizons"])
         self.sample_idx = prediction_result.get("sample_idx")
+        self.origin_idx = prediction_result.get("origin_idx")
 
         self.mase_scale: torch.Tensor | None = None
 
@@ -1829,6 +2229,53 @@ class ForecastEvaluator:
             reduce_dims=reduce_dims,
         )
 
+    def compute_raw_price_temporal_pearson_correlation(
+        self,
+        reduce_dims: Sequence[int] = (0, 2),
+    ) -> torch.Tensor:
+        """Correlate predicted and realised raw prices through time.
+
+        Pearson correlation is calculated separately for each asset,
+        horizon and channel across forecast windows, then averaged over
+        valid assets.
+        """
+        return assetwise_temporal_pearson_correlation(
+            y_pred=self.y_pred_raw,
+            y_true=self.y_true_raw,
+            reduce_dims=reduce_dims,
+        )
+
+    def compute_forecast_series_log_return_temporal_pearson_correlation(
+        self,
+        reduce_dims: Sequence[int] = (0, 2),
+        expected_origin_stride: int | None = None,
+    ) -> torch.Tensor:
+        """Correlate log returns formed from horizon-aligned series.
+
+        Returns are formed from adjacent saved forecasts within the same
+        trading session.  They are not cumulative returns from the
+        context origin.
+        """
+        if self.sample_idx is None or self.origin_idx is None:
+            raise ValueError(
+                "Forecast-series log-return correlation requires both "
+                "sample_idx and origin_idx in prediction_result."
+            )
+
+        y_pred, y_true, _ = forecast_series_log_return_values(
+            y_pred_raw=self.y_pred_raw,
+            y_true_raw=self.y_true_raw,
+            sample_idx=self.sample_idx,
+            origin_idx=self.origin_idx,
+            expected_origin_stride=expected_origin_stride,
+        )
+
+        return assetwise_temporal_pearson_correlation(
+            y_pred=y_pred,
+            y_true=y_true,
+            reduce_dims=reduce_dims,
+        )
+
     def _build_cumulative_log_change_mae_bootstrap_components(
         self,
     ) -> BootstrapMetricComponents:
@@ -1922,6 +2369,41 @@ class ForecastEvaluator:
             kind="assetwise_correlation",
             values=y_pred.abs(),
             reference_values=y_true.abs(),
+        )
+
+    def _build_raw_price_temporal_pearson_bootstrap_components(
+        self,
+    ) -> BootstrapMetricComponents:
+        """Return raw prices for asset-wise temporal correlation."""
+        return BootstrapMetricComponents(
+            kind="assetwise_correlation",
+            values=self.y_pred_raw,
+            reference_values=self.y_true_raw,
+        )
+
+    def _build_forecast_series_log_return_temporal_pearson_bootstrap_components(
+        self,
+        expected_origin_stride: int | None = None,
+    ) -> BootstrapMetricComponents:
+        """Return within-session horizon-series log returns."""
+        if self.sample_idx is None or self.origin_idx is None:
+            raise ValueError(
+                "Forecast-series log-return correlation requires both "
+                "sample_idx and origin_idx in prediction_result."
+            )
+
+        y_pred, y_true, _ = forecast_series_log_return_values(
+            y_pred_raw=self.y_pred_raw,
+            y_true_raw=self.y_true_raw,
+            sample_idx=self.sample_idx,
+            origin_idx=self.origin_idx,
+            expected_origin_stride=expected_origin_stride,
+        )
+
+        return BootstrapMetricComponents(
+            kind="assetwise_correlation",
+            values=y_pred,
+            reference_values=y_true,
         )
 
     def _build_cumulative_log_change_cross_sectional_pearson_ic_bootstrap_components(
@@ -2059,7 +2541,7 @@ class ForecastEvaluator:
         Map each public metric name to its ordinary computation and
         bootstrap-component builder.
         """
-        return {
+        registry = {
             "cumulative_log_change_mae": MetricDefinition(
                 compute=partial(
                     self.compute_pairwise_metric,
@@ -2104,6 +2586,19 @@ class ForecastEvaluator:
                     bootstrap_components=(
                         self
                         ._build_cumulative_log_change_pearson_bootstrap_components
+                    ),
+                )
+            ),
+
+            "raw_price_temporal_pearson_correlation": (
+                MetricDefinition(
+                    compute=(
+                        self
+                        .compute_raw_price_temporal_pearson_correlation
+                    ),
+                    bootstrap_components=(
+                        self
+                        ._build_raw_price_temporal_pearson_bootstrap_components
                     ),
                 )
             ),
@@ -2196,6 +2691,22 @@ class ForecastEvaluator:
                 )
             ),
         }
+
+        if self.sample_idx is not None and self.origin_idx is not None:
+            registry[
+                "forecast_series_log_return_temporal_pearson_correlation"
+            ] = MetricDefinition(
+                compute=(
+                    self
+                    .compute_forecast_series_log_return_temporal_pearson_correlation
+                ),
+                bootstrap_components=(
+                    self
+                    ._build_forecast_series_log_return_temporal_pearson_bootstrap_components
+                ),
+            )
+
+        return registry
     
     @property
     def available_metrics(self) -> tuple[str, ...]:
@@ -3238,11 +3749,6 @@ class ForecastEvaluator:
                     "reference_values."
                 )
 
-            windows_per_session = torch.bincount(
-                session_inverse,
-                minlength=num_sessions,
-            )
-
             values = (
                 components.values
                 .detach()
@@ -3257,10 +3763,35 @@ class ForecastEvaluator:
                 .to(dtype=torch.float64)
             )
 
+            valid_pair = (
+                torch.isfinite(values)
+                & torch.isfinite(references)
+            )
+
+            safe_values = torch.where(
+                valid_pair,
+                values,
+                torch.zeros_like(values),
+            )
+            safe_references = torch.where(
+                valid_pair,
+                references,
+                torch.zeros_like(references),
+            )
+
+            observation_count = (
+                self
+                ._sum_bootstrap_values_by_session_preserve_assets(
+                    values=valid_pair.to(dtype=torch.float64),
+                    session_inverse=session_inverse,
+                    num_sessions=num_sessions,
+                )
+            )
+
             value_sum = (
                 self
                 ._sum_bootstrap_values_by_session_preserve_assets(
-                    values=values,
+                    values=safe_values,
                     session_inverse=session_inverse,
                     num_sessions=num_sessions,
                 )
@@ -3269,7 +3800,7 @@ class ForecastEvaluator:
             reference_sum = (
                 self
                 ._sum_bootstrap_values_by_session_preserve_assets(
-                    values=references,
+                    values=safe_references,
                     session_inverse=session_inverse,
                     num_sessions=num_sessions,
                 )
@@ -3278,7 +3809,7 @@ class ForecastEvaluator:
             value_squared_sum = (
                 self
                 ._sum_bootstrap_values_by_session_preserve_assets(
-                    values=values.square(),
+                    values=safe_values.square(),
                     session_inverse=session_inverse,
                     num_sessions=num_sessions,
                 )
@@ -3287,7 +3818,7 @@ class ForecastEvaluator:
             reference_squared_sum = (
                 self
                 ._sum_bootstrap_values_by_session_preserve_assets(
-                    values=references.square(),
+                    values=safe_references.square(),
                     session_inverse=session_inverse,
                     num_sessions=num_sessions,
                 )
@@ -3296,7 +3827,7 @@ class ForecastEvaluator:
             cross_sum = (
                 self
                 ._sum_bootstrap_values_by_session_preserve_assets(
-                    values=values * references,
+                    values=safe_values * safe_references,
                     session_inverse=session_inverse,
                     num_sessions=num_sessions,
                 )
@@ -3305,7 +3836,7 @@ class ForecastEvaluator:
             return BootstrapSessionStatistics(
                 kind="assetwise_correlation",
                 session_ids=session_ids,
-                observation_count=windows_per_session,
+                observation_count=observation_count,
                 value_sum=value_sum,
                 reference_sum=reference_sum,
                 value_squared_sum=value_squared_sum,
@@ -4239,15 +4770,32 @@ class ForecastEvaluator:
             .to(dtype=torch.float64)
         )
 
-        bootstrap_observation_count = (
-            counts
-            @ observation_count
-        )
+        if observation_count.ndim == 1:
+            # Backwards-compatible path for fully observed asset-wise
+            # metrics created before pairwise counts were retained.
+            bootstrap_observation_count = (
+                counts
+                @ observation_count
+            )[
+                :,
+                None,
+                None,
+                None,
+            ]
 
-        if torch.any(bootstrap_observation_count <= 1):
+        elif observation_count.ndim == 4:
+            # [R, D] x [D, H, N, C] -> [R, H, N, C]
+            bootstrap_observation_count = torch.einsum(
+                "rd,dhnc->rhnc",
+                counts,
+                observation_count,
+            )
+
+        else:
             raise ValueError(
-                "Every asset-wise Pearson bootstrap replicate "
-                "requires at least two forecast windows."
+                "Asset-wise correlation observation_count must have "
+                "shape [D] or [D, H, N, C], got "
+                f"{tuple(observation_count.shape)}."
             )
 
         value_sum = statistics.value_sum.to(dtype=torch.float64)
@@ -4291,12 +4839,7 @@ class ForecastEvaluator:
             cross_sum,
         )
 
-        n = bootstrap_observation_count[
-            :,
-            None,
-            None,
-            None,
-        ]
+        n = bootstrap_observation_count
 
         numerator = (
             n * bootstrap_cross_sum
@@ -4320,7 +4863,11 @@ class ForecastEvaluator:
             * reference_variation
         )
 
-        valid_correlation = denominator > 0
+        valid_correlation = (
+            n > 1
+        ) & (
+            denominator > 0
+        )
 
         asset_correlations = torch.where(
             valid_correlation,
