@@ -192,6 +192,43 @@ def main() -> None:
             h60_time["time_bucket"] == "Late session", "num_windows"
         ].min() > 0
 
+        h60_difference = analysis.time_of_day_metrics(
+            model_names=["Persistence", "GraphTCN"],
+            metric_name="mae_difference_vs_persistence",
+            horizons=60,
+        )
+        assert "mae_difference_vs_persistence" in analysis.available_group_metrics()
+        for bucket in ("Morning", "Midday", "Late session"):
+            base_bucket = h60_time.loc[h60_time["time_bucket"] == bucket]
+            difference_bucket = h60_difference.loc[
+                h60_difference["time_bucket"] == bucket
+            ]
+            persistence_mae = float(
+                base_bucket.loc[
+                    base_bucket["model"] == "Persistence", "value"
+                ].iloc[0]
+            )
+            graphtcn_mae = float(
+                base_bucket.loc[
+                    base_bucket["model"] == "GraphTCN", "value"
+                ].iloc[0]
+            )
+            persistence_difference = float(
+                difference_bucket.loc[
+                    difference_bucket["model"] == "Persistence", "value"
+                ].iloc[0]
+            )
+            graphtcn_difference = float(
+                difference_bucket.loc[
+                    difference_bucket["model"] == "GraphTCN", "value"
+                ].iloc[0]
+            )
+            assert np.isclose(persistence_difference, 0.0)
+            assert np.isclose(
+                graphtcn_difference,
+                graphtcn_mae - persistence_mae,
+            )
+
         h1_time = analysis.time_of_day_metrics(
             model_names=["GraphTCN"],
             metric_name="cumulative_log_change_mae",
@@ -455,7 +492,7 @@ def main() -> None:
             lambda: plot_time_of_day_metric(
                 analysis,
                 model_names=["Persistence", "GraphTCN"],
-                metric_name="cumulative_log_change_mae",
+                metric_name="mae_difference_vs_persistence",
                 horizons=[30, 60],
             ),
             lambda: plot_daily_error_difference(

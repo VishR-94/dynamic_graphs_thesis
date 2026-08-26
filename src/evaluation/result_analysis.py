@@ -860,7 +860,14 @@ class FinancialResultAnalysis:
             prediction_result=reference_result,
             train_split=self.train_split,
         )
-        return evaluator.available_metrics
+        return tuple(
+            dict.fromkeys(
+                (
+                    *evaluator.available_metrics,
+                    "mae_difference_vs_persistence",
+                )
+            )
+        )
 
     def _daily_close_matrix(self, split: Mapping[str, Any]) -> tuple[pd.DatetimeIndex, np.ndarray]:
         channels = list(split["channels"])
@@ -1279,6 +1286,23 @@ class FinancialResultAnalysis:
         horizon: int,
         row_mask: np.ndarray,
     ) -> float:
+        if metric_name == "mae_difference_vs_persistence":
+            model_mae = self._evaluate_subset_metric(
+                model_name=model_name,
+                metric_name="cumulative_log_change_mae",
+                horizon=horizon,
+                row_mask=row_mask,
+            )
+            persistence_mae = self._evaluate_subset_metric(
+                model_name=self.reference_model,
+                metric_name="cumulative_log_change_mae",
+                horizon=horizon,
+                row_mask=row_mask,
+            )
+            if not (np.isfinite(model_mae) and np.isfinite(persistence_mae)):
+                return float("nan")
+            return float(model_mae - persistence_mae)
+
         subset = self._subset_prediction_result(
             model_name=model_name,
             horizon=horizon,
@@ -2780,11 +2804,21 @@ def plot_time_of_day_metric(
                 marker="o",
                 label=_format_model_name(model_name),
             )
-        axis.set_ylabel(
-            DEFAULT_METRIC_DISPLAY_NAMES.get(
-                metric_name, metric_name.replace("_", " ")
+        if metric_name in DEFAULT_METRIC_DISPLAY_NAMES:
+            metric_display_name = DEFAULT_METRIC_DISPLAY_NAMES[metric_name]
+        elif metric_name in STOCK_METRIC_SPECS:
+            metric_display_name = STOCK_METRIC_SPECS[metric_name].display_name
+        else:
+            metric_display_name = metric_name.replace("_", " ")
+        axis.set_ylabel(metric_display_name)
+        if metric_name == "mae_difference_vs_persistence":
+            axis.axhline(
+                0.0,
+                color="red",
+                linestyle="--",
+                linewidth=1.2,
+                label="Persistence parity = 0",
             )
-        )
         axis.set_title(f"{horizon}-minute horizon")
         axis.grid(alpha=0.25)
 
