@@ -61,6 +61,27 @@ _GRAPH_COMPONENT_ALIASES: dict[str, str] = {
     "static": "base",
 }
 
+# Display order used by the central-versus-neighbour correlation summary.
+# It matches the layout used in the original diagnostic plot.
+_CENTRAL_CORRELATION_CITY_ORDER: tuple[str, ...] = (
+    "newyork",
+    "london",
+    "singapore",
+    "hongkong",
+    "capetown",
+)
+
+_CENTRAL_CORRELATION_NEIGHBOUR_ORDER: tuple[str, ...] = (
+    "N",
+    "NE",
+    "NW",
+    "W",
+    "E",
+    "S",
+    "SW",
+    "SE",
+)
+
 
 def _canonical_city(city: str) -> str:
     key = " ".join(str(city).strip().lower().replace("_", " ").split())
@@ -134,6 +155,21 @@ def _load_prediction_result(run_directory: Path) -> dict[str, Any]:
     result = payload.get("prediction_result", payload)
     if not isinstance(result, Mapping):
         raise TypeError("The prediction_result payload is not a mapping.")
+    return dict(result)
+
+
+def _load_train_prediction_result(run_directory: Path) -> dict[str, Any]:
+    """Load the exported training predictions for one final-transfer run."""
+
+    payload = safe_torch_load(
+        _require_file(run_directory / "best_train_predictions.pt"),
+        map_location="cpu",
+    )
+    if not isinstance(payload, Mapping):
+        raise TypeError("The saved training prediction artifact is not a mapping.")
+    result = payload.get("prediction_result", payload)
+    if not isinstance(result, Mapping):
+        raise TypeError("The training prediction_result payload is not a mapping.")
     return dict(result)
 
 
@@ -578,6 +614,259 @@ def plot_weather_forecasts(
     return data, figure, axis
 
 
+def plot_central_neighbour_t850_correlations(
+    *,
+    weather_root: str | Path,
+    test_year: int,
+    difference: bool,
+    figsize: tuple[float, float] = (12.5, 6.6),
+    annotate: bool = True,
+    value_format: str = ".2f",
+) -> tuple[pd.DataFrame, Figure, Axes]:
+    """Plot central-to-neighbour T850 correlations for all five cities.
+
+    The selected ``test_year`` determines the corresponding nominal training
+    period used by that forecasting experiment: 1980 through
+    ``test_year - 2`` (inclusive under the same date slicing used by the
+    weather training code). The raw training T850 series are reconstructed
+    exactly from the exported final-horizon training targets, which have a
+    stride of one six-hour observation.
+
+    Parameters
+    ----------
+    weather_root:
+        Root directory containing the completed fixed-architecture weather
+        runs.
+    test_year:
+        One of 2016, 2017, or 2018.
+    difference:
+        If ``False``, compute ordinary Pearson correlations between the raw
+        T850 level series. If ``True``, first difference each six-hour T850
+        series, take absolute Pearson correlations, and verify that the full
+        matrix matches the saved correlation-prior source matrix.
+    figsize:
+        Matplotlib figure size.
+    annotate:
+        Whether to print correlation values in each heatmap cell.
+    value_format:
+        Format specifier used for cell annotations.
+
+    Returns
+    -------
+    pandas.DataFrame, matplotlib.figure.Figure, matplotlib.axes.Axes
+        The city-by-neighbour correlation table and its heatmap objects.
+    """
+
+    year = _resolve_years(test_year)[0]
+    reference_horizon = int(FINAL_TRANSFER_HORIZONS[0])
+    city_rows: list[np.ndarray] = []
+
+    for city in _CENTRAL_CORRELATION_CITY_ORDER:
+        run_directory = _run_directory(
+            weather_root=weather_root,
+            city=city,
+            test_year=year,
+            horizon=reference_horizon,
+        )
+        result = _load_train_prediction_result(run_directory)
+
+        y_true = _to_cpu_tensor(result.get("y_true"), name="y_true").float()
+        target_times = _to_cpu_tensor(
+            result.get("target_times_ns"),
+            name="target_times_ns",
+        ).long()
+
+        if y_true.ndim != 4 or int(y_true.shape[-1]) != 1:
+            raise ValueError(
+                "Training targets must have shape [W,H,N,1], received "
+                f"{tuple(y_true.shape)}."
+            )
+        if target_times.ndim != 2 or target_times.shape != y_true.shape[:2]:
+            raise ValueError(
+                "target_times_ns must have shape [W,H] matching y_true; "
+                f"received {tuple(target_times.shape)} and {tuple(y_true.shape)}."
+            )
+
+        node_order = list(result.get("node_order", result.get("asset_cols", [])))
+        if len(node_order) != int(y_true.shape[2]):
+            raise ValueError(
+                "Saved node labels do not match the training target tensor: "
+                f"{len(node_order)} labels versus {y_true.shape[2]} nodes."
+            )
+        if "C" not in node_order:
+            raise KeyError("The weather node order does not contain central node 'C'.")
+        missing_neighbours = [
+            node
+            for node in _CENTRAL_CORRELATION_NEIGHBOUR_ORDER
+            if node not in node_order
+        ]
+        if missing_neighbours:
+            raise KeyError(
+                f"The weather node order is missing neighbours: {missing_neighbours}."
+            )
+
+        # The final target from every stride-one training window reconstructs
+        # the exact nominal training-period T850 sequence.
+        final_times = pd.to_datetime(
+            target_times[:, -1].numpy(),
+            unit="ns",
+            utc=False,
+        )
+        levels = y_true[:, -1, :, 0].numpy().astype(np.float64, copy=False)
+        order = np.argsort(final_times.to_numpy(dtype="datetime64[ns]"))
+        final_times = final_times[order]
+        levels = levels[order]
+
+        if pd.Index(final_times).duplicated().any():
+            raise RuntimeError(
+                f"Duplicate training target timestamps were found for {city}."
+            )
+        if len(final_times) < 3:
+            raise RuntimeError(
+                f"Too few training observations were found for {city}, {year}."
+            )
+
+        expected_start = pd.Timestamp("1980-01-01 00:00:00")
+        expected_end = pd.Timestamp(f"{year - 2}-12-31 00:00:00")
+        if final_times[0] != expected_start or final_times[-1] != expected_end:
+            raise RuntimeError(
+                "The exported training targets do not span the nominal training "
+                f"period for {CITY_DISPLAY_NAMES[city]}: "
+                f"{final_times[0]} to {final_times[-1]}, expected "
+                f"{expected_start} to {expected_end}."
+            )
+        time_steps = pd.Series(final_times).diff().dropna()
+        if not (time_steps == pd.Timedelta(hours=6)).all():
+            raise RuntimeError(
+                f"Training T850 targets for {city} are not regular six-hourly data."
+            )
+
+        values = np.diff(levels, axis=0) if bool(difference) else levels
+        with np.errstate(invalid="ignore", divide="ignore"):
+            correlation = np.corrcoef(values, rowvar=False)
+        correlation = np.nan_to_num(
+            correlation,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if bool(difference):
+            correlation = np.abs(correlation)
+
+            # This mode is intended to reproduce the exact source matrix from
+            # which the GraphTCN static prior was constructed.
+            saved_prior = _load_static_correlation_prior(run_directory)
+            saved_source = _to_cpu_tensor(
+                saved_prior.get("source_abs_correlation"),
+                name="source_abs_correlation",
+            ).float().numpy()
+            comparable = correlation.copy()
+            np.fill_diagonal(comparable, 0.0)
+            if saved_source.shape != comparable.shape or not np.allclose(
+                saved_source,
+                comparable,
+                atol=1.0e-6,
+                rtol=1.0e-6,
+            ):
+                maximum_difference = (
+                    float(np.max(np.abs(saved_source - comparable)))
+                    if saved_source.shape == comparable.shape
+                    else float("nan")
+                )
+                raise RuntimeError(
+                    "Recomputed differenced T850 correlations do not match the "
+                    f"saved graph-prior source matrix for {city}; maximum "
+                    f"difference={maximum_difference}."
+                )
+
+        node_to_index = {node: index for index, node in enumerate(node_order)}
+        central_index = node_to_index["C"]
+        city_rows.append(
+            np.asarray(
+                [
+                    correlation[central_index, node_to_index[node]]
+                    for node in _CENTRAL_CORRELATION_NEIGHBOUR_ORDER
+                ],
+                dtype=np.float64,
+            )
+        )
+
+    table = pd.DataFrame(
+        np.vstack(city_rows),
+        index=pd.Index(
+            [CITY_DISPLAY_NAMES[city] for city in _CENTRAL_CORRELATION_CITY_ORDER],
+            name="City",
+        ),
+        columns=pd.Index(
+            _CENTRAL_CORRELATION_NEIGHBOUR_ORDER,
+            name="Neighbouring grid point",
+        ),
+    )
+
+    minimum = float(np.nanmin(table.to_numpy()))
+    vmin = -1.0 if minimum < 0.0 else 0.0
+    vmax = 1.0
+
+    figure, axis = plt.subplots(figsize=figsize)
+    image = axis.imshow(
+        table.to_numpy(),
+        cmap="coolwarm",
+        aspect="auto",
+        interpolation="nearest",
+        vmin=vmin,
+        vmax=vmax,
+    )
+    axis.set_xticks(np.arange(table.shape[1]))
+    axis.set_yticks(np.arange(table.shape[0]))
+    axis.set_xticklabels(table.columns)
+    axis.set_yticklabels(table.index)
+    axis.set_xlabel("Neighbouring grid point", fontweight="bold")
+    axis.set_ylabel("City", fontweight="bold")
+
+    training_end_year = year - 2
+    if bool(difference):
+        subtitle = (
+            r"absolute Pearson correlation of six-hour $\Delta T850$ "
+            f"(training period 1980--{training_end_year})"
+        )
+    else:
+        subtitle = (
+            "Pearson correlation of raw T850 levels "
+            f"(training period 1980--{training_end_year})"
+        )
+    axis.set_title(
+        "Neighbour correlations with central grid point (T850)\n" + subtitle,
+        fontweight="bold",
+        pad=12,
+    )
+
+    # White cell boundaries reproduce the layout of the original diagnostic.
+    axis.set_xticks(np.arange(-0.5, table.shape[1], 1.0), minor=True)
+    axis.set_yticks(np.arange(-0.5, table.shape[0], 1.0), minor=True)
+    axis.grid(which="minor", color="white", linestyle="-", linewidth=1.0)
+    axis.tick_params(which="minor", bottom=False, left=False)
+
+    if annotate:
+        midpoint = (vmin + vmax) / 2.0
+        for row in range(table.shape[0]):
+            for column in range(table.shape[1]):
+                value = float(table.iat[row, column])
+                axis.text(
+                    column,
+                    row,
+                    format(value, value_format),
+                    ha="center",
+                    va="center",
+                    color="white" if value > midpoint + 0.15 else "black",
+                    fontsize=11,
+                )
+
+    colourbar = figure.colorbar(image, ax=axis, fraction=0.035, pad=0.04)
+    colourbar.set_label("Pearson correlation")
+    figure.tight_layout()
+    return table, figure, axis
+
+
 def _resolve_graph_component(component: str) -> str:
     value = str(component).strip().lower()
     if value not in _GRAPH_COMPONENT_ALIASES:
@@ -804,6 +1093,25 @@ def _draw_weather_graph_heatmap(
     return image
 
 
+def _resolve_heatmap_upper(
+    values: np.ndarray,
+    explicit_vmax: float | None,
+    *,
+    name: str,
+) -> float:
+    """Return a valid upper colour limit for one independently scaled heatmap."""
+
+    if explicit_vmax is not None:
+        upper = float(explicit_vmax)
+        if not np.isfinite(upper) or upper <= 0.0:
+            raise ValueError(f"{name} must be finite and positive, received {upper}.")
+        return upper
+
+    finite = values[np.isfinite(values)]
+    upper = float(np.max(finite)) if finite.size else 1.0
+    return upper if np.isfinite(upper) and upper > 0.0 else 1.0
+
+
 def plot_weather_graph(
     *,
     weather_root: str | Path,
@@ -815,29 +1123,48 @@ def plot_weather_graph(
     graph_component: str = "selected",
     head: str | int = "mean",
     annotate: bool = True,
-    figsize: tuple[float, float] = (8.5, 14.5),
+    figsize: tuple[float, float] = (8.5, 7.0),
     value_format: str = ".2f",
     vmax: float | None = None,
-) -> tuple[pd.DataFrame, dict[str, Any], Figure, Axes]:
-    """Plot weather graphs using the same day/window convention as Graph Hub.
+    prior_vmax: float | None = None,
+    correlation_vmax: float | None = None,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    dict[str, Any],
+    Figure,
+    Axes,
+    Figure,
+    Axes,
+    Figure,
+    Axes,
+]:
+    """Plot learned and correlation graphs using Graph Hub day/window selection.
 
     Selection rules
     ---------------
     ``day=None, window=None``
-        Average every saved graph in the test split.
+        Average every saved learned graph in the test split.
     ``day=<date>, window=None``
-        Average every graph whose forecast origin falls on that date.
+        Average every learned graph whose forecast origin falls on that date.
     ``day=None, window=<n>``
-        Average the one-based within-day window ``n`` across all dates.
+        Average the one-based within-day learned graph ``n`` across all dates.
     ``day=<date>, window=<n>``
-        Plot the exact graph for that date and within-day window.
+        Plot the exact learned graph for that date and within-day window.
 
-    Rows are target nodes and columns are source nodes, i.e.
-    ``A[target, source]``. The displayed colour map matches Graph Hub: white
-    represents zero/masked self-edges and progressively darker red represents
-    larger adjacency weights. The training-only, row-normalised static
-    correlation prior for the same city and test-year split is displayed below
-    the learned graph using the identical colour scale.
+    One call creates three independent figures:
+
+    1. the requested learned graph component;
+    2. the row-normalised correlation graph prior supplied to the model;
+    3. the symmetric absolute training-set ΔT850 correlation matrix before
+       row normalisation.
+
+    Each figure uses the Graph Hub white-to-red colour map and its own colour
+    scale by default. Rows are target nodes and columns are source nodes, i.e.
+    ``A[target, source]``. The ``day`` and ``window`` selectors affect only the
+    learned graph; both correlation matrices are fixed for the selected city,
+    horizon, and test-year training split.
     """
 
     canonical = _canonical_city(city)
@@ -855,23 +1182,45 @@ def plot_weather_graph(
     )
     artifacts = _load_graph_artifacts(run_directory)
     prior_artifacts = _load_static_correlation_prior(run_directory)
+
     node_order = list(artifacts.get("node_order", artifacts.get("asset_cols", [])))
     if not node_order:
         raise KeyError("The graph artifact does not contain node labels.")
+
     prior_node_order = list(prior_artifacts.get("node_order", []))
     if prior_node_order and prior_node_order != node_order:
         raise ValueError(
             "The static-correlation prior node order does not match the "
             "learned graph artifact."
         )
-    prior_matrix = _to_cpu_tensor(
+
+    row_normalised_prior = _to_cpu_tensor(
         prior_artifacts.get("row_normalised_prior"),
         name="row_normalised_prior",
     ).float()
-    if prior_matrix.shape != (len(node_order), len(node_order)):
+    raw_correlation = _to_cpu_tensor(
+        prior_artifacts.get("source_abs_correlation"),
+        name="source_abs_correlation",
+    ).float()
+
+    expected_shape = (len(node_order), len(node_order))
+    for name, tensor in (
+        ("row-normalised prior", row_normalised_prior),
+        ("raw absolute correlation matrix", raw_correlation),
+    ):
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                f"The {name} shape does not match the node order: "
+                f"{tuple(tensor.shape)} versus {len(node_order)} nodes."
+            )
+
+    if not torch.allclose(raw_correlation, raw_correlation.T, atol=1e-6, rtol=1e-6):
+        maximum_asymmetry = float(
+            torch.max(torch.abs(raw_correlation - raw_correlation.T)).item()
+        )
         raise ValueError(
-            "The static-correlation prior shape does not match the node order: "
-            f"{tuple(prior_matrix.shape)} versus {len(node_order)} nodes."
+            "The saved pre-normalisation correlation matrix is not symmetric; "
+            f"maximum absolute asymmetry is {maximum_asymmetry:.3e}."
         )
 
     raw_component = artifacts.get(component)
@@ -915,15 +1264,15 @@ def plot_weather_graph(
         dtype=torch.long,
     )
     if component == "base":
-        matrix = collapsed
+        learned_matrix = collapsed
     else:
-        matrix = collapsed.index_select(0, selected_indices).mean(dim=0)
+        learned_matrix = collapsed.index_select(0, selected_indices).mean(dim=0)
 
-    matrix = matrix.float()
-    if matrix.shape != (len(node_order), len(node_order)):
+    learned_matrix = learned_matrix.float()
+    if learned_matrix.shape != expected_shape:
         raise ValueError(
             "The plotted graph shape does not match the node order: "
-            f"{tuple(matrix.shape)} versus {len(node_order)} nodes."
+            f"{tuple(learned_matrix.shape)} versus {len(node_order)} nodes."
         )
 
     exact_window = len(selected_rows) == 1
@@ -940,14 +1289,10 @@ def plot_weather_graph(
         "selected_windows": int(len(selected_rows)),
         "selected_days": int(selected_rows["day"].nunique()),
         "forecast_origin_time": (
-            selected_rows.loc[0, "forecast_origin_time"]
-            if exact_window
-            else None
+            selected_rows.loc[0, "forecast_origin_time"] if exact_window else None
         ),
         "final_target_time": (
-            selected_rows.loc[0, "final_target_time"]
-            if exact_window
-            else None
+            selected_rows.loc[0, "final_target_time"] if exact_window else None
         ),
         "graph_orientation": artifacts.get(
             "graph_orientation",
@@ -960,40 +1305,51 @@ def plot_weather_graph(
         "static_correlation_prior_construction": prior_artifacts.get(
             "construction"
         ),
+        "raw_correlation_is_symmetric": True,
     }
 
-    matrix_values = matrix.numpy()
-    matrix_frame = pd.DataFrame(
-        matrix_values,
+    learned_values = learned_matrix.numpy()
+    prior_values = row_normalised_prior.numpy()
+    correlation_values = raw_correlation.numpy()
+
+    learned_frame = pd.DataFrame(
+        learned_values,
         index=pd.Index(node_order, name="Target node"),
         columns=pd.Index(node_order, name="Source node"),
     )
+    prior_frame = pd.DataFrame(
+        prior_values,
+        index=pd.Index(node_order, name="Target node"),
+        columns=pd.Index(node_order, name="Source node"),
+    )
+    correlation_frame = pd.DataFrame(
+        correlation_values,
+        index=pd.Index(node_order, name="Node"),
+        columns=pd.Index(node_order, name="Node"),
+    )
 
-    plotted_values = matrix_values.copy()
-    prior_values = prior_matrix.numpy().copy()
-    np.fill_diagonal(plotted_values, np.nan)
-    np.fill_diagonal(prior_values, np.nan)
-    combined_finite = np.concatenate(
-        [
-            plotted_values[np.isfinite(plotted_values)],
-            prior_values[np.isfinite(prior_values)],
-        ]
-    )
-    upper = (
-        float(vmax)
-        if vmax is not None
-        else (float(np.max(combined_finite)) if combined_finite.size else 1.0)
-    )
-    if not np.isfinite(upper) or upper <= 0.0:
-        upper = 1.0
+    learned_plot_values = learned_values.copy()
+    prior_plot_values = prior_values.copy()
+    correlation_plot_values = correlation_values.copy()
+    np.fill_diagonal(learned_plot_values, np.nan)
+    np.fill_diagonal(prior_plot_values, np.nan)
+    np.fill_diagonal(correlation_plot_values, np.nan)
 
-    figure, axes = plt.subplots(
-        nrows=2,
-        ncols=1,
-        figsize=figsize,
-        constrained_layout=True,
+    learned_upper = _resolve_heatmap_upper(
+        learned_plot_values,
+        vmax,
+        name="vmax",
     )
-    learned_axis, prior_axis = axes
+    prior_upper = _resolve_heatmap_upper(
+        prior_plot_values,
+        prior_vmax,
+        name="prior_vmax",
+    )
+    correlation_upper = _resolve_heatmap_upper(
+        correlation_plot_values,
+        correlation_vmax,
+        name="correlation_vmax",
+    )
 
     component_label = {
         "selected": "selected static–dynamic mixture",
@@ -1010,40 +1366,95 @@ def plot_weather_graph(
             f"target {metadata['final_target_time']}"
         )
 
+    learned_figure, learned_axis = plt.subplots(
+        figsize=figsize,
+        constrained_layout=True,
+    )
     learned_image = _draw_weather_graph_heatmap(
         axis=learned_axis,
-        values=plotted_values,
+        values=learned_plot_values,
         node_order=node_order,
-        upper=upper,
+        upper=learned_upper,
         annotate=annotate,
         value_format=value_format,
         title=learned_title,
     )
-    _draw_weather_graph_heatmap(
+    learned_colourbar = learned_figure.colorbar(
+        learned_image,
+        ax=learned_axis,
+        fraction=0.046,
+        pad=0.04,
+    )
+    learned_colourbar.set_label("Adjacency weight")
+
+    prior_figure, prior_axis = plt.subplots(
+        figsize=figsize,
+        constrained_layout=True,
+    )
+    prior_image = _draw_weather_graph_heatmap(
         axis=prior_axis,
-        values=prior_values,
+        values=prior_plot_values,
         node_order=node_order,
-        upper=upper,
+        upper=prior_upper,
         annotate=annotate,
         value_format=value_format,
         title=(
-            "Training-only static correlation prior "
+            "Correlation graph prior "
             f"— {CITY_DISPLAY_NAMES[canonical]} — test year {year}"
         ),
     )
-    colourbar = figure.colorbar(
-        learned_image,
-        ax=(learned_axis, prior_axis),
-        fraction=0.025,
-        pad=0.02,
+    prior_colourbar = prior_figure.colorbar(
+        prior_image,
+        ax=prior_axis,
+        fraction=0.046,
+        pad=0.04,
     )
-    colourbar.set_label("Adjacency weight")
-    return matrix_frame, metadata, figure, learned_axis
+    prior_colourbar.set_label("Row-normalised prior weight")
+
+    correlation_figure, correlation_axis = plt.subplots(
+        figsize=figsize,
+        constrained_layout=True,
+    )
+    correlation_image = _draw_weather_graph_heatmap(
+        axis=correlation_axis,
+        values=correlation_plot_values,
+        node_order=node_order,
+        upper=correlation_upper,
+        annotate=annotate,
+        value_format=value_format,
+        title=(
+            "Raw Correlation Matrix"
+            f"— {CITY_DISPLAY_NAMES[canonical]} — test year {year}"
+        ),
+    )
+    correlation_axis.set_xlabel("Node")
+    correlation_axis.set_ylabel("Node")
+    correlation_colourbar = correlation_figure.colorbar(
+        correlation_image,
+        ax=correlation_axis,
+        fraction=0.046,
+        pad=0.04,
+    )
+    correlation_colourbar.set_label("Absolute correlation")
+
+    return (
+        learned_frame,
+        prior_frame,
+        correlation_frame,
+        metadata,
+        learned_figure,
+        learned_axis,
+        prior_figure,
+        prior_axis,
+        correlation_figure,
+        correlation_axis,
+    )
 
 
 __all__ = [
     "load_weather_forecast_series",
     "plot_weather_forecasts",
+    "plot_central_neighbour_t850_correlations",
     "plot_weather_graph",
     "show_weather_alpha_beta_table",
     "show_weather_results",
