@@ -6,12 +6,16 @@ import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import kurtosis
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.spatial.distance import squareform
 from src.data.load_candle_data import compute_log_returns, get_channel
-from src.utils.company_profiles import make_sector_group_order
+from src.utils.company_profiles import (
+    make_asset_sector_mapping,
+    make_sector_group_order,
+)
 
 SplitDict = dict[str,Any]
 DateLike = str | date | datetime
@@ -112,6 +116,239 @@ def resolve_asset_indices(
     labels = [asset_cols[idx] for idx in indices]
 
     return indices, labels
+
+
+def compute_sector_summary(
+    assets: Sequence[str],
+    *,
+    company_profiles_path: str | Path | None = None,
+) -> pd.DataFrame:
+    """Summarise the supplied asset universe by sector.
+
+    Only the supplied project assets are counted. The final row reports the
+    complete universe total.
+    """
+
+    mapping = make_asset_sector_mapping(
+        assets,
+        company_profiles_path=company_profiles_path,
+    )
+    counts = (
+        mapping.groupby("Sector", sort=True)
+        .size()
+        .rename("Number of equities")
+        .reset_index()
+    )
+    counts["Percentage of universe"] = (
+        100.0 * counts["Number of equities"] / len(mapping)
+    )
+    total = pd.DataFrame(
+        {
+            "Sector": ["Total"],
+            "Number of equities": [len(mapping)],
+            "Percentage of universe": [100.0],
+        }
+    )
+    return pd.concat([counts, total], ignore_index=True)
+
+
+def compute_split_summary_table(
+    train: SplitDict,
+    validation: SplitDict,
+    test: SplitDict,
+    *,
+    context_length: int = 60,
+    stride: int = 15,
+    horizons: Sequence[int] = (1, 5, 15, 30, 60),
+) -> pd.DataFrame:
+    """Summarise split dates, session counts, and forecast-window counts.
+
+    The first origin is ``context_length - 1``. Targets are located at
+    ``origin + horizon`` and every window remains inside its source session.
+    """
+
+    if context_length <= 0:
+        raise ValueError("context_length must be positive.")
+    if stride <= 0:
+        raise ValueError("stride must be positive.")
+
+    resolved_horizons = [int(value) for value in horizons]
+    if not resolved_horizons or any(value <= 0 for value in resolved_horizons):
+        raise ValueError("horizons must contain positive integers.")
+    max_horizon = max(resolved_horizons)
+
+    def summarise(name: str, split: SplitDict) -> dict[str, Any]:
+        if not split["samples"]:
+            raise ValueError(f"{name} contains no sessions.")
+
+        dates = [parse_day(sample[2]).date() for sample in split["samples"]]
+        num_windows = 0
+
+        for x, _, day in split["samples"]:
+            first_origin = context_length - 1
+            final_origin = int(x.shape[0]) - 1 - max_horizon
+            if final_origin < first_origin:
+                raise ValueError(
+                    f"Session {day} is too short for context_length="
+                    f"{context_length} and max_horizon={max_horizon}."
+                )
+            num_windows += ((final_origin - first_origin) // stride) + 1
+
+        return {
+            "Split": name,
+            "Start date": min(dates).isoformat(),
+            "End date": max(dates).isoformat(),
+            "Sessions": len(dates),
+            "Forecast windows": int(num_windows),
+        }
+
+    return pd.DataFrame(
+        [
+            summarise("Train", train),
+            summarise("Validation", validation),
+            summarise("Test", test),
+        ]
+    )
+
+
+def compute_session_market_volatility(
+    split: SplitDict,
+    *,
+    channel: str = "close",
+    sample_indices: int | Sequence[int] | slice | None = None,
+    assets: str | int | Sequence[str | int] | None = None,
+    eps: float = 1.0e-8,
+) -> pd.DataFrame:
+    r"""Compute session-level market realised volatility.
+
+    For session :math:`d` and asset :math:`n`,
+
+    .. math::
+
+        RV_{d,n}=\sqrt{\sum_t r_{d,t,n}^2}.
+
+    The market score is the arithmetic mean of ``RV`` across the selected
+    assets. Returns are calculated separately inside each session, so overnight
+    changes are never included.
+    """
+
+    if channel not in split["channels"]:
+        raise ValueError(
+            f"Channel must be one of {split['channels']}, got {channel!r}."
+        )
+    if eps <= 0.0:
+        raise ValueError("eps must be positive.")
+
+    sample_ids = resolve_sample_indices(split, sample_indices)
+    asset_ids, _ = resolve_asset_indices(split, assets)
+    if not sample_ids:
+        raise ValueError("No sample indices selected.")
+    if not asset_ids:
+        raise ValueError("No assets selected.")
+
+    rows: list[dict[str, Any]] = []
+
+    for sample_idx in sample_ids:
+        x, _, day = split["samples"][sample_idx]
+        returns = compute_log_returns(
+            x=x,
+            split=split,
+            channels=[channel],
+            eps=eps,
+        ).double()[:, asset_ids]
+        finite = torch.isfinite(returns)
+        safe_squared_returns = torch.where(
+            finite,
+            returns.square(),
+            torch.zeros_like(returns),
+        )
+        valid_counts = finite.sum(dim=0)
+        asset_volatility = safe_squared_returns.sum(dim=0).sqrt()
+        asset_volatility = asset_volatility.masked_fill(
+            valid_counts == 0,
+            torch.nan,
+        )
+        finite_asset_volatility = asset_volatility[
+            torch.isfinite(asset_volatility)
+        ]
+        if finite_asset_volatility.numel() == 0:
+            raise ValueError(
+                f"Session {day} produced no finite realised-volatility values."
+            )
+
+        rows.append(
+            {
+                "sample_idx": int(sample_idx),
+                "session_date": pd.Timestamp(parse_day(day).date()),
+                "market_realised_volatility": float(
+                    finite_asset_volatility.mean().item()
+                ),
+                "num_assets": int(finite_asset_volatility.numel()),
+                "num_returns": int(returns.shape[0]),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values(
+        "session_date",
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def _volatility_bucket_label(bucket: int, num_buckets: int) -> str:
+    """Return a concise low-to-high label for a volatility bucket."""
+
+    if num_buckets == 1:
+        return "All sessions"
+    if num_buckets == 2:
+        return "Low volatility" if bucket == 1 else "High volatility"
+    if num_buckets == 3:
+        return ("Low volatility", "Medium volatility", "High volatility")[
+            bucket - 1
+        ]
+    if bucket == 1:
+        return "Lowest volatility"
+    if bucket == num_buckets:
+        return "Highest volatility"
+    return f"Volatility bucket {bucket}"
+
+
+def _assign_session_volatility_buckets(
+    session_volatility: pd.DataFrame,
+    *,
+    num_buckets: int,
+) -> pd.DataFrame:
+    """Assign deterministic equal-count session-volatility buckets."""
+
+    if isinstance(num_buckets, bool) or not isinstance(num_buckets, int):
+        raise TypeError("num_buckets must be an integer.")
+    if num_buckets < 1:
+        raise ValueError("num_buckets must be at least 1.")
+    if num_buckets > len(session_volatility):
+        raise ValueError(
+            "num_buckets cannot exceed the number of selected sessions."
+        )
+
+    ordered = session_volatility.sort_values(
+        ["market_realised_volatility", "sample_idx"],
+        kind="stable",
+    ).reset_index(drop=True)
+    ordered["volatility_bucket"] = 0
+
+    for bucket, positions in enumerate(
+        np.array_split(np.arange(len(ordered)), num_buckets),
+        start=1,
+    ):
+        ordered.loc[positions, "volatility_bucket"] = bucket
+
+    ordered["volatility_bucket"] = ordered[
+        "volatility_bucket"
+    ].astype(int)
+    ordered["volatility_label"] = ordered["volatility_bucket"].map(
+        lambda bucket: _volatility_bucket_label(bucket, num_buckets)
+    )
+    return ordered.sort_values("sample_idx", kind="stable").reset_index(
+        drop=True
+    )
 
 #this outputs a np array of log returns on chosen channel. it concatenates
 #returns for the same asset over selected days. for example,
@@ -247,6 +484,7 @@ def plot_return_correlation_heatmap(
         max_tick_labels:int=93,
         figsize:tuple[float,float]|None=None,
         ax:Axes|None=None,
+        title: bool = True,
 )->tuple[Figure,Axes,np.ndarray,list[str]]:
     """Plot a cross-asset return-correlation heatmap.
 
@@ -317,15 +555,8 @@ def plot_return_correlation_heatmap(
         aspect="auto",
     )
     fig.colorbar(image,ax=ax,fraction=0.046,pad=0.04)
-    title="Return Correlation Heatmap "
-
-    if sample_indices is None:
-        title += "across all days"
-    else:
-        title += "for selected day(s)"
-
-    if cluster:
-        title += " — sector-grouped"
+    if title:
+        ax.set_title("Return correlation matrix")
 
     if show_tickers and num_assets<=max_tick_labels:
         ax.set_xticks(np.arange(num_assets))
@@ -348,6 +579,277 @@ def plot_return_correlation_heatmap(
     fig.tight_layout()
 
     return fig,ax,corr,labels
+
+
+def plot_volatility_regime_correlation_heatmaps(
+    split: SplitDict,
+    *,
+    channel: str = "close",
+    sample_indices: int | Sequence[int] | slice | None = None,
+    assets: str | int | Sequence[str | int] | None = None,
+    volatility_tail_fraction: float = 0.20,
+    cluster: bool = True,
+    company_profiles_path: str | Path | None = None,
+    show_tickers: bool = False,
+    max_tick_labels: int = 93,
+    figsize: tuple[float, float] = (12.0, 5.5),
+    title: bool = True,
+) -> tuple[
+    Figure,
+    np.ndarray,
+    dict[str, np.ndarray],
+    list[str],
+    pd.DataFrame,
+]:
+    """Plot low- and high-volatility return correlations.
+
+    The two panels contain the bottom and top
+    ``volatility_tail_fraction`` of selected sessions, ranked by cross-asset
+    mean realised volatility. Sessions between the two tails are excluded from
+    the heatmaps. Both matrices share the same asset order and the fixed
+    correlation scale ``[-1, 1]``.
+    """
+
+    tail_fraction = float(volatility_tail_fraction)
+    if not 0.0 < tail_fraction <= 0.5:
+        raise ValueError(
+            "volatility_tail_fraction must satisfy 0 < value <= 0.5."
+        )
+
+    selected_sample_ids = resolve_sample_indices(split, sample_indices)
+    session_volatility = compute_session_market_volatility(
+        split,
+        channel=channel,
+        sample_indices=selected_sample_ids,
+        assets=assets,
+    ).sort_values(
+        ["market_realised_volatility", "sample_idx"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    tail_count = max(1, int(np.floor(len(session_volatility) * tail_fraction)))
+    if 2 * tail_count > len(session_volatility):
+        raise ValueError(
+            "The selected tail fraction leaves overlapping low- and "
+            "high-volatility groups."
+        )
+
+    low_sample_ids = (
+        session_volatility.head(tail_count)["sample_idx"].astype(int).tolist()
+    )
+    high_sample_ids = (
+        session_volatility.tail(tail_count)["sample_idx"].astype(int).tolist()
+    )
+
+    regime_sample_ids = {
+        "low": low_sample_ids,
+        "high": high_sample_ids,
+    }
+    correlations: dict[str, np.ndarray] = {}
+    labels: list[str] | None = None
+
+    for regime, regime_indices in regime_sample_ids.items():
+        regime_correlation, regime_labels = compute_return_correlation_matrix(
+            split=split,
+            channel=channel,
+            sample_indices=regime_indices,
+            assets=assets,
+        )
+        if labels is None:
+            labels = regime_labels
+        elif regime_labels != labels:
+            raise ValueError(
+                "Asset ordering changed across volatility regimes."
+            )
+        correlations[regime] = regime_correlation
+
+    if labels is None:
+        raise ValueError("No assets were available for the heatmaps.")
+
+    ordered_sectors: np.ndarray | None = None
+    if cluster:
+        order, ordered_mapping = make_sector_group_order(
+            labels,
+            company_profiles_path=company_profiles_path,
+        )
+        labels = [labels[index] for index in order]
+        ordered_sectors = ordered_mapping["Sector"].astype(str).to_numpy()
+        correlations = {
+            regime: correlation[np.ix_(order, order)]
+            for regime, correlation in correlations.items()
+        }
+
+    figure, axes = plt.subplots(
+        1,
+        2,
+        figsize=figsize,
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    correlation_cmap = plt.get_cmap("coolwarm").copy()
+    correlation_cmap.set_bad(color="white")
+    panel_titles = {
+        "low": "Low volatility",
+        "high": "High volatility",
+    }
+    image = None
+
+    for axes_item, regime in zip(
+        axes,
+        ("low", "high"),
+        strict=True,
+    ):
+        display_correlation = correlations[regime].copy()
+        np.fill_diagonal(display_correlation, np.nan)
+        image = axes_item.imshow(
+            display_correlation,
+            vmin=-1.0,
+            vmax=1.0,
+            cmap=correlation_cmap,
+            aspect="auto",
+        )
+
+        if show_tickers and len(labels) <= max_tick_labels:
+            axes_item.set_xticks(np.arange(len(labels)))
+            axes_item.set_yticks(np.arange(len(labels)))
+            axes_item.set_xticklabels(labels, rotation=45, fontsize=6)
+            axes_item.set_yticklabels(labels, fontsize=6)
+        else:
+            axes_item.set_xticks([])
+            axes_item.set_yticks([])
+
+        if ordered_sectors is not None and len(ordered_sectors):
+            boundaries = (
+                np.flatnonzero(
+                    ordered_sectors[1:] != ordered_sectors[:-1]
+                )
+                + 1
+            )
+            for boundary in boundaries:
+                coordinate = float(boundary) - 0.5
+                axes_item.axhline(
+                    coordinate,
+                    color="black",
+                    linewidth=0.8,
+                    alpha=0.65,
+                )
+                axes_item.axvline(
+                    coordinate,
+                    color="black",
+                    linewidth=0.8,
+                    alpha=0.65,
+                )
+
+        if title:
+            axes_item.set_title(panel_titles[regime])
+
+    if image is None:
+        raise RuntimeError("The correlation heatmaps were not created.")
+    figure.colorbar(
+        image,
+        ax=axes.tolist(),
+        fraction=0.025,
+        pad=0.02,
+        label="Pearson correlation",
+    )
+
+    session_assignments = session_volatility.copy()
+    session_assignments["regime"] = "Middle"
+    session_assignments.loc[
+        session_assignments["sample_idx"].isin(low_sample_ids),
+        "regime",
+    ] = "Low"
+    session_assignments.loc[
+        session_assignments["sample_idx"].isin(high_sample_ids),
+        "regime",
+    ] = "High"
+    session_assignments["volatility_tail_fraction"] = tail_fraction
+
+    return figure, axes, correlations, labels, session_assignments
+
+
+def plot_split_volatility_distribution(
+    train: SplitDict,
+    validation: SplitDict,
+    test: SplitDict,
+    *,
+    channel: str = "close",
+    assets: str | int | Sequence[str | int] | None = None,
+    figsize: tuple[float, float] = (9.0, 5.0),
+    ax: Axes | None = None,
+    title: bool = True,
+) -> tuple[Figure, Axes, pd.DataFrame, pd.DataFrame]:
+    """Compare session-level market realised volatility across data splits.
+
+    Each session value is the arithmetic mean of the asset-level realised
+    volatilities, where asset-level realised volatility is the square root of
+    the sum of squared within-session one-minute log returns.
+    """
+
+    reference_assets = list(train["asset_cols"])
+    for split_name, split in (
+        ("Validation", validation),
+        ("Test", test),
+    ):
+        if list(split["asset_cols"]) != reference_assets:
+            raise ValueError(
+                f"{split_name} asset ordering differs from the training split."
+            )
+
+    tables: list[pd.DataFrame] = []
+    for split_name, split in (
+        ("Train", train),
+        ("Validation", validation),
+        ("Test", test),
+    ):
+        table = compute_session_market_volatility(
+            split,
+            channel=channel,
+            assets=assets,
+        )
+        table.insert(0, "split", split_name)
+        tables.append(table)
+
+    values = pd.concat(tables, ignore_index=True)
+    split_order = ("Train", "Validation", "Test")
+    summary = (
+        values.groupby("split", sort=False)["market_realised_volatility"]
+        .agg(
+            sessions="count",
+            mean="mean",
+            standard_deviation=lambda series: series.std(ddof=0),
+            minimum="min",
+            q25=lambda series: series.quantile(0.25),
+            median="median",
+            q75=lambda series: series.quantile(0.75),
+            maximum="max",
+        )
+        .reindex(split_order)
+        .reset_index()
+    )
+
+    if ax is None:
+        figure, axes = plt.subplots(figsize=figsize)
+    else:
+        axes = ax
+        figure = axes.figure
+
+    plot_values = [
+        values.loc[
+            values["split"] == split_name,
+            "market_realised_volatility",
+        ].to_numpy(dtype=np.float64)
+        for split_name in split_order
+    ]
+    axes.boxplot(plot_values, labels=split_order, showfliers=True)
+    axes.set_ylabel("Realised Volatility")
+    axes.grid(axis="y", alpha=0.25)
+    if title:
+        axes.set_title("Session realised volatility by split")
+    figure.tight_layout()
+
+    return figure, axes, values, summary
 
 #utility functions to help us plot time series with actual dates as the x axis
 def parse_day(day: Any) -> datetime:
@@ -488,6 +990,7 @@ def plot_realised_volatility(
     eps: float = 1.0e-8,
     figsize: tuple[float, float] = (14.0, 5.5),
     ax: Axes | None = None,
+    title: bool = True,
 ) -> tuple[Figure, Axes, pd.DataFrame]:
     """Plot rolling realised volatility from within-session log returns.
 
@@ -779,12 +1282,12 @@ def plot_realised_volatility(
             axes.set_xlabel("Date and bar-close time")
 
     axes.set_ylabel(
-        "Rolling std. dev. of 1-minute log returns"
+        "Realised Volatility"
     )
-    axes.set_title(
-        f"{window_minutes}-minute realised volatility — {asset_label}\n"
-        f"{date_description}"
-    )
+    if title:
+        axes.set_title(
+            f"Intraday Realised Volatility"
+        )
     axes.grid(True, alpha=0.25)
     axes.legend(loc="best")
     figure.tight_layout()
@@ -808,6 +1311,7 @@ def plot_intraday_channel(
     max_assets: int | None = 5,
     max_date_ticks: int = 12,
     ax: Axes | None = None,
+    title: bool = True,
 ) -> tuple[Figure, Axes]:
     """
     Plot intraday time series for selected assets and selected days
@@ -983,7 +1487,8 @@ def plot_intraday_channel(
 
     ylabel = f"Normalised {channel} values" if normalize else f"{channel} values"
 
-    ax.set_title(f"Intraday {channel} values")
+    if title:
+        ax.set_title(f"Intraday {channel} values")
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
 
@@ -1005,6 +1510,7 @@ def plot_intraday_log_returns(
     max_assets: int | None = 5,
     max_date_ticks: int = 12,
     ax: Axes | None = None,
+    title: bool = True,
 ) -> tuple[Figure, Axes]:
     """
     Plot intraday log returns/log changes for selected assets and days.
@@ -1179,7 +1685,8 @@ def plot_intraday_log_returns(
 
     ax.axhline(0.0, linewidth=1)
 
-    ax.set_title(f"Intraday {channel} log returns/log changes")
+    if title:
+        ax.set_title(f"Intraday {channel} log returns/log changes")
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Log return / log change")
 
@@ -1258,6 +1765,7 @@ def plot_average_intraday_abs_return(
     mode: str = "profile",
     max_date_ticks: int = 12,
     ax: Axes | None = None,
+    title: bool = True,
 ) -> tuple[Figure, Axes, np.ndarray, np.ndarray]:
     """
     Plot average absolute log returns/log changes for one selected channel.
@@ -1430,7 +1938,8 @@ def plot_average_intraday_abs_return(
             f"({market_open.strftime('%H:%M')}–{market_close.strftime('%H:%M')})"
         )
 
-    ax.set_title(f"Average absolute {channel} log return/change")
+    if title:
+        ax.set_title(f"Average absolute {channel} log return/change")
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Absolute log return / log change")
     ax.set_ylim(bottom=0.0)
@@ -1845,6 +2354,27 @@ def compute_return_autocorrelation(
     return pd.DataFrame(rows)
 
 
+def _summarise_return_autocorrelation(
+    asset_acf: pd.DataFrame,
+    *,
+    lower_quantile: float,
+    upper_quantile: float,
+) -> pd.DataFrame:
+    """Aggregate per-asset autocorrelations across the asset dimension."""
+
+    grouped = asset_acf.groupby("lag", sort=True)["autocorrelation"]
+    return pd.DataFrame(
+        {
+            "lag": grouped.mean().index.to_numpy(),
+            "mean": grouped.mean().to_numpy(),
+            "median": grouped.median().to_numpy(),
+            "band_lower": grouped.quantile(lower_quantile).to_numpy(),
+            "band_upper": grouped.quantile(upper_quantile).to_numpy(),
+            "num_assets": grouped.count().to_numpy(),
+        }
+    )
+
+
 def plot_return_autocorrelation(
     split: SplitDict,
     channel: str = "close",
@@ -1856,95 +2386,76 @@ def plot_return_autocorrelation(
     centre: str = "mean",
     band_quantiles: tuple[float, float] = (0.25, 0.75),
     show_asset_lines: bool = False,
-    ax: Axes | None = None,
-) -> tuple[Figure, Axes, "pd.DataFrame"]:
-    """
-    Plot the cross-asset summary of intraday return autocorrelation.
+    ax: Axes | Sequence[Axes] | np.ndarray | None = None,
+    num_volatility_buckets: int = 1,
+    figsize: tuple[float, float] | None = None,
+    title: bool = True,
+) -> tuple[Figure, Axes | np.ndarray, pd.DataFrame]:
+    """Plot intraday autocorrelation, optionally by session volatility.
 
-    The solid line is the mean or median per-asset autocorrelation at each lag.
-    The shaded region shows the requested cross-asset quantile interval. This is
-    a descriptive dispersion band, not a sampling confidence interval.
+    Returns are always calculated independently inside each session. For each
+    asset and lag, all valid within-session pairs are pooled across the selected
+    sessions before Pearson correlation is calculated. The solid line is the
+    requested cross-asset mean or median. The shaded band is cross-asset
+    dispersion, not a confidence interval.
 
-    Returns the figure, axes, and the aggregated data used for the plot.
+    When ``num_volatility_buckets`` is greater than one, sessions are ranked by
+    their cross-asset mean realised volatility and split into deterministic,
+    approximately equal-count buckets from low to high volatility.
     """
-    import pandas as pd
 
     if centre not in {"mean", "median"}:
         raise ValueError("centre must be 'mean' or 'median'.")
-    
     if min_lag < 0 or min_lag > max_lag:
         raise ValueError(
             "min_lag must satisfy 0 <= min_lag <= max_lag."
         )
 
     lower_quantile, upper_quantile = map(float, band_quantiles)
-
     if not 0.0 <= lower_quantile < upper_quantile <= 1.0:
         raise ValueError(
-            "band_quantiles must satisfy "
-            "0 <= lower < upper <= 1."
+            "band_quantiles must satisfy 0 <= lower < upper <= 1."
         )
 
-    asset_acf = compute_return_autocorrelation(
-        split=split,
+    selected_sample_ids = resolve_sample_indices(split, sample_indices)
+    session_volatility = compute_session_market_volatility(
+        split,
         channel=channel,
-        sample_indices=sample_indices,
+        sample_indices=selected_sample_ids,
         assets=assets,
-        max_lag=max_lag,
-        kind=kind,
+    )
+    bucketed_sessions = _assign_session_volatility_buckets(
+        session_volatility,
+        num_buckets=num_volatility_buckets,
     )
 
-    grouped = asset_acf.groupby("lag", sort=True)["autocorrelation"]
-    summary = pd.DataFrame(
-        {
-            "lag": grouped.mean().index.to_numpy(),
-            "mean": grouped.mean().to_numpy(),
-            "median": grouped.median().to_numpy(),
-            "band_lower": grouped.quantile(lower_quantile).to_numpy(),
-            "band_upper": grouped.quantile(upper_quantile).to_numpy(),
-            "num_assets": grouped.count().to_numpy(),
-        }
-    )
-
-    plot_summary = summary.loc[
-        summary["lag"] >= min_lag
-    ].copy()
-
-    plot_asset_acf = asset_acf.loc[
-        asset_acf["lag"] >= min_lag
-    ].copy()
+    if figsize is None:
+        figsize = (10.0, 5.0) if num_volatility_buckets == 1 else (
+            5.0 * num_volatility_buckets,
+            4.5,
+        )
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(10, 5))
+        fig, created_axes = plt.subplots(
+            1,
+            num_volatility_buckets,
+            figsize=figsize,
+            sharex=True,
+            sharey=True,
+            squeeze=False,
+        )
+        axes_array = created_axes.ravel()
     else:
-        fig = ax.figure
-
-    if show_asset_lines:
-        for _, asset_frame in plot_asset_acf.groupby("asset", sort=False):
-            ax.plot(
-                asset_frame["lag"],
-                asset_frame["autocorrelation"],
-                alpha=0.15,
-                linewidth=0.8,
-            )
-
-    ax.fill_between(
-        plot_summary["lag"].to_numpy(),
-        plot_summary["band_lower"].to_numpy(),
-        plot_summary["band_upper"].to_numpy(),
-        alpha=0.2,
-        label=(
-            f"Cross-asset {100 * lower_quantile:.0f}–"
-            f"{100 * upper_quantile:.0f}% interval"
-        ),
-    )
-    ax.plot(
-        plot_summary["lag"],
-        plot_summary[centre],
-        linewidth=2,
-        label=f"Cross-asset {centre}",
-    )
-    ax.axhline(0.0, linewidth=1)
+        if num_volatility_buckets == 1 and isinstance(ax, Axes):
+            axes_array = np.asarray([ax], dtype=object)
+        else:
+            axes_array = np.asarray(ax, dtype=object).reshape(-1)
+            if len(axes_array) != num_volatility_buckets:
+                raise ValueError(
+                    "The number of supplied axes must equal "
+                    "num_volatility_buckets."
+                )
+        fig = axes_array[0].figure
 
     kind_titles = {
         "return": "Return",
@@ -1957,17 +2468,93 @@ def plot_return_autocorrelation(
         "squared_returns": "Squared-return",
     }
     title_prefix = kind_titles.get(kind, kind.replace("_", " ").title())
+    summaries: list[pd.DataFrame] = []
 
-    ax.set_title(f"{title_prefix} autocorrelation")
-    ax.set_xlabel("Lag (minutes)")
-    ax.set_ylabel("Autocorrelation")
-    ax.set_xlim(min_lag, max_lag)
-    ax.legend(fontsize=8)
+    for bucket in range(1, num_volatility_buckets + 1):
+        axes = axes_array[bucket - 1]
+        bucket_sessions = bucketed_sessions.loc[
+            bucketed_sessions["volatility_bucket"] == bucket
+        ].sort_values("sample_idx", kind="stable")
+        bucket_sample_ids = bucket_sessions["sample_idx"].astype(int).tolist()
+        bucket_label = str(bucket_sessions["volatility_label"].iloc[0])
+
+        asset_acf = compute_return_autocorrelation(
+            split=split,
+            channel=channel,
+            sample_indices=bucket_sample_ids,
+            assets=assets,
+            max_lag=max_lag,
+            kind=kind,
+        )
+        summary = _summarise_return_autocorrelation(
+            asset_acf,
+            lower_quantile=lower_quantile,
+            upper_quantile=upper_quantile,
+        )
+        summary = summary.loc[summary["lag"] >= min_lag].copy()
+        summary["volatility_bucket"] = bucket
+        summary["volatility_label"] = bucket_label
+        summary["num_sessions"] = len(bucket_sample_ids)
+        summary["volatility_min"] = float(
+            bucket_sessions["market_realised_volatility"].min()
+        )
+        summary["volatility_max"] = float(
+            bucket_sessions["market_realised_volatility"].max()
+        )
+        summaries.append(summary)
+
+        plot_asset_acf = asset_acf.loc[
+            asset_acf["lag"] >= min_lag
+        ]
+        if show_asset_lines:
+            for _, asset_frame in plot_asset_acf.groupby(
+                "asset",
+                sort=False,
+            ):
+                axes.plot(
+                    asset_frame["lag"],
+                    asset_frame["autocorrelation"],
+                    alpha=0.15,
+                    linewidth=0.8,
+                )
+
+        axes.fill_between(
+            summary["lag"].to_numpy(),
+            summary["band_lower"].to_numpy(),
+            summary["band_upper"].to_numpy(),
+            alpha=0.2,
+            label=(
+                f"Cross-asset {100 * lower_quantile:.0f}–"
+                f"{100 * upper_quantile:.0f}% interval"
+            ),
+        )
+        axes.plot(
+            summary["lag"],
+            summary[centre],
+            linewidth=2,
+            label=f"Cross-asset {centre}",
+        )
+        axes.axhline(0.0, linewidth=1)
+        axes.set_xlabel("Lag (minutes)")
+        axes.set_xlim(min_lag, max_lag)
+       
+
+        if bucket == 1:
+            axes.set_ylabel("Autocorrelation")
+        if title:
+            axes.set_title(
+                f"{title_prefix} autocorrelation"
+                if num_volatility_buckets == 1
+                else bucket_label
+            )
 
     fig.tight_layout()
-
-    return fig, ax, plot_summary
-
+    result_axes: Axes | np.ndarray = (
+        axes_array[0]
+        if num_volatility_buckets == 1
+        else axes_array
+    )
+    return fig, result_axes, pd.concat(summaries, ignore_index=True)
 
 def _collect_scale_return_statistics(
     split: SplitDict,
@@ -2264,3 +2851,218 @@ def compute_variance_scaling_hurst(
         )
 
     return pd.DataFrame(rows)
+
+def plot_return_histogram(
+    split: SplitDict,
+    channel: str = "close",
+    sample_indices: int | Sequence[int] | slice | None = None,
+    assets: str | int | Sequence[str | int] | None = None,
+    bins: int = 300,
+    scale_to_basis_points: bool = True,
+    show_normal: bool = True,
+    log_y: bool = True,
+    title: bool = True,
+    figsize: tuple[float, float] = (8.0, 5.0),
+    ax: Axes | None = None,
+) -> tuple[Figure, Axes, np.ndarray, pd.DataFrame]:
+    """
+    Plot the pooled distribution of one-minute log returns and calculate
+    their mean and excess kurtosis.
+
+    Returns are calculated separately within each selected trading session,
+    so no overnight return is introduced. The observations are then pooled
+    across all selected sessions and stocks.
+
+    Excess kurtosis uses Fisher's definition, under which a normal
+    distribution has excess kurtosis equal to zero.
+
+    Parameters
+    ----------
+    split:
+        Cleaned candle-data split.
+
+    channel:
+        Channel from which log returns are calculated.
+
+    sample_indices:
+        Sessions to include. None includes every session in the split.
+
+    assets:
+        Stocks to include. None includes every stock in the split.
+
+    bins:
+        Number of histogram bins.
+
+    scale_to_basis_points:
+        If True, display returns in basis points.
+
+    show_normal:
+        If True, overlay a normal density with the same mean and standard
+        deviation as the pooled observations.
+
+    log_y:
+        If True, use a logarithmic y-axis.
+
+    title:
+        If False, omit the plot title.
+
+    figsize:
+        Figure size when an existing axis is not supplied.
+
+    ax:
+        Optional existing Matplotlib axis.
+
+    Returns
+    -------
+    figure:
+        Matplotlib figure.
+
+    axes:
+        Matplotlib axis.
+
+    pooled_returns:
+        One-dimensional array of pooled returns in raw log-return units.
+
+    return_summary:
+        Two-row table containing the mean return and excess kurtosis.
+    """
+    if bins <= 0:
+        raise ValueError("bins must be a positive integer.")
+
+    returns_array, _ = collect_channel_log_returns(
+        split=split,
+        channel=channel,
+        sample_indices=sample_indices,
+        assets=assets,
+    )
+
+    pooled_returns = np.asarray(
+        returns_array,
+        dtype=np.float64,
+    ).reshape(-1)
+
+    pooled_returns = pooled_returns[
+        np.isfinite(pooled_returns)
+    ]
+
+    if pooled_returns.size == 0:
+        raise ValueError(
+            "No finite return observations were available."
+        )
+
+    mean_log_return = float(np.mean(pooled_returns))
+
+    # Pandas uses Fisher's definition, so a normal distribution has
+    # excess kurtosis equal to zero.
+    excess_kurtosis = float(
+        pd.Series(pooled_returns).kurt()
+    )
+
+    return_summary = pd.DataFrame(
+        {
+            "Statistic": [
+                "Mean one-minute log return",
+                "Excess kurtosis",
+            ],
+            "Value": [
+                mean_log_return * 10_000.0,
+                excess_kurtosis,
+            ],
+            "Unit": [
+                "basis points",
+                "",
+            ],
+        }
+    )
+
+    if scale_to_basis_points:
+        displayed_returns = pooled_returns * 10_000.0
+        x_label = (
+            f"One-minute {channel} log return "
+            "(basis points)"
+        )
+    else:
+        displayed_returns = pooled_returns
+        x_label = f"One-minute {channel} log return"
+
+    if ax is None:
+        figure, axes = plt.subplots(figsize=figsize)
+        created_figure = True
+    else:
+        axes = ax
+        figure = axes.figure
+        created_figure = False
+
+    _, bin_edges, _ = axes.hist(
+        displayed_returns,
+        bins=bins,
+        density=True,
+        alpha=0.75,
+        label="Empirical returns",
+    )
+
+    if show_normal:
+        displayed_mean = float(
+            np.mean(displayed_returns)
+        )
+        displayed_std = float(
+            np.std(displayed_returns, ddof=1)
+        )
+
+        if np.isfinite(displayed_std) and displayed_std > 0.0:
+            normal_x = np.linspace(
+                float(bin_edges[0]),
+                float(bin_edges[-1]),
+                1_000,
+            )
+
+            normal_density = (
+                np.exp(
+                    -0.5
+                    * (
+                        (normal_x - displayed_mean)
+                        / displayed_std
+                    )
+                    ** 2
+                )
+                / (
+                    displayed_std
+                    * np.sqrt(2.0 * np.pi)
+                )
+            )
+
+            axes.plot(
+                normal_x,
+                normal_density,
+                linewidth=1.8,
+                label="Matched normal distribution",
+            )
+
+    axes.axvline(
+        0.0,
+        linewidth=1.0,
+        linestyle="--",
+    )
+
+    if log_y:
+        axes.set_yscale("log")
+
+    if title:
+        axes.set_title(
+            f"Distribution of one-minute {channel} log returns"
+        )
+
+    axes.set_xlabel(x_label)
+    axes.set_ylabel("Probability density")
+    axes.legend(fontsize=8)
+    axes.grid(True, alpha=0.2)
+
+    if created_figure:
+        figure.tight_layout()
+
+    return (
+        figure,
+        axes,
+        pooled_returns,
+        return_summary,
+    )

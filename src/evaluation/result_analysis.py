@@ -245,8 +245,15 @@ DEFAULT_MODEL_DISPLAY_NAMES = {
     "modern_tcn": "ModernTCN",
     "kronos": "Kronos",
     "final_model": "GraphTCN",
-    "GraphTCN": "GraphTCN",
     "Persistence": "Persistence",
+    "ARIMA": "ARIMA",
+    "VAR": "VAR",
+    "GARCH": "GARCH",
+    "ModernTCN": "ModernTCN",
+    "Kronos": "Kronos",
+    "Token GraphTCN": "Token GraphTCN",
+    "Tokenized GraphTCN": "Tokenized GraphTCN",
+    "GraphTCN": "GraphTCN",
 }
 
 
@@ -1652,6 +1659,290 @@ class FinancialResultAnalysis:
 # ---------------------------------------------------------------------------
 
 
+def plot_price_forecasts_across_days(
+    analysis: FinancialResultAnalysis,
+    *,
+    model_names: str | Sequence[str],
+    asset: str | int,
+    days: slice | None = None,
+    horizons: int | Sequence[int] | None = None,
+    display_names: Mapping[str, str] | None = None,
+    title: bool = True,
+    figsize: tuple[float, float] = (11.0, 4.0),
+) -> tuple[pd.DataFrame, dict[int, plt.Figure]]:
+    """Plot raw Close forecasts on a compressed trading-time axis.
+
+    A separate figure is produced for each selected forecast horizon. Only
+    observed forecast target points are placed on the x-axis: weekends,
+    non-trading days, and overnight hours consume no horizontal space. Each
+    trading day is plotted as a separate line segment, so no line is drawn
+    across an overnight boundary.
+
+    Parameters
+    ----------
+    analysis:
+        Aligned saved forecasts held in a :class:`FinancialResultAnalysis`.
+    model_names:
+        One model name or a sequence of names from ``analysis.model_names``.
+    asset:
+        Stock ticker or zero-based stock index.
+    days:
+        Positional slice over the chronologically ordered test days. ``None``
+        uses the complete test set. For example, ``slice(0, 5)`` selects the
+        first five test days and ``slice(-5, None)`` selects the final five.
+    horizons:
+        One horizon or a sequence of horizons. ``None`` uses all horizons.
+    display_names:
+        Optional mapping from stored model names to legend labels.
+    title:
+        If ``False``, omit the figure title.
+    figsize:
+        Size of each horizon-specific figure.
+
+    Returns
+    -------
+    plot_data:
+        Long-form table containing every value, timestamp, and compressed
+        x-axis position shown.
+    figures:
+        Mapping from forecast horizon to Matplotlib figure.
+    """
+
+    selected_models = _normalise_model_names(
+        model_names,
+        available=analysis.model_names,
+    )
+    selected_horizons = _normalise_horizons(
+        horizons,
+        available=analysis.horizons,
+    )
+
+    if isinstance(asset, (int, np.integer)):
+        asset_idx = int(asset)
+        if asset_idx < 0 or asset_idx >= len(analysis.assets):
+            raise IndexError(
+                f"asset index {asset_idx} is outside "
+                f"[0, {len(analysis.assets) - 1}]."
+            )
+        asset_name = analysis.assets[asset_idx]
+    else:
+        asset_name = str(asset)
+        if asset_name not in analysis.assets:
+            raise ValueError(
+                f"Unknown asset {asset_name!r}. Available assets include "
+                f"{list(analysis.assets[:10])}."
+            )
+        asset_idx = analysis.assets.index(asset_name)
+
+    available_days: list[tuple[int, pd.Timestamp]] = []
+    seen_days: set[pd.Timestamp] = set()
+    for sample in torch.unique(analysis.sample_idx, sorted=True).tolist():
+        sample_idx = int(sample)
+        sample_day = pd.Timestamp(
+            analysis.test_split["samples"][sample_idx][2]
+        ).normalize()
+        if sample_day in seen_days:
+            raise ValueError(
+                f"Multiple test samples were found for {sample_day.date()}."
+            )
+        seen_days.add(sample_day)
+        available_days.append((sample_idx, sample_day))
+
+    available_days.sort(key=lambda item: item[1])
+
+    if days is None:
+        selected_days = available_days
+    elif isinstance(days, slice):
+        selected_days = available_days[days]
+    else:
+        raise TypeError("days must be a slice or None.")
+
+    if not selected_days:
+        raise ValueError("The selected day slice contains no test days.")
+
+    labels = {
+        model_name: (
+            str(display_names[model_name])
+            if display_names is not None and model_name in display_names
+            else _format_model_name(model_name)
+        )
+        for model_name in selected_models
+    }
+
+    reference = analysis.prediction_results[analysis.reference_model]
+    true_prices = reference["y_true"][..., analysis.close_channel_idx].numpy()
+    sample_indices = analysis.sample_idx.numpy()
+    origin_indices = analysis.origin_idx.numpy()
+    target_timestamps = analysis.target_timestamps
+    horizon_positions = {
+        horizon: analysis.horizons.index(horizon)
+        for horizon in selected_horizons
+    }
+    model_predictions = {
+        model_name: analysis.prediction_results[model_name]["y_pred"][
+            ..., analysis.close_channel_idx
+        ].numpy()
+        for model_name in selected_models
+    }
+
+    model_colours = {
+        model_name: f"C{index}"
+        for index, model_name in enumerate(selected_models)
+    }
+
+    records: list[dict[str, Any]] = []
+    figures: dict[int, plt.Figure] = {}
+
+    for horizon in selected_horizons:
+        horizon_position = horizon_positions[horizon]
+        fig, ax = plt.subplots(figsize=figsize)
+
+        day_centres: list[float] = []
+        day_labels: list[str] = []
+        day_boundaries: list[float] = []
+        next_position = 0
+
+        for day_position, (sample_idx, day) in enumerate(selected_days):
+            rows = np.flatnonzero(sample_indices == sample_idx)
+            if rows.size == 0:
+                raise ValueError(
+                    f"No forecast windows were found for {day.date().isoformat()}."
+                )
+            rows = rows[np.argsort(origin_indices[rows], kind="stable")]
+
+            x_values = np.arange(
+                next_position,
+                next_position + rows.size,
+                dtype=np.float64,
+            )
+            timestamps = pd.to_datetime(
+                target_timestamps.iloc[rows, horizon_position].to_numpy()
+            )
+            realised = true_prices[rows, horizon_position, asset_idx]
+
+            ax.plot(
+                x_values,
+                realised,
+                color="black",
+                linestyle="--",
+                linewidth=1.5,
+                label="True price" if day_position == 0 else None,
+                zorder=3,
+            )
+
+            for row, x_value, timestamp, price in zip(
+                rows,
+                x_values,
+                timestamps,
+                realised,
+                strict=True,
+            ):
+                records.append(
+                    {
+                        "day": day,
+                        "sample_idx": sample_idx,
+                        "origin_idx": int(origin_indices[row]),
+                        "target_timestamp": pd.Timestamp(timestamp),
+                        "horizon": horizon,
+                        "asset": asset_name,
+                        "series": "True price",
+                        "model": "truth",
+                        "price": float(price),
+                        "plot_position": float(x_value),
+                    }
+                )
+
+            for model_name in selected_models:
+                predicted = model_predictions[model_name][
+                    rows,
+                    horizon_position,
+                    asset_idx,
+                ]
+                ax.plot(
+                    x_values,
+                    predicted,
+                    color=model_colours[model_name],
+                    linewidth=1.3,
+                    label=(
+                        labels[model_name]
+                        if day_position == 0
+                        else None
+                    ),
+                    zorder=2,
+                )
+
+                for row, x_value, timestamp, price in zip(
+                    rows,
+                    x_values,
+                    timestamps,
+                    predicted,
+                    strict=True,
+                ):
+                    records.append(
+                        {
+                            "day": day,
+                            "sample_idx": sample_idx,
+                            "origin_idx": int(origin_indices[row]),
+                            "target_timestamp": pd.Timestamp(timestamp),
+                            "horizon": horizon,
+                            "asset": asset_name,
+                            "series": labels[model_name],
+                            "model": model_name,
+                            "price": float(price),
+                            "plot_position": float(x_value),
+                        }
+                    )
+
+            day_centres.append(float(np.mean(x_values)))
+            day_labels.append(day.strftime("%d %b"))
+            next_position = int(x_values[-1]) + 1
+
+            if day_position < len(selected_days) - 1:
+                day_boundaries.append(float(x_values[-1]) + 0.5)
+
+        # Label every day for short slices and a representative subset for
+        # longer ranges. The axis itself still contains every observed point.
+        max_date_ticks = 10
+        if len(day_centres) <= max_date_ticks:
+            tick_indices = np.arange(len(day_centres), dtype=int)
+        else:
+            tick_indices = np.unique(
+                np.linspace(
+                    0,
+                    len(day_centres) - 1,
+                    max_date_ticks,
+                    dtype=int,
+                )
+            )
+
+        ax.set_xticks(
+            [day_centres[index] for index in tick_indices],
+            [day_labels[index] for index in tick_indices],
+        )
+
+        # Light separators indicate trading-day boundaries without allocating
+        # horizontal space to the overnight period.
+        for boundary in day_boundaries:
+            ax.axvline(
+                boundary,
+                color="0.9",
+                linewidth=0.4,
+                zorder=0,
+            )
+
+        ax.set_xlim(-0.5, float(next_position) - 0.5)
+        ax.set_xlabel("Test date")
+        ax.set_ylabel("Close price")
+        if title:
+            ax.set_title(f"{asset_name} — {horizon}-minute horizon")
+        ax.grid(axis="y", alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        figures[horizon] = fig
+
+    plot_data = pd.DataFrame.from_records(records)
+    return plot_data, figures
+
 def plot_split_volatility_distribution(
     analysis: FinancialResultAnalysis,
     *,
@@ -2597,13 +2888,17 @@ def make_top_bottom_stock_table(
 def plot_metric_by_stock_volatility(
     analysis: FinancialResultAnalysis,
     *,
-    model_names: str | Sequence[str],
+    model_names: str | Sequence[str] | None = None,
     metric_name: str,
     horizons: int | Sequence[int] | None = None,
     num_volatility_buckets: int = 5,
     figsize: tuple[float, float] = (11.0, 6.0),
-) -> tuple[pd.DataFrame, plt.Figure]:
-    """Plot mean stock-level performance over configurable volatility buckets.
+    return_extreme_table: bool = False,
+) -> (
+    tuple[pd.DataFrame, plt.Figure]
+    | tuple[pd.DataFrame, pd.DataFrame, plt.Figure]
+):
+    """Plot mean stock-level performance over volatility buckets.
 
     The x-axis buckets are equal-frequency groups based on each stock's median
     daily realised volatility during the test period. Bucket 1 is the lowest-
@@ -2611,15 +2906,38 @@ def plot_metric_by_stock_volatility(
     selected ``(model, horizon)`` pair; no bars, quartiles, or error bars are
     shown.
 
-    For ``relative_mae_vs_persistence`` only, the returned table additionally
+    When ``model_names`` is ``None``, every loaded model except the persistence
+    reference model is included. Passing model names explicitly preserves the
+    supplied order and allows any subset of models to be displayed.
+
+    For ``relative_mae_vs_persistence`` only, the detailed summary additionally
     reports ``fraction_of_stocks_beating_persistence``. This is the proportion
     of stocks in the bucket whose stock-level relative MAE is strictly below 1.
+
+    Set ``return_extreme_table=True`` to also return a compact wide table whose
+    rows are forecast horizons and whose columns contain the lowest- and
+    highest-volatility buckets for each model. For
+    ``mae_difference_vs_persistence``, this compact table is converted to basis
+    points. The default return value remains ``(summary, figure)`` for backward
+    compatibility.
     """
 
-    selected_models = _normalise_model_names(
-        model_names,
-        available=analysis.model_names,
-    )
+    if model_names is None:
+        selected_models = [
+            name
+            for name in analysis.model_names
+            if name != analysis.reference_model
+            and _format_model_name(name).lower() != "persistence"
+        ]
+        if not selected_models:
+            raise ValueError(
+                "No non-persistence models are available for volatility analysis."
+            )
+    else:
+        selected_models = _normalise_model_names(
+            model_names,
+            available=analysis.model_names,
+        )
     selected_horizons = _normalise_horizons(
         horizons,
         available=analysis.horizons,
@@ -2752,7 +3070,65 @@ def plot_metric_by_stock_volatility(
     ax.legend()
     ax.grid(alpha=0.25)
     fig.tight_layout()
-    return summary, fig
+
+    if not return_extreme_table:
+        return summary, fig
+
+    extreme_rows = summary.loc[
+        summary["volatility_bucket"].isin(
+            [1, int(num_volatility_buckets)]
+        )
+    ].copy()
+    extreme_rows["volatility_regime"] = np.where(
+        extreme_rows["volatility_bucket"] == 1,
+        "Low Volatility",
+        "High Volatility",
+    )
+
+    extreme_table = extreme_rows.pivot(
+        index="horizon",
+        columns=["model", "volatility_regime"],
+        values="mean_metric",
+    )
+    ordered_columns = pd.MultiIndex.from_tuples(
+        [
+            (model_name, regime)
+            for model_name in selected_models
+            for regime in ("Low Volatility", "High Volatility")
+        ],
+        names=["Model", "Volatility"],
+    )
+    extreme_table = extreme_table.reindex(
+        index=selected_horizons,
+        columns=ordered_columns,
+    )
+
+    display_columns = pd.MultiIndex.from_tuples(
+        [
+            (_format_model_name(model_name), regime)
+            for model_name, regime in extreme_table.columns
+        ],
+        names=["Model", "Volatility"],
+    )
+    extreme_table.columns = display_columns
+    extreme_table.index.name = "Horizon (min)"
+
+    units = "raw metric units"
+    if metric_name == "mae_difference_vs_persistence":
+        extreme_table = extreme_table * 10_000.0
+        units = "basis points"
+
+    extreme_table.attrs.update(
+        {
+            "metric_name": metric_name,
+            "metric_display_name": spec.display_name,
+            "units": units,
+            "num_volatility_buckets": int(num_volatility_buckets),
+            "low_bucket": 1,
+            "high_bucket": int(num_volatility_buckets),
+        }
+    )
+    return summary, extreme_table, fig
 
 
 def plot_time_of_day_metric(
@@ -3137,6 +3513,7 @@ __all__ = [
     "plot_metric_by_stock_volatility",
     "plot_metric_vs_adf",
     "plot_persistence_headroom",
+    "plot_price_forecasts_across_days",
     "plot_split_volatility_distribution",
     "plot_stock_horizon_heatmap",
     "plot_stock_metric_by_horizon",
